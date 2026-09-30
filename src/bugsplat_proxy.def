@@ -1,0 +1,6 @@
+LIBRARY "BugSplat64"
+EXPORTS
+    ?sendAdditionalFile@MiniDmpSender@@QEAAXPEB_W@Z=ProxySendAdditionalFile
+    ??1MiniDmpSender@@UEAA@XZ=ProxyDestructor
+    ??0MiniDmpSender@@QEAA@PEB_W000K@Z=ProxyConstructor
+    ?setGuardByteBufferSize@MiniDmpSender@@QEAAHH@Z=ProxySetGuardByteBufferSize
