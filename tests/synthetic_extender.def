@@ -1,0 +1,6 @@
+LIBRARY "SyntheticExtender"
+EXPORTS
+    ?sendAdditionalFile@MiniDmpSender@@QEAAXPEB_W@Z=BugSplat64_original.?sendAdditionalFile@MiniDmpSender@@QEAAXPEB_W@Z
+    ??1MiniDmpSender@@UEAA@XZ=BugSplat64_original.??1MiniDmpSender@@UEAA@XZ
+    ??0MiniDmpSender@@QEAA@PEB_W000K@Z=BugSplat64_original.??0MiniDmpSender@@QEAA@PEB_W000K@Z
+    ?setGuardByteBufferSize@MiniDmpSender@@QEAAHH@Z=BugSplat64_original.?setGuardByteBufferSize@MiniDmpSender@@QEAAHH@Z
