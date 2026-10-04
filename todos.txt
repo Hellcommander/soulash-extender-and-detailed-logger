@@ -1,0 +1,5 @@
+I’ll improve attribution within the logger’s evidence boundary: capture the full bounded exception context and correlate fault/caller addresses against a fresh module snapshot, so a loaded plugin can be named when it is actually on the faulting stack. I’ll also make logs distinguish a likely module involvement from a game-only fault; this can’t prove that a data mod caused a crash unless the game exposes that association
+
+it should act as a extender like [Skyrim Script Extender (SKSE)](https://skse.silverlock.org/)
+
+README to state the project's intended direction—an open-source S2NF alternative, richer game diagnostics, and work toward preventing known crashes—while distinguishing that goal from current capabilities.
