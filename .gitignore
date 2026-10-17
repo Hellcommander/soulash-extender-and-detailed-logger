@@ -6,3 +6,5 @@
 *.lib
 *.dll
 *.exe
+
+third_party/lua-*/

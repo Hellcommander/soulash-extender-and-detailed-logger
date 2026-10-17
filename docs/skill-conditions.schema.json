@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/soulash-extender/skill-conditions.schema.json",
+  "title": "Soulash 2 skill conditions, spec 1",
+  "description": "Structure only. Names, ranges and size limits are checked by tools/validate_conditions.py.",
+  "type": "object",
+  "required": ["spec", "conditions"],
+  "additionalProperties": false,
+  "properties": {
+    "spec": { "const": 1 },
+    "requires": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-z_]{1,32}$" },
+      "uniqueItems": true
+    },
+    "conditions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/condition" }
+    }
+  },
+  "$defs": {
+    "condition": {
+      "type": "object",
+      "required": ["id", "target", "when"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+        "target": {
+          "type": "object",
+          "required": ["kind", "id"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "enum": ["passive", "ability"] },
+            "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+          }
+        },
+        "when": { "$ref": "#/$defs/expr" },
+        "on_unavailable": { "enum": ["inactive", "active"] },
+        "note": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "expr": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "properties": {
+        "all": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/expr" } },
+        "any": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/expr" } },
+        "not": { "$ref": "#/$defs/expr" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

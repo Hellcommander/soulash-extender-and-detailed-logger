@@ -1,20 +1,50 @@
 #include "manifest.hpp"
 #include "plugin_api.h"
+#include "conditions.hpp"
+#include "script_sandbox.hpp"
+#include "x64_length.hpp"
 
 #include <windows.h>
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
+
+// Global scope on purpose: its RTTI name is .?AUSyntheticPolymorphicType@@ (types in
+// an anonymous namespace get a hashed namespace component).
+struct SyntheticPolymorphicType
+{
+    virtual ~SyntheticPolymorphicType() = default;
+    virtual int Value() const { return 7; }
+};
 
 namespace
 {
     constexpr DWORD FailFastExceptionStatus = 0xC0000602u;
     constexpr wchar_t DiagnosticsEnvironmentVariable[] = L"SOULASH2_DIAGNOSTICS_LOG";
     int failures = 0;
+
+    // Anchor fixtures: the v3 test plugin looks these up in this executable
+    // (the "game" in tests) by string reference and by RTTI class name.
+    // The function calls something so it has unwind data like real code.
+    __declspec(noinline) const char* SyntheticAnchorFunction(int selector)
+    {
+        if (selector == 0x7777)
+        {
+            OutputDebugStringA("synthetic anchor selector");
+        }
+        return "synthetic-anchor-string-7f3a";
+    }
 
     void Check(bool condition, const char* message)
     {
@@ -512,6 +542,702 @@ namespace
         return failures;
     }
 
+    int RunPluginDirectoryTest(
+        const wchar_t* proxyPath,
+        const wchar_t* originalPath,
+        const wchar_t* pluginDirectory,
+        const wchar_t* markerPath)
+    {
+        const std::wstring diagnosticsLogPath = std::wstring(markerPath) + L".diagnostics.log";
+        SetEnvironmentVariableW(L"SOULASH2_NATIVE_MODULE_MANIFEST", nullptr);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, diagnosticsLogPath.c_str());
+        Check(SetEnvironmentVariableW(
+            L"SOULASH2_PLUGIN_DIRECTORY", pluginDirectory) != FALSE,
+            "plugin directory opt-in is set");
+        Check(SetEnvironmentVariableW(L"SOULASH2_TEST_MODULE_MARKER", markerPath) != FALSE,
+            "plugin marker path is set");
+
+        // Keep both fixtures alive and referenced so they exist in the image.
+        volatile auto anchorFunction = &SyntheticAnchorFunction;
+        Check(anchorFunction(1) != nullptr, "anchor fixture function runs");
+        SyntheticPolymorphicType* polymorphic = new SyntheticPolymorphicType();
+        void* const expectedVtable = *reinterpret_cast<void* const*>(polymorphic);
+        char expectedAnchor[96];
+        char expectedRtti[96];
+        sprintf_s(expectedAnchor, "anchor:%llx:1\r\n",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(&SyntheticAnchorFunction)));
+        sprintf_s(expectedRtti, "rtti:%llx\r\n",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(expectedVtable)));
+
+        HMODULE original = LoadLibraryW(originalPath);
+        Check(original != nullptr, "fake original loads for plugin directory test");
+        HMODULE proxy = original == nullptr
+            ? nullptr : LoadLibraryExW(proxyPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        Check(proxy != nullptr, "proxy loads for plugin directory test");
+        if (original != nullptr && proxy != nullptr)
+        {
+            using Constructor = void* (__cdecl*)(
+                void*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, unsigned long);
+            using Destructor = void (__cdecl*)(void*);
+            auto constructor = reinterpret_cast<Constructor>(
+                GetProcAddress(proxy, "?" "?0MiniDmpSender@@QEAA@PEB_W000K@Z"));
+            auto destructor = reinterpret_cast<Destructor>(
+                GetProcAddress(proxy, "?" "?1MiniDmpSender@@UEAA@XZ"));
+            Check(constructor != nullptr && destructor != nullptr, "proxy exports resolve");
+            if (constructor != nullptr && destructor != nullptr)
+            {
+                alignas(std::max_align_t) std::array<std::byte, 128> storage{};
+                void* object = constructor(storage.data(), L"plugin-dir", L"e", L"k", L"u", 32);
+                Check(object == storage.data(), "constructor result preserved with plugin directory");
+                destructor(object);
+            }
+
+            std::string marker;
+            bool finished = false;
+            for (unsigned attempt = 0; attempt < 500 && !finished; ++attempt)
+            {
+                marker.clear();
+                finished = ReadLog(markerPath, marker)
+                    && marker.find("postpostload:Test.PluginB") != std::string::npos;
+                if (!finished)
+                {
+                    Sleep(10);
+                }
+            }
+            Check(finished, "plugin lifecycle reaches POSTPOSTLOAD");
+
+            const auto at = [&marker](const char* needle) { return marker.find(needle); };
+            const std::size_t npos = std::string::npos;
+            Check(at("load:Test.PluginA\r\n") != npos && at("load:Test.PluginB\r\n") != npos,
+                "v3 plugins are discovered and loaded by file stem id");
+            Check(at("plugin-init-v1") != npos && at("dllmain") != npos,
+                "legacy v2 plugin still loads through SoulashExtenderPluginInit");
+            Check(at("load:bad name") == npos, "invalid plugin file name is skipped");
+            Check(at("hash:ok") != npos, "interface exposes the game executable SHA-256");
+            Check(at("detour:ok") != npos,
+                "detour trampoline, patchMemory and argument validation work");
+            Check(at("load:Test.PluginA\r\n") < at("load:Test.PluginB\r\n"),
+                "plugins load in alphabetical order");
+            Check(at("\r\npostload:Test.PluginA\r\n") != npos
+                    && at("\r\npostload:Test.PluginB\r\n") != npos
+                    && at("\r\npostload:Test.PluginA\r\n") > at("load:Test.PluginB\r\n"),
+                "POSTLOAD is sent only after every plugin loaded");
+            Check(at("\r\npostpostload:Test.PluginA\r\n") != npos
+                    && at("\r\npostpostload:Test.PluginA\r\n")
+                        > at("\r\npostload:Test.PluginB\r\n"),
+                "POSTPOSTLOAD follows POSTLOAD");
+            Check(at("message:Test.PluginB<-Test.PluginA\r\n") != npos,
+                "plugin message is delivered to another plugin's listener");
+            Check(at("FAILED") == npos, "no synthetic plugin check reported failure");
+            Check(at("autodetour:ok") != npos,
+                "installDetourAuto relocates RIP-relative/branch instructions and refuses unsafe targets");
+            Check(at(expectedAnchor) != npos,
+                "findFunctionsReferencingString resolves the function using a string");
+            Check(at("anchor-none:ok") != npos && at("anchor-invalid:ok") != npos,
+                "string anchor lookup reports none and rejects invalid arguments");
+            Check(at(expectedRtti) != npos,
+                "findRttiVtable resolves a class vtable by RTTI name");
+            Check(at("rtti-none:ok") != npos, "missing RTTI class yields a null vtable");
+
+            std::string diagnosticsLog;
+            Check(ReadLog(diagnosticsLogPath.c_str(), diagnosticsLog),
+                "plugin directory diagnostics log is available");
+            Check(diagnosticsLog.find("module_event stage=initialized plugin_id=Test.PluginB")
+                    != std::string::npos,
+                "per-plugin lifecycle events are logged with plugin ids");
+            Check(diagnosticsLog.find(" detour target=") != std::string::npos
+                    && diagnosticsLog.find("plugin_id=Test.PluginA") != std::string::npos,
+                "detour installation is attributed to its plugin in the log");
+        }
+
+        if (proxy != nullptr) FreeLibrary(proxy);
+        if (original != nullptr) FreeLibrary(original);
+        SetEnvironmentVariableW(L"SOULASH2_PLUGIN_DIRECTORY", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_TEST_MODULE_MARKER", nullptr);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, nullptr);
+        DeleteFileW(diagnosticsLogPath.c_str());
+        if (failures == 0)
+        {
+            std::cout << "PASS: plugin directory discovery, v2/v3 plugins, messaging, and detours\n";
+        }
+        return failures;
+    }
+
+    // Expects an INI beside the proxy with [Plugins] RequireHash=1 listing the
+    // correct hash for Test.PluginA, a wrong one for Test.LegacyV2 and none
+    // for Test.PluginB: only Test.PluginA may load.
+    int RunPluginAllowlistTest(
+        const wchar_t* proxyPath,
+        const wchar_t* originalPath,
+        const wchar_t* pluginDirectory,
+        const wchar_t* markerPath)
+    {
+        SetEnvironmentVariableW(L"SOULASH2_NATIVE_MODULE_MANIFEST", nullptr);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_PLUGIN_DIRECTORY", pluginDirectory);
+        SetEnvironmentVariableW(L"SOULASH2_TEST_MODULE_MARKER", markerPath);
+
+        HMODULE original = LoadLibraryW(originalPath);
+        Check(original != nullptr, "fake original loads for allowlist test");
+        HMODULE proxy = original == nullptr
+            ? nullptr : LoadLibraryExW(proxyPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        Check(proxy != nullptr, "proxy loads for allowlist test");
+        if (original != nullptr && proxy != nullptr)
+        {
+            using Constructor = void* (__cdecl*)(
+                void*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, unsigned long);
+            auto constructor = reinterpret_cast<Constructor>(
+                GetProcAddress(proxy, "?" "?0MiniDmpSender@@QEAA@PEB_W000K@Z"));
+            Check(constructor != nullptr, "proxy constructor resolves");
+            if (constructor != nullptr)
+            {
+                alignas(std::max_align_t) std::array<std::byte, 128> storage{};
+                constructor(storage.data(), L"allowlist", L"e", L"k", L"u", 32);
+            }
+
+            std::string marker;
+            bool finished = false;
+            for (unsigned attempt = 0; attempt < 500 && !finished; ++attempt)
+            {
+                marker.clear();
+                finished = ReadLog(markerPath, marker)
+                    && marker.find("postpostload:Test.PluginA") != std::string::npos;
+                if (!finished)
+                {
+                    Sleep(10);
+                }
+            }
+            Check(finished, "allowlisted plugin loads and reaches POSTPOSTLOAD");
+            Check(marker.find("load:Test.PluginA\r\n") != std::string::npos,
+                "plugin with a matching SHA-256 loads");
+            Check(marker.find("load:Test.PluginB") == std::string::npos,
+                "plugin missing from [PluginHashes] is refused");
+            Check(marker.find("dllmain") == std::string::npos
+                    && marker.find("plugin-init-v1") == std::string::npos,
+                "plugin with a mismatching SHA-256 is refused before DllMain runs");
+        }
+
+        SetEnvironmentVariableW(L"SOULASH2_PLUGIN_DIRECTORY", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_TEST_MODULE_MARKER", nullptr);
+        if (failures == 0)
+        {
+            std::cout << "PASS: plugin SHA-256 allowlist refuses unlisted and mismatching plugins\n";
+        }
+        return failures;
+    }
+
+#include "decoder_tests.inc"
+#include "sandbox_tests.inc"
+#include "conditions_tests.inc"
+
+    // Child side of the debugger fallback test. Loads the proxy but never
+    // calls any BugSplat export, so only the DllMain fallback can start it.
+    // mode: plain (no debugger, expect no load), debugged (debugger attached,
+    // expect load), disabled (debugger attached, fallback opted out).
+    int RunDebuggerFallbackChild(
+        const wchar_t* proxyPath,
+        const wchar_t* originalPath,
+        const wchar_t* markerPath,
+        std::wstring_view mode)
+    {
+        const bool expectDebugger = mode != L"plain";
+        const bool expectLoad = mode == L"debugged";
+        Check((IsDebuggerPresent() != FALSE) == expectDebugger,
+            "child debugger state matches the test mode");
+
+        HMODULE original = LoadLibraryW(originalPath);
+        Check(original != nullptr, "fake original loads for debugger fallback test");
+        HMODULE proxy = original == nullptr
+            ? nullptr : LoadLibraryExW(proxyPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        Check(proxy != nullptr, "proxy loads for debugger fallback test");
+
+        bool loaded = false;
+        std::string marker;
+        const unsigned attempts = expectLoad ? 500 : 50;
+        for (unsigned attempt = 0; attempt < attempts && !loaded; ++attempt)
+        {
+            marker.clear();
+            // "dllmain" is written by the synthetic module on mapping; its
+            // initializer needs the diagnostics log, which is not enabled here.
+            loaded = ReadLog(markerPath, marker)
+                && marker.find("dllmain") != std::string::npos;
+            if (!loaded)
+            {
+                Sleep(10);
+            }
+        }
+        Check(loaded == expectLoad,
+            expectLoad ? "debugger fallback loads the plugin without any BugSplat call"
+                       : "no plugin loads without a BugSplat call or an attached debugger");
+
+        if (original != nullptr)
+        {
+            using GetCallCounts = void (WINAPI*)(int*, int*, int*);
+            auto getCallCounts = reinterpret_cast<GetCallCounts>(
+                GetProcAddress(original, "FakeGetCallCounts"));
+            int constructors = -1;
+            int sends = -1;
+            int destructors = -1;
+            Check(getCallCounts != nullptr, "fake original call counter resolves");
+            if (getCallCounts != nullptr)
+            {
+                getCallCounts(&constructors, &sends, &destructors);
+                Check(constructors == 0 && sends == 0 && destructors == 0,
+                    "fallback start-up does not call the original BugSplat API");
+            }
+        }
+        // The proxy pins itself when the fallback starts, so it is not freed here.
+        return failures;
+    }
+
+    bool RunChildProcess(
+        const std::wstring& commandLine,
+        bool asDebugger,
+        DWORD& exitCode)
+    {
+        std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
+        mutableCommandLine.push_back(L'\0');
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        // Share this process's stdout/stderr so child check failures are visible.
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+        startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+        startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+        PROCESS_INFORMATION process{};
+        DWORD flags = CREATE_NO_WINDOW;
+        if (asDebugger)
+        {
+            flags |= DEBUG_ONLY_THIS_PROCESS;
+        }
+        if (!CreateProcessW(
+                nullptr, mutableCommandLine.data(), nullptr, nullptr, TRUE,
+                flags, nullptr, nullptr, &startup, &process))
+        {
+            std::cerr << "FAIL: cannot launch child process, error " << GetLastError() << '\n';
+            return false;
+        }
+
+        exitCode = ERROR_GEN_FAILURE;
+        const ULONGLONG deadline = GetTickCount64() + 30000;
+        bool finished = false;
+        if (asDebugger)
+        {
+            while (!finished && GetTickCount64() < deadline)
+            {
+                DEBUG_EVENT event{};
+                if (!WaitForDebugEvent(&event, 500))
+                {
+                    continue;
+                }
+                DWORD status = DBG_EXCEPTION_NOT_HANDLED;
+                switch (event.dwDebugEventCode)
+                {
+                case EXCEPTION_DEBUG_EVENT:
+                    // Loader breakpoints are expected; anything else is passed on.
+                    if (event.u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_BREAKPOINT
+                        || event.u.Exception.ExceptionRecord.ExceptionCode == 0x4000001Fu)
+                    {
+                        status = DBG_CONTINUE;
+                    }
+                    break;
+                case CREATE_PROCESS_DEBUG_EVENT:
+                    if (event.u.CreateProcessInfo.hFile != nullptr)
+                    {
+                        CloseHandle(event.u.CreateProcessInfo.hFile);
+                    }
+                    status = DBG_CONTINUE;
+                    break;
+                case LOAD_DLL_DEBUG_EVENT:
+                    if (event.u.LoadDll.hFile != nullptr)
+                    {
+                        CloseHandle(event.u.LoadDll.hFile);
+                    }
+                    status = DBG_CONTINUE;
+                    break;
+                case EXIT_PROCESS_DEBUG_EVENT:
+                    exitCode = event.u.ExitProcess.dwExitCode;
+                    finished = true;
+                    status = DBG_CONTINUE;
+                    break;
+                default:
+                    status = DBG_CONTINUE;
+                    break;
+                }
+                ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status);
+            }
+        }
+        else
+        {
+            finished = WaitForSingleObject(process.hProcess, 30000) == WAIT_OBJECT_0
+                && GetExitCodeProcess(process.hProcess, &exitCode);
+        }
+
+        if (!finished)
+        {
+            TerminateProcess(process.hProcess, ERROR_TIMEOUT);
+            WaitForSingleObject(process.hProcess, INFINITE);
+        }
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return finished;
+    }
+
+    int RunDebuggerFallbackTest(
+        const wchar_t* proxyPath,
+        const wchar_t* originalPath,
+        const wchar_t* manifestPath,
+        const wchar_t* markerBase)
+    {
+        wchar_t executablePath[MAX_PATH]{};
+        const DWORD executableLength = GetModuleFileNameW(nullptr, executablePath, MAX_PATH);
+        Check(executableLength != 0 && executableLength < MAX_PATH,
+            "test executable path is available");
+        if (executableLength == 0 || executableLength >= MAX_PATH)
+        {
+            return failures;
+        }
+
+        struct Case
+        {
+            const wchar_t* mode;
+            bool asDebugger;
+            bool disableFallback;
+        };
+        const Case cases[] = {
+            {L"plain", false, false},
+            {L"debugged", true, false},
+            {L"disabled", true, true},
+        };
+
+        // The parent's environment is inherited by each child.
+        SetEnvironmentVariableW(L"SOULASH2_NATIVE_MODULE_MANIFEST", manifestPath);
+        SetEnvironmentVariableW(L"SOULASH2_PLUGIN_DIRECTORY", nullptr);
+        for (const Case& test : cases)
+        {
+            const std::wstring marker = std::wstring(markerBase) + L"." + test.mode;
+            DeleteFileW(marker.c_str());
+            SetEnvironmentVariableW(L"SOULASH2_TEST_MODULE_MARKER", marker.c_str());
+            SetEnvironmentVariableW(
+                L"SOULASH2_DEBUGGER_FALLBACK", test.disableFallback ? L"0" : nullptr);
+
+            const std::wstring commandLine = L"\"" + std::wstring(executablePath)
+                + L"\" --debugger-fallback-child \"" + proxyPath + L"\" \"" + originalPath
+                + L"\" \"" + marker + L"\" " + test.mode;
+            DWORD exitCode = 0;
+            const bool finished = RunChildProcess(commandLine, test.asDebugger, exitCode);
+            if (!finished || exitCode != 0)
+            {
+                std::cerr << "child mode finished=" << finished << " exit=" << exitCode << '\n';
+            }
+            Check(finished && exitCode == 0,
+                (std::string("debugger fallback child passes: ")
+                    + (test.mode[0] == L'p' ? "plain" : test.mode[0] == L'd' && test.mode[1] == L'e'
+                        ? "debugged" : "disabled")).c_str());
+            DeleteFileW(marker.c_str());
+        }
+
+        SetEnvironmentVariableW(L"SOULASH2_NATIVE_MODULE_MANIFEST", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_TEST_MODULE_MARKER", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_DEBUGGER_FALLBACK", nullptr);
+        if (failures == 0)
+        {
+            std::cout << "PASS: debugger fallback loads without a BugSplat call and can be disabled\n";
+        }
+        return failures;
+    }
+
+    // Child for chain-loading: calls all four proxy exports; the chain target
+    // (configured by environment variables inherited from the parent) must be
+    // reached and the fake original behind it must see each call once.
+    int RunChainChild(
+        const wchar_t* proxyPath, const wchar_t* originalPath, const wchar_t* extenderName)
+    {
+        HMODULE proxy = LoadLibraryW(proxyPath);
+        Check(proxy != nullptr, "proxy loads for chain test");
+        if (proxy == nullptr)
+        {
+            return failures;
+        }
+        using Constructor = void* (__cdecl*)(
+            void*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, unsigned long);
+        using Destructor = void (__cdecl*)(void*);
+        using Send = void (__cdecl*)(void*, const wchar_t*);
+        using Guard = int (__cdecl*)(void*, int);
+        auto constructor = reinterpret_cast<Constructor>(
+            GetProcAddress(proxy, "?" "?0MiniDmpSender@@QEAA@PEB_W000K@Z"));
+        auto destructor = reinterpret_cast<Destructor>(
+            GetProcAddress(proxy, "?" "?1MiniDmpSender@@UEAA@XZ"));
+        auto send = reinterpret_cast<Send>(
+            GetProcAddress(proxy, "?sendAdditionalFile@MiniDmpSender@@QEAAXPEB_W@Z"));
+        auto guard = reinterpret_cast<Guard>(
+            GetProcAddress(proxy, "?setGuardByteBufferSize@MiniDmpSender@@QEAAHH@Z"));
+        Check(constructor && destructor && send && guard, "proxy exports resolve for chain test");
+        if (!(constructor && destructor && send && guard))
+        {
+            return failures;
+        }
+
+        alignas(std::max_align_t) std::array<std::byte, 128> storage{};
+        void* object = constructor(storage.data(), L"chain", L"e", L"k", L"u", 32);
+        Check(object == storage.data(), "constructor result preserved through the chain");
+        send(object, L"file.txt");
+        Check(guard(object, 5) == 12, "guard-size result (fake returns value+7) preserved through the chain");
+        destructor(object);
+
+        Check(GetModuleHandleW(extenderName) != nullptr, "chain target extender is loaded");
+        HMODULE original = LoadLibraryW(originalPath); // already mapped by the extender's forwarders
+        using GetCallCounts = void (WINAPI*)(int*, int*, int*);
+        auto getCallCounts = original == nullptr ? nullptr : reinterpret_cast<GetCallCounts>(
+            GetProcAddress(original, "FakeGetCallCounts"));
+        int constructors = 0;
+        int sends = 0;
+        int destructors = 0;
+        Check(getCallCounts != nullptr, "fake original counter resolves for chain test");
+        if (getCallCounts != nullptr)
+        {
+            getCallCounts(&constructors, &sends, &destructors);
+            Check(constructors == 1 && sends == 1 && destructors == 1,
+                "each call traversed proxy, chained extender and original exactly once");
+        }
+        return failures;
+    }
+
+    int RunChainTest(
+        const wchar_t* proxyPath,
+        const wchar_t* originalPath,
+        const wchar_t* extenderPath,
+        const wchar_t* extenderSha256,
+        const wchar_t* mode)
+    {
+        wchar_t executablePath[MAX_PATH]{};
+        const DWORD executableLength = GetModuleFileNameW(nullptr, executablePath, MAX_PATH);
+        Check(executableLength != 0 && executableLength < MAX_PATH,
+            "test executable path is available");
+        if (executableLength == 0 || executableLength >= MAX_PATH)
+        {
+            return failures;
+        }
+        const wchar_t* separator = std::wcsrchr(extenderPath, L'\\');
+        const std::wstring extenderName = separator == nullptr ? extenderPath : separator + 1;
+        const std::wstring logPath = std::wstring(proxyPath) + L".chain.log";
+
+        struct Case
+        {
+            const char* label;
+            std::wstring next;
+            std::wstring hash;      // empty: unset
+            bool expectSuccess;
+            bool expectNote;
+        };
+        std::vector<Case> cases;
+        if (std::wstring_view(mode) == L"require-hash")
+        {
+            // INI beside the proxy has RequireHash=1: an unpinned chain target is refused.
+            cases.push_back({"RequireHash refuses an unpinned chain target",
+                extenderName, L"", false, false});
+            cases.push_back({"RequireHash accepts a matching pin",
+                extenderName, extenderSha256, true, true});
+        }
+        else
+        {
+            cases.push_back({"chain through a forwarding extender", extenderName, L"", true, true});
+            cases.push_back({"chain with a matching SHA-256 pin", extenderName, extenderSha256, true, true});
+            cases.push_back({"chain with a wrong SHA-256 pin is refused", extenderName,
+                std::wstring(64, L'0'), false, false});
+            cases.push_back({"missing chain target is refused", L"NoSuchExtender.dll", L"", false, false});
+            cases.push_back({"path in chain target is refused", L"..\\evil.dll", L"", false, false});
+            cases.push_back({"non-dll chain target is refused", L"extender.txt", L"", false, false});
+            cases.push_back({"chaining to the proxy itself is refused", L"BugSplat64.dll", L"", false, false});
+        }
+
+        for (const Case& test : cases)
+        {
+            DeleteFileW(logPath.c_str());
+            SetEnvironmentVariableW(L"SOULASH2_CHAIN_NEXT", test.next.c_str());
+            SetEnvironmentVariableW(L"SOULASH2_CHAIN_NEXT_SHA256",
+                test.hash.empty() ? nullptr : test.hash.c_str());
+            SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, logPath.c_str());
+
+            const std::wstring commandLine = L"\"" + std::wstring(executablePath)
+                + L"\" --chain-child \"" + proxyPath + L"\" \"" + originalPath
+                + L"\" \"" + extenderName + L"\"";
+            DWORD exitCode = ERROR_GEN_FAILURE;
+            const bool finished = RunChildProcess(commandLine, false, exitCode);
+            const bool passed = test.expectSuccess
+                ? finished && exitCode == 0
+                : finished && exitCode == FailFastExceptionStatus;
+            if (!passed)
+            {
+                std::cerr << "chain case exit code " << exitCode << '\n';
+            }
+            Check(passed, test.label);
+
+            if (test.expectNote)
+            {
+                std::string log;
+                Check(ReadLog(logPath.c_str(), log)
+                        && log.find("plugin message=chain_next loaded name=") != std::string::npos,
+                    "chain target is recorded in the diagnostics log");
+            }
+        }
+
+        SetEnvironmentVariableW(L"SOULASH2_CHAIN_NEXT", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_CHAIN_NEXT_SHA256", nullptr);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, nullptr);
+        DeleteFileW(logPath.c_str());
+        if (failures == 0)
+        {
+            std::cout << "PASS: chain loading (" << (std::wstring_view(mode) == L"require-hash"
+                ? "RequireHash policy" : "forwarding extender, pins, refusals") << ")\n";
+        }
+        return failures;
+    }
+
+    // Lua scripts run through the proxy: loaded, logged, contained, capped.
+    int RunScriptsTest(
+        const wchar_t* proxyPath,
+        const wchar_t* originalPath,
+        const wchar_t* scriptDirectory,
+        const wchar_t* logPath)
+    {
+        DeleteFileW(logPath);
+        SetEnvironmentVariableW(L"SOULASH2_NATIVE_MODULE_MANIFEST", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_PLUGIN_DIRECTORY", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_SCRIPT_DIRECTORY", scriptDirectory);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, logPath);
+
+        HMODULE original = LoadLibraryW(originalPath);
+        HMODULE proxy = original == nullptr
+            ? nullptr : LoadLibraryExW(proxyPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        Check(original != nullptr && proxy != nullptr, "proxy and original load for the script test");
+        if (original != nullptr && proxy != nullptr)
+        {
+            using Constructor = void* (__cdecl*)(
+                void*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, unsigned long);
+            auto constructor = reinterpret_cast<Constructor>(
+                GetProcAddress(proxy, "?" "?0MiniDmpSender@@QEAA@PEB_W000K@Z"));
+            Check(constructor != nullptr, "proxy constructor resolves for the script test");
+            if (constructor != nullptr)
+            {
+                alignas(std::max_align_t) std::array<std::byte, 128> storage{};
+                const ULONGLONG started = GetTickCount64();
+                void* object = constructor(storage.data(), L"scripts", L"e", L"k", L"u", 32);
+                Check(object == storage.data(), "constructor result preserved with scripts enabled");
+                (void)started;
+            }
+
+            std::string log;
+            bool finished = false;
+            for (unsigned attempt = 0; attempt < 1000 && !finished; ++attempt)
+            {
+                log.clear();
+                finished = ReadLog(logPath, log)
+                    && log.find("script Test.Loop failed") != std::string::npos
+                    && log.find("script Test.Hello loaded") != std::string::npos;
+                if (!finished)
+                {
+                    Sleep(10);
+                }
+            }
+            Check(finished, "scripts finished loading");
+            Check(log.find("plugin message=script Test.Hello: top level\r\n") != std::string::npos,
+                "a script's top-level ext.log reaches the diagnostics log");
+            Check(log.find("plugin message=script Test.Hello: hello from on_load\r\n") != std::string::npos,
+                "the optional on_load function is called");
+            Check(log.find("script Test.Evil failed:") != std::string::npos
+                    && log.find("io") != std::string::npos,
+                "a script that reaches for io fails inside the sandbox");
+            Check(log.find("script Test.Evil loaded") == std::string::npos,
+                "a failed script is not reported as loaded");
+            Check(log.find("script Test.Loop failed: instruction limit exceeded") != std::string::npos,
+                "an endless script is stopped by its budget");
+            Check(log.find("script Test.After loaded") != std::string::npos,
+                "scripts after a failing one still load");
+            Check(log.find("bad name") == std::string::npos, "an invalid script file name is skipped");
+        }
+
+        if (proxy != nullptr) FreeLibrary(proxy);
+        if (original != nullptr) FreeLibrary(original);
+        SetEnvironmentVariableW(L"SOULASH2_SCRIPT_DIRECTORY", nullptr);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, nullptr);
+        DeleteFileW(logPath);
+        if (failures == 0)
+        {
+            std::cout << "PASS: Lua scripts load through the extender and stay inside the sandbox\n";
+        }
+        return failures;
+    }
+
+    // Condition files in a synthetic mods folder are discovered and loaded strictly.
+    int RunConditionDiscoveryTest(
+        const wchar_t* proxyPath,
+        const wchar_t* originalPath,
+        const wchar_t* modsDirectory,
+        const wchar_t* logPath)
+    {
+        DeleteFileW(logPath);
+        SetEnvironmentVariableW(L"SOULASH2_NATIVE_MODULE_MANIFEST", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_PLUGIN_DIRECTORY", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_SCRIPT_DIRECTORY", nullptr);
+        SetEnvironmentVariableW(L"SOULASH2_MODS_DIRECTORY", modsDirectory);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, logPath);
+
+        HMODULE original = LoadLibraryW(originalPath);
+        HMODULE proxy = original == nullptr
+            ? nullptr : LoadLibraryExW(proxyPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        Check(original != nullptr && proxy != nullptr, "proxy and original load for the conditions test");
+        if (original != nullptr && proxy != nullptr)
+        {
+            using Constructor = void* (__cdecl*)(
+                void*, const wchar_t*, const wchar_t*, const wchar_t*, const wchar_t*, unsigned long);
+            auto constructor = reinterpret_cast<Constructor>(
+                GetProcAddress(proxy, "?" "?0MiniDmpSender@@QEAA@PEB_W000K@Z"));
+            Check(constructor != nullptr, "proxy constructor resolves for the conditions test");
+            if (constructor != nullptr)
+            {
+                alignas(std::max_align_t) std::array<std::byte, 128> storage{};
+                void* object = constructor(storage.data(), L"conditions", L"e", L"k", L"u", 32);
+                Check(object == storage.data(), "constructor result preserved with conditions enabled");
+            }
+
+            std::string log;
+            bool finished = false;
+            for (unsigned attempt = 0; attempt < 1000 && !finished; ++attempt)
+            {
+                log.clear();
+                finished = ReadLog(logPath, log) && log.find("plugin message=conditions: ") != std::string::npos;
+                if (!finished)
+                {
+                    Sleep(10);
+                }
+            }
+            Check(finished, "condition discovery finished");
+            Check(log.find("plugin message=conditions ModA: 3 condition(s) loaded\r\n") != std::string::npos,
+                "a valid conditions file is loaded and counted");
+            Check(log.find("plugin message=conditions ModB rejected: duplicate condition id 'dup'\r\n")
+                    != std::string::npos,
+                "an invalid conditions file is rejected with the reason");
+            Check(log.find("plugin message=conditions ModD: 1 condition(s) loaded\r\n") != std::string::npos,
+                "later mods still load after a rejected one");
+            Check(log.find("conditions ModC") == std::string::npos,
+                "a mod without an extender folder is silently ignored");
+            Check(log.find("plugin message=conditions: 4 condition(s) from 2 mod(s)\r\n") != std::string::npos,
+                "the summary counts only accepted files");
+        }
+
+        if (proxy != nullptr) FreeLibrary(proxy);
+        if (original != nullptr) FreeLibrary(original);
+        SetEnvironmentVariableW(L"SOULASH2_MODS_DIRECTORY", nullptr);
+        SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, nullptr);
+        DeleteFileW(logPath);
+        if (failures == 0)
+        {
+            std::cout << "PASS: condition files are discovered per mod, loaded strictly, and reported\n";
+        }
+        return failures;
+    }
+
     int RunMissingOriginalChild(const wchar_t* proxyPath)
     {
         SetEnvironmentVariableW(DiagnosticsEnvironmentVariable, nullptr);
@@ -999,6 +1725,14 @@ namespace
             << "       native-tests.exe --coexist <proxy-dll> <fake-original-dll> <synthetic-extender-dll>\n"
             << "       native-tests.exe --module <proxy-dll> <fake-original-dll> <manifest> <marker>\n"
             << "       native-tests.exe --module-failure <proxy-dll> <fake-original-dll> <manifest>\n"
+            << "       native-tests.exe --plugin-dir <proxy-dll> <fake-original-dll> <plugin-dir> <marker>\n"
+            << "       native-tests.exe --debugger-fallback <proxy-dll> <fake-original-dll> <manifest> <marker-base>\n"
+            << "       native-tests.exe --sandbox\n"
+            << "       native-tests.exe --conditions <conditions-example.json>\n"
+            << "       native-tests.exe --conditions-discovery <proxy-dll> <fake-original-dll> <mods-dir> <log-path>\n"
+            << "       native-tests.exe --scripts <proxy-dll> <fake-original-dll> <script-dir> <log-path>\n"
+            << "       native-tests.exe --chain <proxy-dll> <fake-original-dll> <extender-dll> <extender-sha256> <default|require-hash>\n"
+            << "       native-tests.exe --decoder-oracle <image> <dumpbin-disasm-nobytes-listing>\n"
             << "       native-tests.exe --missing <proxy-dll>\n"
             << "       native-tests.exe --missing-child <proxy-dll>\n"
             << "       native-tests.exe --diagnostics <diagnostics-dll> <local-log-path> <synthetic-plugin-dll>\n";
@@ -1010,6 +1744,7 @@ int wmain(int argc, wchar_t* argv[])
     if (argc == 2 && std::wstring_view(argv[1]) == L"--unit")
     {
         TestManifestParser();
+        TestX64Decoder();
         if (failures == 0)
         {
             std::cout << "PASS: native module manifest tests\n";
@@ -1036,6 +1771,61 @@ int wmain(int argc, wchar_t* argv[])
     {
         const std::wstring markerPath = std::wstring(argv[4]) + L".marker";
         return RunNativeModuleTest(argv[2], argv[3], argv[4], markerPath.c_str(), false);
+    }
+
+    if (argc == 6 && std::wstring_view(argv[1]) == L"--plugin-dir")
+    {
+        return RunPluginDirectoryTest(argv[2], argv[3], argv[4], argv[5]);
+    }
+
+    if (argc == 6 && std::wstring_view(argv[1]) == L"--scripts")
+    {
+        return RunScriptsTest(argv[2], argv[3], argv[4], argv[5]);
+    }
+
+    if (argc == 6 && std::wstring_view(argv[1]) == L"--conditions-discovery")
+    {
+        return RunConditionDiscoveryTest(argv[2], argv[3], argv[4], argv[5]);
+    }
+
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--conditions")
+    {
+        return RunConditionsTests(argv[2]);
+    }
+
+    if (argc == 2 && std::wstring_view(argv[1]) == L"--sandbox")
+    {
+        return RunSandboxTests();
+    }
+
+    if (argc == 7 && std::wstring_view(argv[1]) == L"--chain")
+    {
+        return RunChainTest(argv[2], argv[3], argv[4], argv[5], argv[6]);
+    }
+
+    if (argc == 5 && std::wstring_view(argv[1]) == L"--chain-child")
+    {
+        return RunChainChild(argv[2], argv[3], argv[4]);
+    }
+
+    if (argc == 4 && std::wstring_view(argv[1]) == L"--decoder-oracle")
+    {
+        return RunDecoderOracle(argv[2], argv[3]);
+    }
+
+    if (argc == 6 && std::wstring_view(argv[1]) == L"--plugin-allowlist")
+    {
+        return RunPluginAllowlistTest(argv[2], argv[3], argv[4], argv[5]);
+    }
+
+    if (argc == 6 && std::wstring_view(argv[1]) == L"--debugger-fallback")
+    {
+        return RunDebuggerFallbackTest(argv[2], argv[3], argv[4], argv[5]);
+    }
+
+    if (argc == 6 && std::wstring_view(argv[1]) == L"--debugger-fallback-child")
+    {
+        return RunDebuggerFallbackChild(argv[2], argv[3], argv[4], argv[5]);
     }
 
     if (argc == 3 && std::wstring_view(argv[1]) == L"--missing")

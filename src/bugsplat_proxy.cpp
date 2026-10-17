@@ -2,11 +2,14 @@
 #include <intrin.h>
 
 #include <cstddef>
+#include <cstdio>
 #include <cwchar>
 
 #include "module_runtime.hpp"
+#include "plugin_services.hpp"
 
 extern "C" BOOL WINAPI SoulashDiagnosticsStart(const wchar_t* logPath);
+extern "C" BOOL WINAPI SoulashDiagnosticsWritePluginMessage(const char* message);
 
 namespace
 {
@@ -34,6 +37,7 @@ namespace
     INIT_ONCE g_initialization = INIT_ONCE_STATIC_INIT;
     OriginalApi g_original;
     volatile LONG g_diagnosticsChecked = 0;
+    char g_chainNote[160]{};
 
     bool GetProxyPath(wchar_t (&path)[MAX_PATH])
     {
@@ -51,15 +55,15 @@ namespace
         return length != 0 && length < MAX_PATH;
     }
 
-    bool ReadDiagnosticsIniPath(wchar_t (&logPath)[MAX_PATH])
+    // Fills `iniPath` with the SoulashExtender.ini path beside the proxy DLL.
+    bool BuildIniPath(wchar_t (&iniPath)[MAX_PATH])
     {
-        wchar_t proxyPath[MAX_PATH]{};
-        if (!GetProxyPath(proxyPath))
+        if (!GetProxyPath(iniPath))
         {
             return false;
         }
 
-        wchar_t* fileName = std::wcsrchr(proxyPath, L'\\');
+        wchar_t* fileName = std::wcsrchr(iniPath, L'\\');
         if (fileName == nullptr)
         {
             return false;
@@ -67,13 +71,24 @@ namespace
         ++fileName;
         constexpr wchar_t IniName[] = L"SoulashExtender.ini";
         constexpr std::size_t IniNameLength = sizeof(IniName) / sizeof(IniName[0]);
-        const std::size_t directoryLength = static_cast<std::size_t>(fileName - proxyPath);
+        const std::size_t directoryLength = static_cast<std::size_t>(fileName - iniPath);
         if (directoryLength + IniNameLength > MAX_PATH)
         {
             return false;
         }
         std::wmemcpy(fileName, IniName, IniNameLength);
+        return true;
+    }
 
+    bool ReadDiagnosticsIniPath(wchar_t (&logPath)[MAX_PATH])
+    {
+        wchar_t proxyPath[MAX_PATH]{};
+        if (!BuildIniPath(proxyPath))
+        {
+            return false;
+        }
+
+        wchar_t* fileName = nullptr;
         if (GetPrivateProfileIntW(L"Diagnostics", L"Enabled", 0, proxyPath) != 1)
         {
             return false;
@@ -146,7 +161,72 @@ namespace
         {
             SoulashDiagnosticsStart(logPath);
         }
+        if (g_chainNote[0] != '\0')
+        {
+            SoulashDiagnosticsWritePluginMessage(g_chainNote);
+        }
         SetLastError(previousError);
+    }
+
+    bool IsValidChainFileName(const wchar_t* name, const wchar_t* selfName)
+    {
+        const std::size_t length = std::wcslen(name);
+        if (length < 5 || length > 100 || _wcsicmp(name + length - 4, L".dll") != 0
+            || _wcsicmp(name, selfName) == 0)
+        {
+            return false;
+        }
+        for (std::size_t index = 0; index < length; ++index)
+        {
+            const wchar_t value = name[index];
+            const bool alphaNumeric = (value >= L'a' && value <= L'z')
+                || (value >= L'A' && value <= L'Z') || (value >= L'0' && value <= L'9');
+            if (!alphaNumeric && value != L'.' && value != L'_' && value != L'-')
+            {
+                return false;
+            }
+        }
+        return name[0] != L'.';
+    }
+
+    // Chain loading: instead of the sibling BugSplat64_original.dll, the proxy
+    // can forward to another extender's BugSplat64-compatible DLL, which in
+    // turn forwards to the real one. The target is a plain file name in the
+    // proxy's own directory: SOULASH2_CHAIN_NEXT, else [Chain] Next in the INI.
+    DWORD ResolveChainTarget(
+        const wchar_t* selfName,
+        wchar_t (&targetName)[MAX_PATH],
+        bool& chained,
+        wchar_t (&expectedHash)[80],
+        bool& hashRequired)
+    {
+        wchar_t iniPath[MAX_PATH]{};
+        const bool haveIni = BuildIniPath(iniPath);
+
+        wchar_t configured[MAX_PATH]{};
+        DWORD length = GetEnvironmentVariableW(L"SOULASH2_CHAIN_NEXT", configured, MAX_PATH);
+        if (length == 0 && haveIni)
+        {
+            length = GetPrivateProfileStringW(L"Chain", L"Next", L"", configured, MAX_PATH, iniPath);
+        }
+        if (length == 0)
+        {
+            return ERROR_SUCCESS;
+        }
+        if (length >= MAX_PATH || !IsValidChainFileName(configured, selfName))
+        {
+            return ERROR_INVALID_NAME;
+        }
+
+        wcscpy_s(targetName, MAX_PATH, configured);
+        chained = true;
+        if (GetEnvironmentVariableW(L"SOULASH2_CHAIN_NEXT_SHA256", expectedHash, 80) == 0 && haveIni)
+        {
+            GetPrivateProfileStringW(L"Chain", L"NextSha256", L"", expectedHash, 80, iniPath);
+        }
+        hashRequired = haveIni
+            && GetPrivateProfileIntW(L"Plugins", L"RequireHash", 0, iniPath) == 1;
+        return ERROR_SUCCESS;
     }
 
     BOOL CALLBACK InitializeOriginal(PINIT_ONCE, PVOID, PVOID*)
@@ -181,25 +261,97 @@ namespace
         }
 
         ++fileName;
-        constexpr wchar_t OriginalFileName[] = L"BugSplat64_original.dll";
-        constexpr std::size_t OriginalFileNameLength =
-            sizeof(OriginalFileName) / sizeof(OriginalFileName[0]);
+        wchar_t targetName[MAX_PATH] = L"BugSplat64_original.dll";
+        wchar_t expectedHash[80]{};
+        bool chained = false;
+        bool hashRequired = false;
+        const DWORD chainError = ResolveChainTarget(fileName, targetName, chained, expectedHash, hashRequired);
+        if (chainError != ERROR_SUCCESS)
+        {
+            g_original.error = chainError;
+            return TRUE;
+        }
+
+        const std::size_t targetNameLength = std::wcslen(targetName) + 1;
         const std::size_t directoryLength = static_cast<std::size_t>(fileName - originalPath);
-        if (directoryLength + OriginalFileNameLength > MAX_PATH)
+        if (directoryLength + targetNameLength > MAX_PATH)
         {
             g_original.error = ERROR_FILENAME_EXCED_RANGE;
             return TRUE;
         }
-        std::wmemcpy(fileName, OriginalFileName, OriginalFileNameLength);
+        std::wmemcpy(fileName, targetName, targetNameLength);
+
+        // Two instances of this proxy in one process would each start their own
+        // diagnostics and plugins, so only the first may initialize.
+        wchar_t guardName[64];
+        swprintf_s(guardName, L"Local\\SoulashExtenderProxyActive.%lu", GetCurrentProcessId());
+        HANDLE guard = CreateMutexW(nullptr, FALSE, guardName);
+        if (guard != nullptr && GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            CloseHandle(guard);
+            g_original.error = ERROR_ALREADY_EXISTS;
+            return TRUE;
+        }
+        // The guard handle is intentionally kept for the life of the process.
+
+        // A chained extender runs with full privileges: pin it by hash when a
+        // hash is configured, and require one under [Plugins] RequireHash=1.
+        HANDLE pin = INVALID_HANDLE_VALUE;
+        if (chained && (hashRequired || expectedHash[0] != L'\0'))
+        {
+            bool verified = false;
+            pin = CreateFileW(
+                originalPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL, nullptr);
+            char actual[65]{};
+            if (pin != INVALID_HANDLE_VALUE && std::wcslen(expectedHash) == 64
+                && soulash::plugin_services::Sha256OfHandle(pin, actual))
+            {
+                verified = true;
+                for (unsigned index = 0; index < 64; ++index)
+                {
+                    wchar_t want = expectedHash[index];
+                    if (want >= L'A' && want <= L'F')
+                    {
+                        want = static_cast<wchar_t>(want - L'A' + L'a');
+                    }
+                    verified = verified && want == static_cast<wchar_t>(actual[index]);
+                }
+            }
+            if (!verified)
+            {
+                if (pin != INVALID_HANDLE_VALUE)
+                {
+                    CloseHandle(pin);
+                }
+                g_original.error = ERROR_ACCESS_DENIED;
+                return TRUE;
+            }
+        }
 
         HMODULE original = LoadLibraryExW(
             originalPath,
             nullptr,
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const DWORD loadError = GetLastError();
+        if (pin != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(pin);
+        }
         if (original == nullptr)
         {
-            g_original.error = GetLastError();
+            g_original.error = loadError;
             return TRUE;
+        }
+        if (original == proxyModule)
+        {
+            g_original.error = ERROR_CIRCULAR_DEPENDENCY;
+            return TRUE;
+        }
+        if (chained)
+        {
+            _snprintf_s(g_chainNote, sizeof(g_chainNote), _TRUNCATE,
+                "chain_next loaded name=%ls", targetName);
         }
 
         g_original.constructor = reinterpret_cast<Constructor>(
@@ -227,6 +379,41 @@ namespace
 
         g_original.module = original;
         return TRUE;
+    }
+
+    // The game skips constructing its crash sender when a debugger is
+    // attached (it calls IsDebuggerPresent first in main), so no proxy export
+    // would ever be called and nothing would load. In that case the same
+    // opt-in start-up is triggered from a thread created in DllMain; the
+    // thread cannot run before the loader lock is released.
+    // Disable with SOULASH2_DEBUGGER_FALLBACK=0 or [Extender] DebuggerFallback=0.
+    DWORD WINAPI DebuggerFallbackThread(void*)
+    {
+        bool enabled = true;
+        wchar_t value[8]{};
+        const DWORD length = GetEnvironmentVariableW(
+            L"SOULASH2_DEBUGGER_FALLBACK", value, sizeof(value) / sizeof(value[0]));
+        if (length != 0)
+        {
+            enabled = !(length == 1 && value[0] == L'0');
+        }
+        else
+        {
+            wchar_t iniPath[MAX_PATH]{};
+            if (BuildIniPath(iniPath))
+            {
+                enabled = GetPrivateProfileIntW(L"Extender", L"DebuggerFallback", 1, iniPath) != 0;
+            }
+        }
+
+        if (enabled)
+        {
+            OutputDebugStringA(
+                "Soulash extender: debugger detected; starting without the BugSplat trigger.\r\n");
+            StartOptInDiagnostics();
+            soulash::module_runtime::StartOptInModule();
+        }
+        return 0;
     }
 
     const OriginalApi& GetOriginal()
@@ -289,4 +476,26 @@ extern "C" int __cdecl ProxySetGuardByteBufferSize(void* self, int size)
     soulash::module_runtime::StartOptInModule();
     SetLastError(lastError);
     return result;
+}
+
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH && IsDebuggerPresent())
+    {
+        // Only create a thread here: it starts after the loader lock is
+        // released. Pinning keeps the proxy mapped while that thread runs.
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                reinterpret_cast<LPCWSTR>(&DllMain),
+                &self))
+        {
+            HANDLE thread = CreateThread(nullptr, 0, DebuggerFallbackThread, nullptr, 0, nullptr);
+            if (thread != nullptr)
+            {
+                CloseHandle(thread);
+            }
+        }
+    }
+    return TRUE;
 }

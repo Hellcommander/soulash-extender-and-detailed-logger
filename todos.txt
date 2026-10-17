@@ -1,5 +1,27 @@
-I’ll improve attribution within the logger’s evidence boundary: capture the full bounded exception context and correlate fault/caller addresses against a fresh module snapshot, so a loaded plugin can be named when it is actually on the faulting stack. I’ll also make logs distinguish a likely module involvement from a game-only fault; this can’t prove that a data mod caused a crash unless the game exposes that association
+Direction: SKSE-style extender for Soulash 2 (open-source S2NF alternative).
 
-it should act as a extender like [Skyrim Script Extender (SKSE)](https://skse.silverlock.org/)
+Done
+- Proxy BugSplat64.dll with opt-in crash logger (access violation context, module/RVA attribution, stack unwind).
+- Single manifest-listed module bootstrap (ABI v2).
+- Plugin directory discovery, ordered loading, per-plugin ids in crash attribution.
+- Debugger fallback: DllMain-created thread starts the extender when a debugger is attached (main skips BugSplat then).
+- Plugin SHA-256 allowlist ([Plugins] RequireHash=1, [PluginHashes]).
+- Build-independent anchors: findFunctionsReferencingString, findRttiVtable.
+- x64 length decoder + installDetourAuto (relocates branches/RIP-relative, refuses unsafe targets); validated against dumpbin, incl. the game exe once.
+- Chain loading of other BugSplat64-compatible extenders ([Chain] Next / NextSha256, tested with a forwarding extender); second proxy instance refused.
+- scripts/check-install.ps1: read-only post-update check (proxy replaced by vendor DLL, unknown build, stale pins).
+- Sandboxed Lua scripts: whitelisted Lua 5.4 per *.lua, logging-only API, memory/instruction/time/native-work caps, escape and resource tests. Next: game-state query API, skill-conditions evaluator written against it, periodic review of Lua security fixes (current: 5.4.9).
+- Interface v3: messaging, lifecycle messages, game exe SHA-256/base, patchMemory, installDetour.
 
-README to state the project's intended direction—an open-source S2NF alternative, richer game diagnostics, and work toward preventing known crashes—while distinguishing that goal from current capabilities.
+Not done / needs the real game to verify
+- Load point verified statically (docs/game-notes.md): BugSplat ctor is called early in main. Still unverified at runtime.
+- Add a "data about to load" message by hooking the mod-loading entry (current build RVA 0x4D9760), keyed by exe SHA-256.
+- Re-check the recorded null-write crash (older build 7cec802f RVA 0x6E7E52) against the current build.
+- Game-specific hooks (needs reverse engineering of Soulash 2.exe); use anchors + installDetourAuto, and runtime-verify before shipping any.
+- Removed: loader.exe (SKSE-style injector). One supported install route: the BugSplat64.dll proxy, re-pasted after each update (check-install.ps1 warns).
+- Skill conditions (someone asked for them): native vocabulary is closed (docs/skill-schema.md). Spec v1 written (docs/skill-conditions.md, schema, example, tools/validate_conditions.py). Evaluator core done (src/conditions.cpp, synthetic snapshots); conditions files are discovered per mod and loaded/logged at start-up. Next: a real state source (needs game hooks or the Lua layer) and either finding where passive/ability fields are evaluated (dynamic analysis) or testing the tag-bridge idea (does restrict_tags accept mod-defined tags?).
+- Runtime-verify anchors against the real Soulash 2.exe (string anchors for "Loading mods:" etc., RTTI such as MainMenuScreen).
+- Script/data-mod integration points.
+- Decide whether to suspend other threads while patching.
+- Distinguish "likely module involvement" from "game-only fault" in crash records.
+- S2NF-compatible lifecycle, only if S2NF's real loader behaviour can be verified.

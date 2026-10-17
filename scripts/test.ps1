@@ -16,6 +16,58 @@ $syntheticModulePath = Join-Path $outputDirectory 'synthetic-modules\native\Synt
 & $testsPath --unit
 if ($LASTEXITCODE -ne 0) { throw 'Manifest parser tests failed.' }
 
+$oracleListing = Join-Path $outputDirectory 'native-tests.asm'
+& dumpbin.exe /nologo /disasm:nobytes $testsPath | Set-Content -LiteralPath $oracleListing -Encoding ascii
+if ($LASTEXITCODE -ne 0) { throw 'dumpbin disassembly failed.' }
+& $testsPath --decoder-oracle $testsPath $oracleListing
+if ($LASTEXITCODE -ne 0) { throw 'x64 length decoder oracle test failed.' }
+
+$python = Get-Command python -ErrorAction SilentlyContinue
+if ($python) {
+    & $python.Source -I (Join-Path $repoRoot 'tools\validate_conditions.py') --self-test
+    if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions validator self-test failed.' }
+    & $python.Source -I (Join-Path $repoRoot 'tools\validate_conditions.py') (Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions example does not validate.' }
+}
+else {
+    Write-Output 'SKIP: python not found; skill-conditions validator not run.'
+}
+
+& $testsPath --conditions (Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json')
+if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions evaluator test failed.' }
+
+& $testsPath --sandbox
+if ($LASTEXITCODE -ne 0) { throw 'Lua sandbox test failed.' }
+
+$modsDirectoryPath = Join-Path $outputDirectory ("mods-" + [guid]::NewGuid().ToString('N'))
+$exampleConditions = Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json'
+foreach ($mod in 'ModA', 'ModB', 'ModC', 'ModD') { New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath $mod) -Force | Out-Null }
+New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModA\extender') -Force | Out-Null
+Copy-Item -LiteralPath $exampleConditions -Destination (Join-Path $modsDirectoryPath 'ModA\extender\conditions.json')
+New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModB\extender') -Force | Out-Null
+$oneCondition = '{"id":"dup","target":{"kind":"passive","id":"%s"},"when":{"in_combat":true}}'
+[System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModB\extender\conditions.json'),
+    ('{"spec":1,"conditions":[' + $oneCondition.Replace('%s', 'a') + ',' + $oneCondition.Replace('%s', 'b') + ']}'))
+New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModD\extender') -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModD\extender\conditions.json'),
+    ('{"spec":1,"conditions":[' + $oneCondition.Replace('%s', 'z') + ']}'))
+$conditionsLogPath = Join-Path $outputDirectory ("conditions-" + [guid]::NewGuid().ToString('N') + '.log')
+& $testsPath --conditions-discovery $proxyPath $fakeOriginalPath $modsDirectoryPath $conditionsLogPath
+if ($LASTEXITCODE -ne 0) { throw 'Condition discovery test failed.' }
+
+$scriptDirectoryPath = Join-Path $outputDirectory 'script-dir'
+New-Item -ItemType Directory -Path $scriptDirectoryPath -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.Hello.lua'),
+    "ext.log('top level')`nfunction on_load() ext.log('hello from on_load') end`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.Evil.lua'),
+    "local f = io.open('C:\\Windows\\win.ini')`nos.execute('calc')`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.Loop.lua'), "while true do end`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.After.lua'), "after = true`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'bad name.lua'), "ext.log('must not run')`n")
+$scriptLogPath = Join-Path $outputDirectory ("scripts-" + [guid]::NewGuid().ToString('N') + '.log')
+& $testsPath --scripts $proxyPath $fakeOriginalPath $scriptDirectoryPath $scriptLogPath
+if ($LASTEXITCODE -ne 0) { throw 'Script loading test failed.' }
+
 $disabledLogPath = Join-Path $outputDirectory ("diagnostics-disabled-" + [guid]::NewGuid().ToString('N') + '.log')
 & $testsPath --proxy $proxyPath $fakeOriginalPath disabled $disabledLogPath
 if ($LASTEXITCODE -ne 0) { throw 'Default-disabled proxy forwarding test failed.' }
@@ -70,6 +122,68 @@ if ($LASTEXITCODE -ne 0) { throw 'Opt-in synthetic native module test failed.' }
 $invalidModuleManifestPath = Join-Path $outputDirectory ("missing-manifest-" + [guid]::NewGuid().ToString('N') + '.txt')
 & $testsPath --module-failure $proxyPath $fakeOriginalPath $invalidModuleManifestPath
 if ($LASTEXITCODE -ne 0) { throw 'Native module load failure-isolation test failed.' }
+
+$fallbackMarkerBase = Join-Path $outputDirectory ("debugger-fallback-" + [guid]::NewGuid().ToString('N'))
+& $testsPath --debugger-fallback $proxyPath $fakeOriginalPath $moduleManifestPath $fallbackMarkerBase
+if ($LASTEXITCODE -ne 0) { throw 'Debugger fallback test failed.' }
+
+$pluginDirectoryPath = Join-Path $outputDirectory 'plugin-dir'
+$pluginMarkerPath = Join-Path $outputDirectory ("plugin-dir-" + [guid]::NewGuid().ToString('N') + '.txt')
+try {
+    & $testsPath --plugin-dir $proxyPath $fakeOriginalPath $pluginDirectoryPath $pluginMarkerPath
+    if ($LASTEXITCODE -ne 0) { throw 'Plugin directory discovery test failed.' }
+}
+finally {
+    if (Test-Path -LiteralPath $pluginMarkerPath) {
+        Remove-Item -LiteralPath $pluginMarkerPath -Force
+    }
+}
+
+$allowlistIniPath = Join-Path $outputDirectory 'SoulashExtender.ini'
+$allowlistMarkerPath = Join-Path $outputDirectory ("plugin-allowlist-" + [guid]::NewGuid().ToString('N') + '.txt')
+$pluginAHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $pluginDirectoryPath 'Test.PluginA.dll')).Hash.ToUpperInvariant()
+try {
+    [System.IO.File]::WriteAllText(
+        $allowlistIniPath,
+        "[Plugins]`r`nRequireHash=1`r`n[PluginHashes]`r`nTest.PluginA=$pluginAHash`r`nTest.LegacyV2=$('0' * 64)`r`n",
+        [System.Text.Encoding]::ASCII)
+    & $testsPath --plugin-allowlist $proxyPath $fakeOriginalPath $pluginDirectoryPath $allowlistMarkerPath
+    if ($LASTEXITCODE -ne 0) { throw 'Plugin allowlist test failed.' }
+}
+finally {
+    foreach ($leftover in @($allowlistIniPath, $allowlistMarkerPath)) {
+        if (Test-Path -LiteralPath $leftover) { Remove-Item -LiteralPath $leftover -Force }
+    }
+}
+
+$extenderHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $syntheticExtenderPath).Hash.ToLowerInvariant()
+& $testsPath --chain $proxyPath $fakeOriginalPath $syntheticExtenderPath $extenderHash default
+if ($LASTEXITCODE -ne 0) { throw 'Chain loading test failed.' }
+
+$chainIniPath = Join-Path $outputDirectory 'SoulashExtender.ini'
+try {
+    [System.IO.File]::WriteAllText(
+        $chainIniPath,
+        "[Plugins]`r`nRequireHash=1`r`n",
+        [System.Text.Encoding]::ASCII)
+    & $testsPath --chain $proxyPath $fakeOriginalPath $syntheticExtenderPath $extenderHash require-hash
+    if ($LASTEXITCODE -ne 0) { throw 'Chain loading RequireHash test failed.' }
+}
+finally {
+    if (Test-Path -LiteralPath $chainIniPath) { Remove-Item -LiteralPath $chainIniPath -Force }
+}
+
+$distDirectory = Join-Path $outputDirectory ("dist-" + [guid]::NewGuid().ToString('N'))
+& (Join-Path $PSScriptRoot 'package.ps1') -OutputDirectory $distDirectory | Out-Null
+foreach ($expected in 'BugSplat64.dll', 'SoulashExtender.ini', 'INSTALL.txt', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.txt', 'check-install.ps1', 'SoulashExtender\Plugins', 'SoulashExtender\Scripts') {
+    if (-not (Test-Path -LiteralPath (Join-Path $distDirectory $expected))) { throw "Package is missing $expected." }
+}
+$packagedIni = Get-Content -LiteralPath (Join-Path $distDirectory 'SoulashExtender.ini') -Raw
+if ($packagedIni -notmatch '(?m)^\[Plugins\]\s*\r?\nEnabled=1' -or $packagedIni -notmatch '(?m)^\[Scripts\]\s*\r?\nEnabled=1') { throw 'Packaged INI does not enable plugins and scripts.' }
+if ((Get-Content -LiteralPath (Join-Path $distDirectory 'THIRD_PARTY_NOTICES.txt') -Raw) -notmatch 'Permission is hereby granted') { throw 'Packaged notices are missing the Lua licence text.' }
+$sumLine = (Get-Content -LiteralPath (Join-Path $distDirectory 'SHA256SUMS.txt')) | Where-Object { $_ -like '*BugSplat64.dll' }
+if ($sumLine -ne ('{0} *BugSplat64.dll' -f (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $distDirectory 'BugSplat64.dll')).Hash.ToLowerInvariant())) { throw 'SHA256SUMS does not match the packaged DLL.' }
+Write-Output 'PASS: packaged folder is complete and its INI enables plugins and scripts'
 
 $missingDirectory = Join-Path $outputDirectory ("missing-original-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $missingDirectory -Force | Out-Null
