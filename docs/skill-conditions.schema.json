@@ -4,39 +4,83 @@
   "title": "Soulash 2 skill conditions, spec 1",
   "description": "Structure only. Names, ranges and size limits are checked by tools/validate_conditions.py.",
   "type": "object",
-  "required": ["spec", "conditions"],
+  "required": [
+    "spec"
+  ],
   "additionalProperties": false,
   "properties": {
-    "spec": { "const": 1 },
+    "spec": {
+      "const": 1
+    },
     "requires": {
       "type": "array",
-      "items": { "type": "string", "pattern": "^[a-z_]{1,32}$" },
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z_]{1,32}$"
+      },
       "uniqueItems": true
     },
     "conditions": {
       "type": "array",
-      "items": { "$ref": "#/$defs/condition" }
+      "items": {
+        "$ref": "#/$defs/condition"
+      }
+    },
+    "triggers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/trigger"
+      }
     }
   },
   "$defs": {
     "condition": {
       "type": "object",
-      "required": ["id", "target", "when"],
+      "required": [
+        "id",
+        "target",
+        "when"
+      ],
       "additionalProperties": false,
       "properties": {
-        "id": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]{1,64}$"
+        },
         "target": {
           "type": "object",
-          "required": ["kind", "id"],
+          "required": [
+            "kind",
+            "id"
+          ],
           "additionalProperties": false,
           "properties": {
-            "kind": { "enum": ["passive", "ability"] },
-            "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+            "kind": {
+              "enum": [
+                "passive",
+                "ability"
+              ]
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
           }
         },
-        "when": { "$ref": "#/$defs/expr" },
-        "on_unavailable": { "enum": ["inactive", "active"] },
-        "note": { "type": "string", "maxLength": 512 }
+        "when": {
+          "$ref": "#/$defs/expr"
+        },
+        "on_unavailable": {
+          "enum": [
+            "inactive",
+            "active"
+          ]
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 512
+        }
       }
     },
     "expr": {
@@ -44,11 +88,94 @@
       "minProperties": 1,
       "maxProperties": 1,
       "properties": {
-        "all": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/expr" } },
-        "any": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/expr" } },
-        "not": { "$ref": "#/$defs/expr" }
+        "all": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/expr"
+          }
+        },
+        "any": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/expr"
+          }
+        },
+        "not": {
+          "$ref": "#/$defs/expr"
+        }
       },
       "additionalProperties": true
+    },
+    "trigger": {
+      "type": "object",
+      "required": [
+        "id",
+        "on",
+        "cast",
+        "when"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]{1,64}$"
+        },
+        "on": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "properties": {
+            "cast": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "attack": {
+              "const": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "cast": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "chance": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1
+        },
+        "when": {
+          "$ref": "#/$defs/expr"
+        },
+        "on_unavailable": {
+          "enum": [
+            "inactive",
+            "active"
+          ]
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 512
+        }
+      }
     }
-  }
+  },
+  "anyOf": [
+    {
+      "required": [
+        "conditions"
+      ]
+    },
+    {
+      "required": [
+        "triggers"
+      ]
+    }
+  ]
 }

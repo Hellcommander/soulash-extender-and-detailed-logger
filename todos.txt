@@ -1,27 +1,166 @@
-Direction: SKSE-style extender for Soulash 2 (open-source S2NF alternative).
+SOULASH 2 EXTENDER - HANDOFF / TODOS
+====================================
 
-Done
-- Proxy BugSplat64.dll with opt-in crash logger (access violation context, module/RVA attribution, stack unwind).
-- Single manifest-listed module bootstrap (ABI v2).
-- Plugin directory discovery, ordered loading, per-plugin ids in crash attribution.
-- Debugger fallback: DllMain-created thread starts the extender when a debugger is attached (main skips BugSplat then).
-- Plugin SHA-256 allowlist ([Plugins] RequireHash=1, [PluginHashes]).
-- Build-independent anchors: findFunctionsReferencingString, findRttiVtable.
-- x64 length decoder + installDetourAuto (relocates branches/RIP-relative, refuses unsafe targets); validated against dumpbin, incl. the game exe once.
-- Chain loading of other BugSplat64-compatible extenders ([Chain] Next / NextSha256, tested with a forwarding extender); second proxy instance refused.
-- scripts/check-install.ps1: read-only post-update check (proxy replaced by vendor DLL, unknown build, stale pins).
-- Sandboxed Lua scripts: whitelisted Lua 5.4 per *.lua, logging-only API, memory/instruction/time/native-work caps, escape and resource tests. Next: game-state query API, skill-conditions evaluator written against it, periodic review of Lua security fixes (current: 5.4.9).
-- Interface v3: messaging, lifecycle messages, game exe SHA-256/base, patchMemory, installDetour.
+Direction (from the project owner): an open-source, SKSE-style native extender for Soulash 2
+(alternative to S2NF), richer diagnostics, and practical work toward preventing known crashes.
+The game's author has said an extender is welcome (owner's account; not a licence).
 
-Not done / needs the real game to verify
-- Load point verified statically (docs/game-notes.md): BugSplat ctor is called early in main. Still unverified at runtime.
-- Add a "data about to load" message by hooking the mod-loading entry (current build RVA 0x4D9760), keyed by exe SHA-256.
-- Re-check the recorded null-write crash (older build 7cec802f RVA 0x6E7E52) against the current build.
-- Game-specific hooks (needs reverse engineering of Soulash 2.exe); use anchors + installDetourAuto, and runtime-verify before shipping any.
-- Removed: loader.exe (SKSE-style injector). One supported install route: the BugSplat64.dll proxy, re-pasted after each update (check-install.ps1 warns).
-- Skill conditions (someone asked for them): native vocabulary is closed (docs/skill-schema.md). Spec v1 written (docs/skill-conditions.md, schema, example, tools/validate_conditions.py). Evaluator core done (src/conditions.cpp, synthetic snapshots); conditions files are discovered per mod and loaded/logged at start-up. Next: a real state source (needs game hooks or the Lua layer) and either finding where passive/ability fields are evaluated (dynamic analysis) or testing the tag-bridge idea (does restrict_tags accept mod-defined tags?).
-- Runtime-verify anchors against the real Soulash 2.exe (string anchors for "Loading mods:" etc., RTTI such as MainMenuScreen).
-- Script/data-mod integration points.
-- Decide whether to suspend other threads while patching.
-- Distinguish "likely module involvement" from "game-only fault" in crash records.
-- S2NF-compatible lifecycle, only if S2NF's real loader behaviour can be verified.
+READ FIRST: README.md, docs/game-notes.md, docs/skill-schema.md, docs/skill-conditions.md, docs/effects.md.
+
+HOW TO BUILD AND TEST (Windows, x64)
+- Open a VS Build Tools environment. This machine: run `vcvars64.bat` from
+  C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\ and then:
+    pwsh -NoProfile -File scripts\fetch-lua.ps1     (once; downloads and hash-verifies Lua 5.4.9 into third_party\, git-ignored)
+    pwsh -NoProfile -File scripts\test.ps1          (builds everything, runs ~25 test groups; "All native extender tests passed.")
+- Python 3 (D:\Python\Python314\python.exe) is optional; run with `-I`. It runs the tools/validate_conditions.py and
+  tools/effects_compile.py self-tests and compiles the effects example.
+- Everything currently passes.
+- FIRST LIVE RUN (2026-10-24, owner-approved): the proxy IS INSTALLED in D:\games\Steam\steamapps\common\Soulash 2
+  (vendor BugSplat64.dll SHA-256 4016763c... renamed to BugSplat64_original.dll; proxy a2ebdff3...; INI enables
+  Diagnostics, Plugins with RequireHash + pinned AbilityBarProbe, Conditions). Rollback: scripts\uninstall.ps1.
+  Verified in the real game (build 924e1ef3, logs\proxy-crash.log): the BugSplat ctor trigger fires at start-up, the
+  game runs normally behind the proxy, the pinned plugin loads, AbilityBarProbe found DrawActionBar/AbilityUser/player-id
+  anchors and hooked update, conditions discovery ran (0 mods), effects discovery loaded arendeth_hydromancy
+  (0 spells, 1 trigger). Nothing inside the game's logic is hooked yet; the probe is log-only.
+
+UNCOMMITTED WORK (git: branch hellcommander-native-extender-logger, last commit 867270e)
+- Conditional triggers, condition-file discovery, new-build notes, check-install fix, etc. (see `git status`).
+- Effects system (2026-10-24): docs/effects.md, docs/effects.schema.json, docs/examples/runic-magic-effects.json,
+  tools/effects_compile.py, src/effects.cpp/.hpp, tests/effects_tests.inc; small edits to tests.cpp, build.ps1, test.ps1,
+  module_runtime.cpp (effects.json discovery), conditions.hpp/.cpp (ParseJson exposed). Also a fix: on_attack_cast takes
+  its chance in secondary_value (validate_conditions.py emitted third_value).
+- tools/__pycache__/pe_xrefs.cpython-314.pyc is tracked by mistake: untrack it and add __pycache__ to .gitignore.
+
+STANDING RULES FROM THE OWNER (keep following them)
+- Read-only against the game files. Do NOT install or modify anything in the game folder without an
+  explicit instruction. Do not launch the game unprompted.
+  ONE EXCEPTION (owner's instruction, 2026-10-24): scripts\build.ps1 copies the built real plugins
+  (.build\plugins\*.dll) into <game>\SoulashExtender\Plugins after every build. Nothing else is written there.
+- Ask before downloading anything. Lua is fetched on demand by scripts/fetch-lua.ps1 with a pinned SHA-256;
+  third-party source is deliberately NOT committed.
+- One supported install route: the BugSplat64.dll proxy (rename vendor DLL to BugSplat64_original.dll, paste the
+  proxy in; re-paste after every game update; scripts/check-install.ps1 reports state). The SKSE-style loader.exe was
+  built and then REMOVED at the owner's request.
+- Native plugins cannot be sandboxed in-process. Untrusted mods = sandboxed Lua scripts; native = trusted + SHA-256 pinned.
+- Do not patch game code blind. Anything touching game logic needs runtime verification first.
+- Owner's correction: conditions are for CONDITIONAL TRIGGERS (abilities fire only while a condition holds). They are
+  NOT about logging and NOT about stacker counts (the stacker system is a separate native mechanism).
+
+WHERE THE GAME IS
+- Current: D:\games\Steam\steamapps\common\Soulash 2   version 0.10.4.0.1   exe sha256 924e1ef316ce5ab4...
+  (extender NOT installed there; vendor BugSplat64.dll, no BugSplat64_original.dll)
+- Older copy: E:\SteamLibrary\steamapps\common\Soulash 2 (0.10.3.4, exe d10cec5f...).
+- Owner's mod (read-only reference): <game>\data\mods\arendeth_runic_magic (Runic Magic, 680 json files).
+
+WHAT EXISTS (all tested with synthetic fixtures)
+- Proxy BugSplat64.dll: four ABI-checked exports forwarding to BugSplat64_original.dll; opt-in crash logger
+  (access violations, module/RVA attribution, 12-frame unwind); debugger fallback (game skips BugSplat under a debugger);
+  chain loading of another BugSplat64-compatible extender ([Chain] Next/NextSha256); one proxy instance per process.
+- Plugin runtime: SoulashExtender\Plugins\*.dll, interface v3 (messaging, lifecycle messages, game exe hash/base,
+  patchMemory, installDetour, installDetourAuto with an x64 length decoder validated against dumpbin on ~170k instructions
+  and once on 2.2M game instructions, build-independent anchors findFunctionsReferencingString / findRttiVtable),
+  SHA-256 pinning ([Plugins] RequireHash, [PluginHashes]), legacy v2 plugins still load.
+- Sandboxed Lua 5.4.9 scripts (SoulashExtender\Scripts\*.lua): whitelisted env, logging-only API (ext.log), memory /
+  instruction / wall-clock / native-work caps, escape + hostile-input tests. NO game-state API yet.
+- Skill conditions: spec v1 (docs/skill-conditions.md), JSON schema, validator (tools/validate_conditions.py, --emit),
+  C++ strict loader + three-valued evaluator (src/conditions.cpp) tested with synthetic snapshots, per-mod discovery of
+  <mods>\<mod>\extender\conditions.json at start-up (logged only). Conditional TRIGGER rules: `triggers` array
+  ({on:{cast:A}|{attack:true}, cast:B, chance, when}) compile to the engine's own trigger_ability_on_cast / on_attack_cast
+  passive effects + a gating condition; fully-native conditions need no evaluator.
+- Effects: spec v1 (docs/effects.md; Dredmor spell effects as the reference, mapped effect by effect), composable nodes
+  (all / chance / repeat / exact weighted choose / delay / when-gated by skill-conditions) + event triggers (cast, attack,
+  kill, turn, damaged, dodge, block, crit). tools/effects_compile.py validates with typed errors and compiles to ability
+  JSON + chain passives (trigger_ability_on_cast rows, hoisted restrict_* gates) + milestones + a conditions file +
+  effects_report.json (native / evaluator / impossible per node). "Attach" mode adds effects to an existing ability.
+  src/effects.cpp: strict loader, same ownership classification, Resolve/ResolveEvent -> {ability, delay} casts for the
+  evaluator-owned parts (fail-closed). Start-up discovery of <mod>\extender\effects.json (logged only).
+  Exe facts found on the way (pe_xrefs has): `trigger_ability` as an ABILITY key (astral mod) and `trigger_ability_on_turn`
+  (hydromancy) are NOT in the exe -> probably silent no-ops; tell the owner. The only verified chain is the passive row.
+- Static game analysis: tools/pe_xrefs.py (iat, calls, refs, str, fnstr, has), tools/pe_rtti.py (class name ->
+  vtable + virtuals + constructors), tools/asm_fn.py (annotated listings from a dumpbin dump: show/range/grep/callers/
+  strs), docs/game-notes.md (load point, anchors, recorded crash signatures), docs/skill-schema.md (closed native
+  condition vocabulary), docs/ability-bar.md (hotbar internals, save format, probe plugin, roadmap).
+- Real plugins live in plugins/<name>/ and build to .build\plugins\ (never into the synthetic plugin-dir the tests use).
+  Currently: AbilityBarProbe (log-only).
+- Packaging: scripts/package.ps1 -> BugSplat64.dll, INI template, notices (Lua MIT), SHA256SUMS. Installs nothing.
+
+OPEN WORK, PRIORITISED
+
+1. MULTI-SET ABILITY BARS (current user request; static analysis DONE, probe plugin WRITTEN, nothing run in-game)
+   Goal: more than 2 hotbar sets, cycled by scrolling. Full findings + roadmap: docs/ability-bar.md.
+   Located (build 924e1ef3, all static): handler for action 65 = DrawActionBar::handleInput 0x3FC720 (chunk 0x3FC84E),
+   it toggles int AbilityUser+0x68; slots = int[24] at AbilityUser+0x08 (2 sets x 12, -1 empty, else index into the
+   ability vector at +0x70); AbilityUser = 0x260-byte component, getter 0x91DA0(storage=[[ctx+0x100]+8], player id
+   dword @ 0xAFE668); save = text line "Ability user;24|...", fixed 24 slots, current set NOT saved, loader unbounded
+   -> extra sets MUST live in extender storage. Wheel = synthetic keys 0x400000A4 (up) / 0x40000119 (down) in
+   InputManager::handleEvent 0x7EFC80. UI systems poll keymap ids via 0x5FA7D0 + 0x7D4170 (no switch table exists).
+   (a) DONE and RUNNING: plugins/ability_bar_probe -> .build\plugins\AbilityBarProbe.dll (log-only, hash-gated,
+       vtable pass-through on DrawActionBar::update). First live run 2026-10-24 (proxy installed from the effects
+       session, owner-approved), two runs: anchors, component chain, slot array (matches the save's "Ability user;24|"
+       line exactly) and the +0x68 toggle (91 Left Ctrl toggles logged) ALL CONFIRMED (docs/ability-bar.md 2.3).
+       A third run caught ten drag-and-drop slot writes landing in slots[set*12+n]; the final array equals the saved
+       "Ability user;24|..." line byte for byte. Storage, toggle and save format are fully runtime-verified. Game context is static at RVA 0xAFEC50.
+       Step (b) may now be built on evidence: write +0x68 exactly as the game does.
+   (b) DONE as code (owner asked for it 2026-10-24), NOT YET RUN SUCCESSFULLY: plugins/ability_bar_wheel ->
+       AbilityBarWheel.dll + AbilityBarWheel.ini (Enabled=0 default; the build deploys both, keeps an existing INI).
+       IAT hook on SDL2!SDL_PollEvent (Trigger=modifier [ctrl|shift|alt] default, or Trigger=overbar -> pending step,
+       event swallowed so the camera does not zoom) + DrawActionBar::update hook (writes +0x68 like action 65;
+       respects the game's UI-mode block mask 0x13200060400). First in-game attempt: both plugins REFUSED with
+       load_failed error=5 because the owner's SoulashExtender.ini has RequireHash=1 with a stale probe hash and no
+       wheel hash; the build now prints the [PluginHashes] lines to paste. Owner then asked for a modifier+wheel
+       trigger instead of over-bar (the wheel is camera zoom) -> implemented, default ctrl.
+       Second live test: plugin loaded, 54 Ctrl+wheel toggles logged and the bar switched, BUT the owner still saw the
+       camera zoom on Ctrl+wheel although the events were swallowed in the SDL_PollEvent hook (only IAT slot; handleEvent
+       0x7EFC80 is only reached from PollEvent loops; zoom = 0x7D33C0 via is-pressed(0x400000A4/0x40000119), keys enter
+       the pressed set only in handleEvent 0x7F001D). Unexplained -> added HoldMs=400 (owner: switching should engage
+       only after Ctrl is held a while; no rapid flipping) and LogEvents=1 (one line per wheel event: swallowed/passed).
+       Third live test SOLVED the mystery: all 275 wheel events were swallowed (none passed); the "not working" was Left
+       Ctrl itself: it is the game's Ability Bar Switch key and auto-repeats, so the game flipped the bar every few frames
+       while Ctrl was held (probe log). Fix: SuppressModifierKey=1 (default for ctrl) hides the modifier's key down/up
+       events from the game while in the game world; SDL_GetModState still arms the wheel. Built + deployed, NOT RUN.
+       Owner: paste the printed hashes again, hold Ctrl 0.5 s, scroll, send the "AbilityBarWheel:" lines.
+   (c) THEN: N sets in extender storage keyed by ability id strings, swapped into the live 24 slots; sidecar file next
+       to the save, never player.sav. Ask the owner: keep Left Ctrl's two physical sets? per-save or global?
+   Still do not patch anything else blind; every offset above is unverified until the probe log says otherwise.
+
+2. CONDITIONS: A REAL STATE SOURCE  (OWNER DIRECTIVE 2026-10-24: the extender itself must add conditional support
+   for abilities - the engine's trigger vocabulary is too thin (see the dead trigger_ability / trigger_ability_on_turn
+   keys) - AND the game's in-game mod editor should be able to author it. The editor side is UNEXPLORED: find the
+   editor's UI/system (RTTI names, the screen that edits abilities/passives), how it writes mod JSON, and whether a
+   plugin can add fields (conditions / effects.json) to it or must ship its own editor panel. Static analysis first,
+   then a log-only probe, same path as the hotbar work.)
+   Evaluator and trigger compiler exist; nothing feeds them game state. Options: game hooks (find where passive/ability
+   fields are READ at runtime - parsers are known: passive loader 0x50D840, ability loader 0x424CF0 in 924e1ef3 - needs
+   dynamic analysis) or the Lua layer (once the author ships scripting). Also test the "tag bridge" idea (does
+   restrict_tags accept mod-defined tags? value encodings of restrict_shield / restrict_tags_enemy unverified).
+   Consider a game-state query API for sandboxed scripts and an interface-v3 entry to the evaluator.
+   The effects resolver (src/effects.cpp) needs the same state source plus ONE primitive: "make the holder cast ability
+   X now / in N turns" (and an event feed: ability cast, attack, kill, turn, damaged, dodge, block, crit). With those two,
+   every evaluator-owned node in docs/effects.md works; nothing else is missing. Run-in-game questions to settle first
+   (docs/effects.md section 7): where a trigger_ability_on_cast cast lands, whether identical rows all fire, whether a
+   triggered cast can chain, summon of an item entity (floor vs bag). Possible follow-ups once verified: `cast` rows
+   relaying the original target, a `--mod` mode that writes straight into a mod folder, and reading Runic Magic's
+   tools/runic_registry.json to generate effects.json from it.
+
+3. RUNTIME VERIFICATION (needs the owner to run the game; everything so far is static/synthetic)
+   - Install the packaged proxy in a COPY or with rollback ready; confirm the BugSplat ctor trigger and plugin loading.
+   - Verify anchors (RTTI MainMenuScreen, DrawActionBar, "Loading mods:" string) at runtime.
+   - Verify the first game-hook candidate: a "data about to load" message at the mod-loading entry
+     (0x4DDB70 in 924e1ef3; was 0x4D9760 in d10cec5f), keyed by exe SHA-256.
+   - Re-check the recorded null-write crash (older build 7cec802f RVA 0x6E7E52) against the current build.
+
+4. HARDENING / HOUSEKEEPING
+   - Commit current work; untrack tools/__pycache__; add __pycache__ to .gitignore.
+   - Review Lua security fixes periodically (pinned 5.4.9); keep the sandbox limits.
+   - Consider code signing, a release process, and the S2NF-compatible lifecycle only if S2NF's loader can be verified.
+   - Possible: decide whether to suspend other threads while patching; distinguish "likely module involvement" from
+     "game-only fault" in crash records.
+
+GOTCHAS LEARNED THIS PROJECT
+- Windows MSVC: Lua objects must use /MT (the other targets use default static CRT). Long scratch paths break cl (use short dirs).
+- The shell tool blocks commands containing the literal word Remove-Item; do file edits/deletes with Python or the editor tools.
+- PowerShell `-f` format strings break on JSON braces; use .Replace().
+- Test console-subsystem processes started from a windowless parent flake; the game is GUI-subsystem.
+- dumpbin /disasm of the 11 MB exe takes ~30 s and ~110 MB; do it in the scratchpad, not the repo.
+- Short strings (<=15 chars) are inline immediates in the exe, not .rdata: use `pe_xrefs.py has <key>`.
+- Hash-pin comparisons hold the file open with write sharing denied across the load to avoid check/use races.

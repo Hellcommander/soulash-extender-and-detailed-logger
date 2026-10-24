@@ -1,13 +1,16 @@
 #include "manifest.hpp"
 #include "plugin_api.h"
 #include "conditions.hpp"
+#include "effects.hpp"
 #include "script_sandbox.hpp"
 #include "x64_length.hpp"
 
 #include <windows.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <cstdio>
 #include <cctype>
@@ -729,6 +732,7 @@ namespace
 #include "decoder_tests.inc"
 #include "sandbox_tests.inc"
 #include "conditions_tests.inc"
+#include "effects_tests.inc"
 
     // Child side of the debugger fallback test. Loads the proxy but never
     // calls any BugSplat export, so only the DllMain fallback can start it.
@@ -1206,24 +1210,30 @@ namespace
             for (unsigned attempt = 0; attempt < 1000 && !finished; ++attempt)
             {
                 log.clear();
-                finished = ReadLog(logPath, log) && log.find("plugin message=conditions: ") != std::string::npos;
+                finished = ReadLog(logPath, log) && log.find("plugin message=effects: ") != std::string::npos;
                 if (!finished)
                 {
                     Sleep(10);
                 }
             }
             Check(finished, "condition discovery finished");
-            Check(log.find("plugin message=conditions ModA: 3 condition(s) loaded\r\n") != std::string::npos,
+            Check(log.find("plugin message=conditions ModA: 3 condition(s), 2 trigger(s) loaded\r\n") != std::string::npos,
                 "a valid conditions file is loaded and counted");
             Check(log.find("plugin message=conditions ModB rejected: duplicate condition id 'dup'\r\n")
                     != std::string::npos,
                 "an invalid conditions file is rejected with the reason");
-            Check(log.find("plugin message=conditions ModD: 1 condition(s) loaded\r\n") != std::string::npos,
+            Check(log.find("plugin message=conditions ModD: 1 condition(s), 0 trigger(s) loaded\r\n") != std::string::npos,
                 "later mods still load after a rejected one");
             Check(log.find("conditions ModC") == std::string::npos,
                 "a mod without an extender folder is silently ignored");
-            Check(log.find("plugin message=conditions: 4 condition(s) from 2 mod(s)\r\n") != std::string::npos,
+            Check(log.find("plugin message=conditions: 4 condition(s), 2 trigger(s) from 2 mod(s)\r\n") != std::string::npos,
                 "the summary counts only accepted files");
+            Check(log.find("plugin message=effects ModA: 7 spell(s), 3 trigger(s) loaded\r\n") != std::string::npos,
+                "a valid effects file is loaded and counted");
+            Check(log.find("plugin message=effects ModD rejected: spec must be 1\r\n") != std::string::npos,
+                "an invalid effects file is rejected with the reason");
+            Check(log.find("plugin message=effects: 7 spell(s), 3 trigger(s) from 1 mod(s)\r\n") != std::string::npos,
+                "the effects summary counts only accepted files");
         }
 
         if (proxy != nullptr) FreeLibrary(proxy);
@@ -1729,6 +1739,7 @@ namespace
             << "       native-tests.exe --debugger-fallback <proxy-dll> <fake-original-dll> <manifest> <marker-base>\n"
             << "       native-tests.exe --sandbox\n"
             << "       native-tests.exe --conditions <conditions-example.json>\n"
+            << "       native-tests.exe --effects <effects-example.json>\n"
             << "       native-tests.exe --conditions-discovery <proxy-dll> <fake-original-dll> <mods-dir> <log-path>\n"
             << "       native-tests.exe --scripts <proxy-dll> <fake-original-dll> <script-dir> <log-path>\n"
             << "       native-tests.exe --chain <proxy-dll> <fake-original-dll> <extender-dll> <extender-sha256> <default|require-hash>\n"
@@ -1791,6 +1802,11 @@ int wmain(int argc, wchar_t* argv[])
     if (argc == 3 && std::wstring_view(argv[1]) == L"--conditions")
     {
         return RunConditionsTests(argv[2]);
+    }
+
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--effects")
+    {
+        return RunEffectsTests(argv[2]);
     }
 
     if (argc == 2 && std::wstring_view(argv[1]) == L"--sandbox")

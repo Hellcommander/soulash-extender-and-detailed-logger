@@ -191,6 +191,51 @@ int RunConditionsTests(const wchar_t* examplePath)
     Check(rejects("{\"spec\":1,\"conditions\":[{\"id\":\"\\u00zz\"}]}", ""), "bad unicode escape");
     Check(rejects("{\"spec\":1,\"conditions\":[{\"id\":\"a\\q\"}]}", ""), "bad escape");
 
+    // ---- Conditional triggers --------------------------------------------
+    {
+        const std::string triggerDocument = "{\"spec\":1,\"triggers\":[{\"id\":\"surge\","
+            "\"on\":{\"cast\":\"Draw\"},\"cast\":\"Conjure\",\"chance\":0.5,"
+            "\"when\":{\"health_percent\":{\"max\":50}}},"
+            "{\"id\":\"spark\",\"on\":{\"attack\":true},\"cast\":\"Spark\","
+            "\"when\":{\"in_combat\":true},\"on_unavailable\":\"active\"}]}";
+        ConditionSet set;
+        std::string error;
+        Check(set.Load(triggerDocument, error) && set.Items().empty() && set.Triggers().size() == 2,
+            "a triggers-only document loads");
+        if (set.Triggers().size() == 2)
+        {
+            const Trigger& surge = set.Triggers()[0];
+            Check(surge.onKind == "cast" && surge.onAbility == "Draw" && surge.castAbility == "Conjure"
+                    && surge.chance == 0.5,
+                "trigger fields are read");
+            Check(set.Triggers()[1].onKind == "attack" && set.Triggers()[1].chance == 1.0,
+                "attack trigger defaults to chance 1");
+            Snapshot hurt;
+            hurt.healthPercent = 20.0;
+            Snapshot fine;
+            fine.healthPercent = 90.0;
+            Check(IsTriggerAllowed(set, surge, hurt), "trigger is allowed while its condition holds");
+            Check(!IsTriggerAllowed(set, surge, fine), "trigger is blocked while its condition is false");
+            Check(!IsTriggerAllowed(set, surge, Snapshot{}), "trigger fails closed without state");
+            Check(IsTriggerAllowed(set, set.Triggers()[1], Snapshot{}),
+                "a trigger that opted into on_unavailable=active fires without state");
+        }
+        const std::string head = "{\"spec\":1,\"triggers\":[";
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"kill\":true},\"cast\":\"C\",\"when\":{\"in_combat\":true}}]}",
+            "'on' must be"), "unsupported trigger event");
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"attack\":true},\"when\":{\"in_combat\":true}}]}",
+            "needs id, on, cast and when"), "trigger without a cast");
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"attack\":true},\"cast\":\"C\"}]}",
+            "needs id, on, cast and when"), "trigger without a condition");
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"attack\":true},\"cast\":\"C\",\"chance\":0,"
+            "\"when\":{\"in_combat\":true}}]}", "chance"), "trigger chance of zero");
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"attack\":true},\"cast\":\"C\",\"when\":{\"in_combat\":true},"
+            "\"extra\":1}]}", "unknown trigger key"), "unknown trigger key");
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"attack\":true},\"cast\":\"C\",\"when\":{\"in_combat\":true}},"
+            "{\"id\":\"a\",\"on\":{\"attack\":true},\"cast\":\"D\",\"when\":{\"in_combat\":true}}]}",
+            "duplicate condition id"), "duplicate trigger id");
+    }
+
     // ---- The example document shipped in docs/ -----------------------------
     if (examplePath != nullptr)
     {
@@ -198,7 +243,8 @@ int RunConditionsTests(const wchar_t* examplePath)
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         ConditionSet set;
         std::string error;
-        Check(set.Load(text, error) && set.Items().size() == 3, "the example document loads");
+        Check(set.Load(text, error) && set.Items().size() == 3 && set.Triggers().size() == 2,
+            "the example document loads with 3 conditions and 2 triggers");
         const Condition* harvest = set.Find("passive", "arendeth_runic_magic_charge_harvest");
         Check(harvest != nullptr, "the example's first target is found");
         if (harvest != nullptr)

@@ -1,7 +1,14 @@
 """Validate a skill-conditions file (spec 1, docs/skill-conditions.md).
 
-  python -I tools/validate_conditions.py <conditions.json> [--mod <mod folder>]
+  python -I tools/validate_conditions.py <conditions.json> [--mod <mod folder>] [--emit <folder>]
   python -I tools/validate_conditions.py --self-test
+
+Conditions gate a passive or ability; triggers are conditional triggers (an
+ability fires on a cast or an attack only while a condition holds). --emit
+writes generated_passives.json (one passive per trigger, with the engine's own
+trigger effect and any native restrict_* keys the condition allows) and
+generated_conditions.json (the remaining gating conditions, spec 1) into the
+folder, ready to merge into the mod.
 
 Checks structure, predicate names and arguments, names against the game's own
 lists, size limits and `requires`. With --mod it also checks that each target
@@ -271,6 +278,119 @@ def used_predicates(expr, acc):
             acc.add(key)
 
 
+TRIGGER_KEYS = {"id", "on", "cast", "chance", "when", "on_unavailable", "note"}
+
+
+def trigger_passive_id(trigger_id):
+    return "ext_trigger_" + trigger_id
+
+
+def native_keys_for_passive(expr):
+    """Native restrict_* keys implied by necessary leaves, plus the leaves that
+    remain for an evaluator. Only top-level `all` (or a single leaf) is hoisted."""
+    keys = {}
+    if not isinstance(expr, dict) or len(expr) != 1:
+        return keys, expr
+    name, value = next(iter(expr.items()))
+    leaves = value if name == "all" else [expr]
+    remaining = []
+    for leaf in leaves:
+        leaf_name, args = next(iter(leaf.items()))
+        if leaf_name == "weapon_class" and "restrict_weapon_type" not in keys \
+                and (isinstance(args, str) or (isinstance(args, list) and len(args) == 1)):
+            keys["restrict_weapon_type"] = (args if isinstance(args, str) else args[0]).lower()
+        elif leaf_name == "holder_tag" and "restrict_tags" not in keys:
+            names = args if isinstance(args, list) else [args]
+            ids = [str([t.lower() for t in TAGS].index(n.lower())) for n in names]
+            keys["restrict_tags"] = ids[0] if len(ids) == 1 else ids
+        elif leaf_name == "party" and "apply_mode" not in keys:
+            keys["apply_mode"] = "solo_only" if args == "alone" else "party_only"
+        else:
+            remaining.append(leaf)
+    if name != "all" and not remaining:
+        return keys, None
+    if not remaining:
+        return keys, None
+    return keys, (remaining[0] if len(remaining) == 1 else {"all": remaining})
+
+
+def compile_trigger(trigger):
+    """Returns (passive, condition-or-None) for a validated trigger."""
+    chance = trigger.get("chance", 1)
+    on = trigger["on"]
+    if "cast" in on:
+        effect = {"effect": "trigger_ability_on_cast", "value": on["cast"],
+                  "secondary_value": trigger["cast"], "third_value": chance}
+    else:
+        # on_attack_cast takes its chance in secondary_value (core_2 messages.json id 100;
+        # every installed mod encodes it that way), unlike trigger_ability_on_cast.
+        effect = {"effect": "on_attack_cast", "value": trigger["cast"], "secondary_value": chance}
+    keys, remaining = native_keys_for_passive(trigger["when"])
+    passive = {"id": trigger_passive_id(trigger["id"]), "name": "Conditional trigger " + trigger["id"],
+               "effects": [effect]}
+    passive.update(keys)
+    condition = None
+    if remaining is not None:
+        condition = {"id": trigger["id"], "target": {"kind": "passive", "id": passive["id"]},
+                     "when": remaining}
+        if "on_unavailable" in trigger:
+            condition["on_unavailable"] = trigger["on_unavailable"]
+    return passive, condition
+
+
+def validate_trigger(trigger, where, report, seen_ids, known_targets, used):
+    if not isinstance(trigger, dict):
+        report.error(where, "must be an object")
+        return None
+    extra = set(trigger) - TRIGGER_KEYS
+    if extra:
+        report.error(where, "unknown keys %s" % sorted(extra))
+    tid = trigger.get("id")
+    if not isinstance(tid, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", tid):
+        report.error(where, "id must match [a-z0-9_]{1,64}")
+        return None
+    if tid in seen_ids:
+        report.error(where, "duplicate id %r" % tid)
+        return None
+    seen_ids.add(tid)
+    where = "%s(%s)" % (where, tid)
+
+    on = trigger.get("on")
+    if (not isinstance(on, dict) or len(on) != 1
+            or next(iter(on)) not in ("cast", "attack")):
+        report.error(where, "on must be {cast: <ability id>} or {attack: true}")
+        return None
+    if "cast" in on:
+        if not id_string(on["cast"], where, report, "on.cast"):
+            return None
+        if known_targets is not None and on["cast"] not in known_targets["ability"]:
+            report.warn(where, "on.cast %r is not an ability of this mod (fine if it is another mod's)" % on["cast"])
+    elif on["attack"] is not True:
+        report.error(where, "on.attack must be true")
+        return None
+    if not id_string(trigger.get("cast"), where, report, "cast"):
+        return None
+    if known_targets is not None and trigger["cast"] not in known_targets["ability"]:
+        report.warn(where, "cast %r is not an ability of this mod (fine if it is another mod's)" % trigger["cast"])
+    chance = trigger.get("chance", 1)
+    if not is_number(chance) or not 0 < chance <= 1:
+        report.error(where, "chance must be a number above 0 and at most 1")
+        return None
+    if trigger.get("on_unavailable", "inactive") not in ("inactive", "active"):
+        report.error(where, "on_unavailable must be inactive or active")
+        return None
+    expr = trigger.get("when")
+    if expr is None:
+        report.error(where, "missing 'when' (a trigger without a condition needs no extender)")
+        return None
+    leaves = []
+    walk(expr, where + ".when", 1, {"nodes": 0}, report, leaves)
+    names = set()
+    used_predicates(expr, names)
+    used.update(names)
+    return trigger
+
+
 def mod_target_ids(mod_folder):
     ids = {"passive": set(), "ability": set()}
     passives = os.path.join(mod_folder, "passives.json")
@@ -296,7 +416,7 @@ def validate(document, report, mod_folder=None):
     if not isinstance(document, dict):
         report.error("file", "top level must be an object")
         return summary
-    extra = set(document) - {"spec", "requires", "conditions"}
+    extra = set(document) - {"spec", "requires", "conditions", "triggers"}
     if extra:
         report.error("file", "unknown keys %s" % sorted(extra))
     if document.get("spec") != 1:
@@ -308,9 +428,13 @@ def validate(document, report, mod_folder=None):
     for name in requires:
         if name not in PREDICATES:
             report.error("file", "requires names an unknown predicate %r" % name)
-    conditions = document.get("conditions")
+    conditions = document.get("conditions", [])
     if not isinstance(conditions, list):
         report.error("file", "conditions must be a list")
+        return summary
+    triggers = document.get("triggers", [])
+    if not isinstance(triggers, list):
+        report.error("file", "triggers must be a list")
         return summary
 
     known_targets = mod_target_ids(mod_folder) if mod_folder else None
@@ -373,13 +497,51 @@ def validate(document, report, mod_folder=None):
             if (kind == "ability" and "weapon_class" in native
                     and isinstance(expr, dict)):
                 pass
+    for index, trigger in enumerate(triggers):
+        checked = validate_trigger(trigger, "triggers[%d]" % index, report, seen_ids,
+                                   known_targets, used)
+        if checked is not None and not report.errors:
+            passive, condition = compile_trigger(checked)
+            evaluated = []
+            if condition is not None:
+                leaves = []
+                walk(condition["when"], "x", 1, {"nodes": 0}, Report(), leaves)
+                evaluated = [name for name, _ in leaves]
+            summary.append({"id": checked["id"], "kind": "trigger",
+                            "native": sorted(k for k in passive if k.startswith(("restrict_", "apply_"))),
+                            "needs_evaluator": evaluated,
+                            "fully_native": condition is None})
     missing = sorted(used - set(requires) - {n for n in used if n not in PREDICATES})
     if missing:
         report.warn("file", "predicates used but not listed in requires: %s" % missing)
     return summary
 
 
-def run(path, mod_folder):
+def emit(document, folder):
+    os.makedirs(folder, exist_ok=True)
+    passives, conditions = [], list(document.get("conditions", []))
+    for trigger in document.get("triggers", []):
+        passive, condition = compile_trigger(trigger)
+        passives.append(passive)
+        if condition is not None:
+            conditions.append(condition)
+    with open(os.path.join(folder, "generated_passives.json"), "w", encoding="utf-8") as handle:
+        json.dump(passives, handle, indent=2)
+        handle.write("\n")
+    requires = sorted({name for c in conditions for name in _leaf_names(c["when"])})
+    with open(os.path.join(folder, "generated_conditions.json"), "w", encoding="utf-8") as handle:
+        json.dump({"spec": 1, "requires": requires, "conditions": conditions}, handle, indent=2)
+        handle.write("\n")
+    return len(passives), len(conditions)
+
+
+def _leaf_names(expr):
+    names = set()
+    used_predicates(expr, names)
+    return names
+
+
+def run(path, mod_folder, emit_folder=None):
     report = Report()
     try:
         document = json.load(open(path, encoding="utf-8-sig"))
@@ -395,8 +557,11 @@ def run(path, mod_folder):
         print("WARNING: " + message)
     for message in report.errors:
         print("ERROR: " + message)
-    print("%d condition(s), %d error(s), %d warning(s)" % (
+    print("%d condition(s)/trigger(s), %d error(s), %d warning(s)" % (
         len(summary), len(report.errors), len(report.warnings)))
+    if emit_folder and not report.errors:
+        generated = emit(document, emit_folder)
+        print("emitted %d passive(s) and %d condition(s) to %s" % (generated[0], generated[1], emit_folder))
     return 1 if report.errors else 0
 
 
@@ -478,6 +643,59 @@ def self_test():
         print("FAIL: all-native condition should be fully native -> %s" % summary)
     results.append(bool(fully))
 
+    def tdoc(**fields):
+        trigger = {"id": "t1", "on": {"cast": "A"}, "cast": "B", "chance": 0.25,
+                   "when": {"health_percent": {"max": 50}}}
+        trigger.update(fields)
+        return {"spec": 1, "triggers": [trigger]}
+
+    results += [
+        check("valid cast trigger", tdoc(), False),
+        check("valid attack trigger", tdoc(on={"attack": True}), False),
+        check("trigger without when", tdoc(when=None) if False else
+              {"spec": 1, "triggers": [{"id": "t", "on": {"cast": "A"}, "cast": "B"}]}, True, "missing 'when'"),
+        check("trigger bad on", tdoc(on={"kill": True}), True, "on must be"),
+        check("trigger two on keys", tdoc(on={"cast": "A", "attack": True}), True, "on must be"),
+        check("trigger attack false", tdoc(on={"attack": False}), True, "must be true"),
+        check("trigger chance zero", tdoc(chance=0), True, "chance"),
+        check("trigger chance above one", tdoc(chance=1.5), True, "chance"),
+        check("trigger missing cast", {"spec": 1, "triggers": [{"id": "t", "on": {"attack": True},
+              "when": {"in_combat": True}}]}, True, "cast"),
+        check("trigger unknown predicate", tdoc(when={"moon": 1}), True, "unknown predicate"),
+        check("trigger duplicate id with a condition",
+              {"spec": 1,
+               "conditions": [{"id": "t1", "target": {"kind": "passive", "id": "x"}, "when": {"in_combat": True}}],
+               "triggers": [{"id": "t1", "on": {"attack": True}, "cast": "B", "when": {"in_combat": True}}]},
+              True, "duplicate id"),
+    ]
+
+    # Compilation.
+    passive, condition = compile_trigger({"id": "t1", "on": {"cast": "A"}, "cast": "B", "chance": 0.25,
+                                          "when": {"all": [{"weapon_class": "Sword"},
+                                                           {"health_percent": {"max": 50}}]}})
+    compile_ok = (passive["effects"][0] == {"effect": "trigger_ability_on_cast", "value": "A",
+                                            "secondary_value": "B", "third_value": 0.25}
+                  and passive["restrict_weapon_type"] == "sword" and passive["id"] == "ext_trigger_t1"
+                  and condition is not None and condition["when"] == {"health_percent": {"max": 50}}
+                  and condition["target"] == {"kind": "passive", "id": "ext_trigger_t1"})
+    if not compile_ok:
+        print("FAIL: trigger compile -> %s %s" % (passive, condition))
+    results.append(compile_ok)
+    passive, condition = compile_trigger({"id": "t2", "on": {"attack": True}, "cast": "B",
+                                          "when": {"all": [{"holder_tag": "Undead"}, {"party": "alone"}]}})
+    native_ok = (passive["effects"][0] == {"effect": "on_attack_cast", "value": "B", "secondary_value": 1}
+                 and passive["restrict_tags"] == "4" and passive["apply_mode"] == "solo_only"
+                 and condition is None)
+    if not native_ok:
+        print("FAIL: fully native trigger -> %s %s" % (passive, condition))
+    results.append(native_ok)
+    passive, condition = compile_trigger({"id": "t3", "on": {"attack": True}, "cast": "B",
+                                          "when": {"any": [{"weapon_class": "Axe"}, {"in_combat": True}]}})
+    any_ok = "restrict_weapon_type" not in passive and condition is not None
+    if not any_ok:
+        print("FAIL: any must not be hoisted -> %s %s" % (passive, condition))
+    results.append(any_ok)
+
     passed = all(results)
     print("PASS: skill-conditions validator self-test (%d checks)" % len(results) if passed
           else "FAIL: skill-conditions validator self-test")
@@ -489,14 +707,19 @@ def main(argv):
         return self_test()
     args = argv[1:]
     mod = None
+    emit_folder = None
     if "--mod" in args:
         index = args.index("--mod")
         mod = args[index + 1]
         del args[index:index + 2]
+    if "--emit" in args:
+        index = args.index("--emit")
+        emit_folder = args[index + 1]
+        del args[index:index + 2]
     if len(args) != 1:
         print(__doc__)
         return 2
-    return run(args[0], mod)
+    return run(args[0], mod, emit_folder)
 
 
 if __name__ == "__main__":

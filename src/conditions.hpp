@@ -85,6 +85,21 @@ namespace soulash::conditions
         bool activeWhenUnavailable = false;
     };
 
+    // A conditional trigger: `cast` fires on `onKind` ("cast" of `onAbility`, or
+    // "attack") with `chance`, only while `when` holds. Compiles to the
+    // engine's own trigger effect plus a gating condition (see the validator's
+    // --emit); this evaluator answers whether it is currently allowed to fire.
+    struct Trigger
+    {
+        std::string id;
+        std::string onKind;       // "cast" or "attack"
+        std::string onAbility;    // for "cast"
+        std::string castAbility;
+        double chance = 1.0;
+        Node when;
+        bool activeWhenUnavailable = false;
+    };
+
     class ConditionSet
     {
     public:
@@ -96,12 +111,17 @@ namespace soulash::conditions
 
         const Condition* Find(const std::string& targetKind, const std::string& targetId) const;
         const std::vector<Condition>& Items() const { return items_; }
+        const std::vector<Trigger>& Triggers() const { return triggers_; }
         const std::vector<std::string>& Requires() const { return requires_; }
 
     private:
         std::vector<Condition> items_;
+        std::vector<Trigger> triggers_;
         std::vector<std::string> requires_;
     };
+
+    // The strict JSON parser used by the loader (shared with src/effects.cpp).
+    bool ParseJson(const std::string& text, Json& out, std::string& error);
 
     // Predicates this evaluator implements.
     const std::set<std::string>& SupportedPredicates();
@@ -113,6 +133,13 @@ namespace soulash::conditions
     bool IsActive(
         const ConditionSet& set,
         const Condition& condition,
+        const Snapshot& state,
+        const std::set<std::string>& supported = SupportedPredicates());
+
+    // May this trigger fire right now? Same fail-closed rules as IsActive.
+    bool IsTriggerAllowed(
+        const ConditionSet& set,
+        const Trigger& trigger,
         const Snapshot& state,
         const std::set<std::string>& supported = SupportedPredicates());
 }

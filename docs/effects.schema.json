@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/soulash-extender/effects.schema.json",
+  "title": "Soulash 2 extender effects, spec 1",
+  "description": "Structure only. Names, ranges, limits and backend classification are checked by tools/effects_compile.py.",
+  "type": "object",
+  "required": ["spec", "mod"],
+  "additionalProperties": false,
+  "properties": {
+    "spec": { "const": 1 },
+    "mod": { "$ref": "#/$defs/id" },
+    "requires": { "type": "array", "items": { "type": "string", "pattern": "^[a-z_]{1,32}$" }, "uniqueItems": true },
+    "spells": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/spell" } },
+    "triggers": { "type": "array", "maxItems": 256, "items": { "$ref": "#/$defs/trigger" } }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9_]{1,64}$" },
+    "dataId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "amount": {
+      "oneOf": [
+        { "type": "number", "minimum": 0 },
+        { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number", "minimum": 0 } }
+      ]
+    },
+    "spell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effects"],
+      "oneOf": [ { "required": ["id"] }, { "required": ["ability"] } ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "ability": { "$ref": "#/$defs/dataId" },
+        "name": { "type": "string", "maxLength": 128 },
+        "description": { "type": "string", "maxLength": 1024 },
+        "image": { "type": "integer", "minimum": 0 },
+        "animation": { "type": "string", "maxLength": 128 },
+        "skill": { "$ref": "#/$defs/dataId" },
+        "target": { "type": "string", "maxLength": 32 },
+        "radius": { "type": "integer", "minimum": 0, "maximum": 32 },
+        "shape": { "enum": ["circle", "sides", "square", "ring"] },
+        "range": { "type": "number", "minimum": 0 },
+        "min_range": { "type": "number", "minimum": 0 },
+        "cooldown": { "type": "number", "minimum": 0 },
+        "cast_time": { "type": "number", "minimum": 0 },
+        "cost": {
+          "type": "object", "additionalProperties": false,
+          "properties": { "health": { "type": "number", "minimum": 0 }, "stamina": { "type": "number", "minimum": 0 } }
+        },
+        "requirements": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "one_of": { "type": "array", "items": { "type": "string" } },
+            "always": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "slots": {
+          "type": "object", "additionalProperties": false,
+          "properties": { "offensive": { "type": "integer" }, "defensive": { "type": "integer" }, "utility": { "type": "integer" } }
+        },
+        "level": { "type": "integer", "minimum": 1 },
+        "effects": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/effect" } },
+        "note": { "type": "string" }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "on", "do"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "on": {
+          "type": "object", "minProperties": 1, "maxProperties": 1, "additionalProperties": false,
+          "properties": {
+            "cast": { "$ref": "#/$defs/dataId" },
+            "attack": { "const": true }, "kill": { "const": true }, "turn": { "const": true },
+            "damaged": { "const": true }, "dodge": { "const": true }, "block": { "const": true }, "crit": { "const": true }
+          }
+        },
+        "chance": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "when": { "$ref": "skill-conditions.schema.json#/$defs/expr" },
+        "on_unavailable": { "enum": ["inactive", "active"] },
+        "do": { "$ref": "#/$defs/effect" },
+        "level": { "type": "integer", "minimum": 1 },
+        "note": { "type": "string" }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 3,
+      "properties": {
+        "all": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "$ref": "#/$defs/effect" } },
+        "chance": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "repeat": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "every": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "delay": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "when": { "$ref": "skill-conditions.schema.json#/$defs/expr" },
+        "on_unavailable": { "enum": ["inactive", "active"] },
+        "choose": {
+          "type": "array", "minItems": 1, "maxItems": 32,
+          "items": {
+            "type": "object", "required": ["do"], "additionalProperties": false,
+            "properties": { "weight": { "type": "number", "exclusiveMinimum": 0 }, "do": { "$ref": "#/$defs/effect" } }
+          }
+        },
+        "approximate": { "type": "boolean" },
+        "do": { "$ref": "#/$defs/effect" },
+        "damage": {
+          "type": "object", "required": ["amount", "type"], "additionalProperties": false,
+          "properties": {
+            "amount": { "$ref": "#/$defs/amount" }, "type": { "type": "string" },
+            "scaling": { "type": "number", "minimum": 0 }, "weapon": { "type": "number", "minimum": 0 },
+            "leech": { "type": "number", "minimum": 0, "maximum": 1 }, "pierce": { "type": "boolean" },
+            "chain": { "type": "integer", "minimum": 1 }, "ignore_party": { "type": "boolean" }
+          }
+        },
+        "heal": { "type": "object", "required": ["amount"], "additionalProperties": false, "properties": { "amount": { "$ref": "#/$defs/amount" } } },
+        "stamina": { "type": "number" },
+        "status": { "type": "object", "minProperties": 1, "additionalProperties": { "type": "number", "minimum": 0 } },
+        "knockback": { "type": "integer", "minimum": 1 },
+        "pull": { "type": "integer", "minimum": 1 },
+        "swap": { "const": true }, "lunge": { "const": true }, "charge": { "const": true }, "step_aside": { "const": true },
+        "buff": {
+          "type": "object", "required": ["duration"], "additionalProperties": false,
+          "properties": {
+            "duration": { "type": "number", "exclusiveMinimum": 0 },
+            "stats": { "type": "object", "additionalProperties": { "type": "number" } },
+            "modifiers": { "type": "object", "additionalProperties": { "type": "number" } }
+          }
+        },
+        "summon": {
+          "type": "object", "required": ["entity"], "additionalProperties": false,
+          "properties": { "entity": { "$ref": "#/$defs/dataId" }, "count": { "type": "integer", "minimum": 1 }, "on_move": { "type": "boolean" } }
+        },
+        "create_item": {
+          "type": "object", "required": ["item"], "additionalProperties": false,
+          "properties": { "item": { "$ref": "#/$defs/dataId" }, "count": { "type": "integer", "minimum": 1 } }
+        },
+        "stacks": {
+          "type": "object", "required": ["stacker"], "additionalProperties": false,
+          "properties": { "stacker": { "$ref": "#/$defs/dataId" }, "count": { "type": "integer", "minimum": 1 } }
+        },
+        "remove_stacks": {
+          "type": "object", "required": ["stacker"], "additionalProperties": false,
+          "properties": { "stacker": { "$ref": "#/$defs/dataId" }, "count": { "type": "integer", "minimum": 0 } }
+        },
+        "cleanse": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "cooldowns": { "type": "object", "required": ["clear"], "additionalProperties": false, "properties": { "clear": { "type": "integer", "minimum": 1 } } },
+        "transform": { "type": "object", "required": ["entity"], "additionalProperties": false, "properties": { "entity": { "$ref": "#/$defs/dataId" } } },
+        "aura": { "type": "object", "required": ["ability"], "additionalProperties": false, "properties": { "ability": { "$ref": "#/$defs/dataId" } } },
+        "cast": {
+          "type": "object", "required": ["spell"], "additionalProperties": false,
+          "properties": {
+            "spell": { "$ref": "#/$defs/dataId" },
+            "chance": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+            "delay": { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "when": { "$ref": "skill-conditions.schema.json#/$defs/expr" }
+          }
+        },
+        "teleport": { "const": "target" },
+        "grant_xp": { "type": "number", "exclusiveMinimum": 0 },
+        "note": { "type": "string" }
+      }
+    }
+  }
+}

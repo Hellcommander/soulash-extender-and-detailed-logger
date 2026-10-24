@@ -160,7 +160,9 @@ skill-conditions evaluator are the next steps.
 
 ## Skill-conditions files
 
-A mod may ship `extender\conditions.json` (format: [docs/skill-conditions.md](docs/skill-conditions.md)).
+A mod may ship `extender\conditions.json` (format: [docs/skill-conditions.md](docs/skill-conditions.md)):
+**conditional triggers** (an ability fires on a cast or an attack only while a condition holds)
+and conditions that gate a passive or ability.
 With `[Conditions] Enabled=1` in the INI (optional `Directory=`, default
 `<game folder>\data\mods`; or `SOULASH2_MODS_DIRECTORY`), the extender looks in
 every mod folder at start-up, loads each file with the strict loader, and logs
@@ -171,6 +173,74 @@ game yet**: that needs a source of game state (game hooks or the Lua layer),
 so for now the files are validated and counted only. Offline, the same checks
 and a per-condition native/evaluator report are available from
 `tools/validate_conditions.py`.
+
+## Effects files (Dredmor-style spell effects, composable)
+
+A mod may also ship `extender\effects.json` (format and design:
+[docs/effects.md](docs/effects.md), schema `docs/effects.schema.json`, example
+`docs/examples/runic-magic-effects.json`). It describes spells as trees of
+typed effect nodes, the way Dungeons of Dredmor's `spellDB.xml` does but with
+real combinators: `all`, `chance`, `repeat`, exact weighted `choose`, `delay`,
+and `when` gates written in the skill-conditions language; plus event
+`triggers` (`cast`, `attack`, `kill`, `turn`, `damaged`, `dodge`, `block`,
+`crit`). `tools/effects_compile.py <file> --emit <folder>` validates it with
+typed errors and compiles everything the engine can do itself to ordinary
+ability JSON, passives built on the engine's own `trigger_ability_on_cast` /
+`on_attack_cast` / `on_kill_create_item` rows, the milestones that grant them,
+and a spec-1 conditions file for the gates that remain; `effects_report.json`
+says per node whether it is `native`, `evaluator` or `impossible`. A spell can
+also attach extra effects to one of the mod's existing abilities.
+
+What the engine cannot express (exact one-of-N, delays, repeats over turns,
+most conditions, per-turn or on-hit events, teleport, experience, removing
+stacks) is **evaluator-owned**: its abilities are still generated so the
+extender can cast them, but no engine data points at them, so without the
+evaluator they never fire. `src/effects.cpp` is that evaluator's core: the same
+strict loader, the same native/evaluator classification as the compiler, and
+`Resolve` / `ResolveEvent`, which turn an evaluator-owned subtree into "cast
+ability X now / in N turns" using the three-valued conditions evaluator and
+fail closed on anything unknown. With `[Conditions] Enabled=1` the extender
+discovers and counts these files at start-up like conditions files
+(`effects <mod>: N spell(s), M trigger(s) loaded`). **Nothing drives the
+resolver in the game yet** (no state source, no "cast ability" primitive), and
+no generated data has been run in the game: the target a triggered cast lands
+on, whether identical trigger rows all fire, and whether triggered casts can
+chain are the open questions listed in the design document.
+
+## Plugins in this repository
+
+Real plugins live under `plugins/<name>/` and are built by `scripts/build.ps1`
+into `.build\plugins\` (separate from the synthetic plugins the tests load).
+The build then copies those DLLs into `<game>\SoulashExtender\Plugins`
+(`-GameDir`, default `SOULASH2_GAME_DIR` or the Steam location; `-GameDir ''`
+skips it). That subfolder is the only thing in the game folder the build
+writes; the proxy itself is still never installed by any script. Pin the DLLs
+as described below (the build prints each SHA-256).
+
+- `AbilityBarProbe.dll` (`plugins/ability_bar_probe`): a **log-only** probe
+  for the ability hotbar. On game build `924e1ef3` it hooks the `DrawActionBar`
+  UI system's `update` with a pass-through and logs the bar's slot array, the
+  current set and every change (`AbilityBarProbe:` lines in the diagnostics
+  log). On any other build it logs `inactive` and does nothing. It exists to
+  verify the static analysis in [docs/ability-bar.md](docs/ability-bar.md)
+  before any behaviour-changing work on multi-set hotbars starts.
+- `AbilityBarWheel.dll` (`plugins/ability_bar_wheel`): the mouse wheel
+  switches the bar set while a modifier key is held (`Modifier=ctrl` default,
+  or `shift`/`alt`; `Trigger=overbar` instead accepts the wheel over the bar),
+  by writing the same dword the game's own "Ability Bar Switch" action writes;
+  accepted wheel events are hidden from the game so the camera does not zoom.
+  **Off by default**: it hooks nothing until `AbilityBarWheel.ini` (deployed
+  next to it) says `Enabled=1`. Same build gate as the probe. Hooks: the
+  game's IAT entry for `SDL2.dll!SDL_PollEvent` and `DrawActionBar::update`,
+  both pass-through.
+
+Plugin INI templates (`plugins/<name>/<Name>.ini`) are deployed next to the
+DLLs; an existing INI keeps its values and only gains options the template has
+added since, each with its comment lines.
+
+With `[Plugins] RequireHash=1`, every rebuild changes the DLL hashes; the build
+prints the `[PluginHashes]` lines to paste into the game's `SoulashExtender.ini`.
+A stale pin shows up in the log as `load_failed ... error=5`.
 
 ## Plugin allowlist (SHA-256 pinning)
 

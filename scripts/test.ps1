@@ -28,6 +28,14 @@ if ($python) {
     if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions validator self-test failed.' }
     & $python.Source -I (Join-Path $repoRoot 'tools\validate_conditions.py') (Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json') | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions example does not validate.' }
+    & $python.Source -I (Join-Path $repoRoot 'tools\effects_compile.py') --self-test
+    if ($LASTEXITCODE -ne 0) { throw 'Effects compiler self-test failed.' }
+    $effectsEmitDirectory = Join-Path $outputDirectory ("effects-emit-" + [guid]::NewGuid().ToString('N'))
+    & $python.Source -I (Join-Path $repoRoot 'tools\effects_compile.py') (Join-Path $repoRoot 'docs\examples\runic-magic-effects.json') --emit $effectsEmitDirectory | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Effects example does not compile.' }
+    foreach ($expected in 'abilities\arendeth_runic_magic_Entropy_Surge__1_1.json', 'generated_passives.json', 'generated_milestones.json', 'generated_conditions.json', 'effects_report.json') {
+        if (-not (Test-Path -LiteralPath (Join-Path $effectsEmitDirectory $expected))) { throw "Effects compiler did not emit $expected." }
+    }
 }
 else {
     Write-Output 'SKIP: python not found; skill-conditions validator not run.'
@@ -35,6 +43,9 @@ else {
 
 & $testsPath --conditions (Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json')
 if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions evaluator test failed.' }
+
+& $testsPath --effects (Join-Path $repoRoot 'docs\examples\runic-magic-effects.json')
+if ($LASTEXITCODE -ne 0) { throw 'Effects loader/resolver test failed.' }
 
 & $testsPath --sandbox
 if ($LASTEXITCODE -ne 0) { throw 'Lua sandbox test failed.' }
@@ -44,6 +55,7 @@ $exampleConditions = Join-Path $repoRoot 'docs\examples\runic-magic-conditions.j
 foreach ($mod in 'ModA', 'ModB', 'ModC', 'ModD') { New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath $mod) -Force | Out-Null }
 New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModA\extender') -Force | Out-Null
 Copy-Item -LiteralPath $exampleConditions -Destination (Join-Path $modsDirectoryPath 'ModA\extender\conditions.json')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\examples\runic-magic-effects.json') -Destination (Join-Path $modsDirectoryPath 'ModA\extender\effects.json')
 New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModB\extender') -Force | Out-Null
 $oneCondition = '{"id":"dup","target":{"kind":"passive","id":"%s"},"when":{"in_combat":true}}'
 [System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModB\extender\conditions.json'),
@@ -51,6 +63,7 @@ $oneCondition = '{"id":"dup","target":{"kind":"passive","id":"%s"},"when":{"in_c
 New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModD\extender') -Force | Out-Null
 [System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModD\extender\conditions.json'),
     ('{"spec":1,"conditions":[' + $oneCondition.Replace('%s', 'z') + ']}'))
+[System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModD\extender\effects.json'), '{"spec":2,"mod":"ModD"}')
 $conditionsLogPath = Join-Path $outputDirectory ("conditions-" + [guid]::NewGuid().ToString('N') + '.log')
 & $testsPath --conditions-discovery $proxyPath $fakeOriginalPath $modsDirectoryPath $conditionsLogPath
 if ($LASTEXITCODE -ne 0) { throw 'Condition discovery test failed.' }

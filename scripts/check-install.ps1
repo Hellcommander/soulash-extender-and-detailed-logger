@@ -63,7 +63,15 @@ if (Test-Path -LiteralPath $notes) {
 
 # Proxy state.
 if (-not (Test-Path -LiteralPath $originalPath)) {
-    $problems.Add('BugSplat64_original.dll is missing. The proxy cannot work without the renamed vendor DLL.')
+    # No renamed original: either the extender was never installed here, or an
+    # update restored the vendor file and the original was removed.
+    $vendorSignature = if (Test-Path -LiteralPath $proxyPath) { Get-AuthenticodeSignature -LiteralPath $proxyPath } else { $null }
+    if ($vendorSignature -and $vendorSignature.Status -eq 'Valid' -and $vendorSignature.SignerCertificate.Subject -match 'BugSplat') {
+        $warnings.Add("EXTENDER NOT INSTALLED: BugSplat64.dll is the signed vendor file and there is no BugSplat64_original.dll. Install the proxy (see README).")
+    }
+    else {
+        $problems.Add('BugSplat64_original.dll is missing and BugSplat64.dll is not the signed vendor file. The proxy cannot work without the renamed vendor DLL.')
+    }
 }
 elseif (-not (Test-Path -LiteralPath $proxyPath)) {
     $problems.Add('BugSplat64.dll is missing; the game will not start.')

@@ -1,6 +1,6 @@
 # Skill conditions: predicate vocabulary (spec v1)
 
-Status: **specification plus an evaluator core**. `src/conditions.cpp` loads these files and evaluates them against a state snapshot (tested with synthetic snapshots), but nothing feeds it real game state yet and no game hook is involved. This document, `skill-conditions.schema.json`,
+Status: **specification plus an evaluator core** (conditions and conditional triggers). `src/conditions.cpp` loads these files and evaluates them against a state snapshot (tested with synthetic snapshots), but nothing feeds it real game state yet and no game hook is involved. This document, `skill-conditions.schema.json`,
 `examples/runic-magic-conditions.json` and `tools/validate_conditions.py` define
 and check the data format so mods can be written now and an evaluator (a native
 plugin, or the author's planned Lua layer) can implement it later.
@@ -73,6 +73,83 @@ folders and files in a mod folder: the runic mod already ships `tools/`,
 
 At most one condition per target per file. Two mods that condition the same
 target are combined with AND (every condition must hold).
+
+## Conditional triggers (the main use)
+
+The game's stacker system (`ability_stackers`, `on_max_stacks_cast`) is a
+separate mechanism and is not what this feature is about: conditional triggers
+do not depend on stacks or counters. A condition is any state the holder or
+the world is in (health, equipment, time of day, and so on), and it decides
+whether an ability that would otherwise trigger is allowed to.
+
+The engine can already make an ability fire on its own: a passive effect
+`trigger_ability_on_cast` (when ability A is cast, cast B with a chance) or
+`on_attack_cast` (on an attack, cast B with a chance). What it cannot do is
+make that depend on anything: every trigger fires whenever its chance rolls.
+A **trigger rule** adds the missing condition:
+
+```json
+{
+  "spec": 1,
+  "triggers": [
+    {
+      "id": "wounded_first_circle_surge",
+      "on": { "cast": "arendeth_runic_magic_Draw_First_Circle" },
+      "cast": "arendeth_runic_magic_Conjure_Strength",
+      "chance": 0.5,
+      "when": { "health_percent": { "max": 50 } }
+    },
+    {
+      "id": "unarmed_attack_discharge",
+      "on": { "attack": true },
+      "cast": "arendeth_runic_magic_Cascade_Discharge",
+      "chance": 0.2,
+      "when": { "all": [ { "weapon_class": "Unarmed" }, { "stamina_percent": { "min": 30 } } ] }
+    }
+  ]
+}
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `id` | yes | `[a-z0-9_]{1,64}`, unique across conditions and triggers in the file. |
+| `on` | yes | Exactly one event: `{"cast": "<ability id>"}` (that ability was cast) or `{"attack": true}` (the holder attacked). |
+| `cast` | yes | The ability to fire. |
+| `chance` | no | Above 0, at most 1; default 1. Rolled by the engine as it is today. |
+| `when` | yes | An expression (below). A trigger with no condition needs no extender. |
+| `on_unavailable` | no | `inactive` (default) or `active`, as for conditions. |
+
+**Meaning:** when the event happens and the engine's chance roll succeeds, the
+cast goes ahead only if `when` is true at that moment. If `when` is false, or
+unknown and `on_unavailable` is `inactive`, nothing fires.
+
+**How it is realised without hooking trigger evaluation.** A trigger rule
+compiles to ordinary data the engine already understands, plus one gating
+condition:
+
+| Rule | Generated passive effect |
+| --- | --- |
+| `on.cast = A`, `cast = B`, `chance = c` | `{effect: trigger_ability_on_cast, value: A, secondary_value: B, third_value: c}` |
+| `on.attack`, `cast = B`, `chance = c` | `{effect: on_attack_cast, value: B, secondary_value: c}` (the chance sits in `secondary_value` for this effect: core_2 `messages.json` id 100 and every installed mod agree) |
+
+Each rule becomes its own passive (`ext_trigger_<id>`) so it can be gated
+independently. Necessary leaves of a top-level `all` that have a native key
+become native keys on that passive (`restrict_weapon_type`, `restrict_tags`,
+`apply_mode`); the rest stay as a gating condition on the passive. A rule whose
+condition is entirely native needs no evaluator at all. `tools/validate_conditions.py
+<file> --emit <folder>` writes `generated_passives.json` (merge into the mod's
+`passives.json` and its skill) and `generated_conditions.json` (the remaining
+gating conditions, a normal spec-1 file).
+
+The gate is state-based: the evaluator keeps the passive on or off as the
+inputs change (see "Realisation strategies"), so a condition is current to
+within the evaluator's refresh, not evaluated at the exact instant of the roll.
+A direct gate at the trigger point would be exact but needs the engine's
+trigger code located and runtime-verified (see `skill-schema.md`). Unverified
+details: the value encodings of `restrict_weapon_type` for non-sword/axe
+classes, and whether a passive with a single trigger effect is gated per
+effect or per passive (the generator uses one passive per rule so it does not
+matter).
 
 ## Expressions
 
@@ -153,6 +230,7 @@ native and needs no evaluator; the validator reports this per condition.
 
 - unique condition ids and one condition per target;
 - exactly one key in a leaf; known predicate names and well-formed arguments;
+- for triggers: one `on` event, a `cast` ability, a `chance` in (0, 1], and a `when`;
 - names resolve against the game's lists; ranges are ordered and within 0..100
   for percentages;
 - the size limits above; a warning when a predicate is used but missing from `requires`;

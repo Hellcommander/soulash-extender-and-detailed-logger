@@ -8,7 +8,8 @@ is listed under.** Reproduce them with `tools/pe_xrefs.py`.
 
 | Build | `version.txt` | SHA-256 (first 8) | Seen in |
 | --- | --- | --- | --- |
-| current | 0.10.3.4 | `d10cec5f` | installed game, analysed below |
+| newest | 0.10.4.0.1 | `924e1ef3` | game moved to `D:\games\Steam\...`; re-verified below |
+| previous | 0.10.3.4 | `d10cec5f` | analysed in the sections below |
 | older | unknown | `7cec802f` | `proxy-crash.log` (2026-09-28), 23 crashes |
 | older | unknown | `09565e8d` | `proxy-crash.log`, 1 crash |
 
@@ -54,7 +55,54 @@ Consequences:
 3. The two-step ordering the plugin API promises (load, then POSTLOAD) says
    nothing about game state. There is currently no "data loaded" message.
 
-## Anchors for the current build (`d10cec5f`)
+## Re-verification on build `924e1ef3` (0.10.4.0.1)
+
+Same method, static only. The structure is unchanged; addresses moved:
+
+| What | `d10cec5f` | `924e1ef3` |
+| --- | --- | --- |
+| `main` (calls `IsDebuggerPresent` first) | `0x6E0D70` | `0x6E5080` |
+| `MiniDmpSender` constructor call (first proxy call) | `0x6E0FB5` | `0x6E52C5` |
+| `sendAdditionalFile` / `setGuardByteBufferSize` calls | `0x6E10F0` / `0x6E110C` | `0x6E5400` / `0x6E541C` |
+| destructor wrapper | `0x6E1250` | `0x6E5560` |
+| start of mod loading (`"Loading mods:"`) | `0x4D9760` | `0x4DDB70` |
+| `mod.json` readers (`data/mods/{}/mod.json`) | `0x4DC9C0` ... | `0x4E0DD0`, `0x4E1250`, `0x4E1340`, `0x5985B0` |
+| passive loader (`restrict_shield`) | `0x509430` | `0x50D840` (same 16 keys) |
+| ability loader (`one_of`) | `0x420E50` | `0x424CF0` (same 24 keys) |
+
+The BugSplat call is still the first thing `main` does after `IsDebuggerPresent`,
+so the load-point conclusions above hold. Anchors found by string or RTTI name
+survived; every fixed RVA shifted by roughly 0x4000-0x4300, which is exactly
+why plugins should use the anchor API rather than addresses.
+
+The installed copy at this location has the vendor `BugSplat64.dll` and no
+`BugSplat64_original.dll`, i.e. the extender is not installed there. It also
+now ships `data.7z` (about 420 MB) next to an extracted `data\` folder.
+
+### Ability bar (located statically; probe plugin written, not yet run)
+
+Full write-up: [ability-bar.md](ability-bar.md). Summary for build `924e1ef3`:
+
+- The bar is the UI system `DrawActionBar` (RTTI, vtable `0x8CEFE0`, 5 virtuals;
+  `update` `0x3FC3F0`, `draw` `0x3FC4A0`, `handleInput` `0x3FC720`). Keymap
+  actions are not dispatched through a switch table: each UI system asks
+  `0x5FA7D0` for the key bound to a gameplay-key id and polls the InputManager
+  (`0x7D4170`), which is why no id table was found earlier.
+- "Ability Bar Switch" (65) is handled at `0x3FC933`-`0x3FC9B9`: it toggles the
+  `int` at **`AbilityUser+0x68`** (0 <-> 1). Slots are `int slots[24]` at
+  `AbilityUser+0x08` (2 sets x 12, `-1` empty, else an index into the ability
+  vector at `+0x70`). `AbilityUser` is a 0x260-byte component fetched with
+  `0x91DA0(storage, g_playerEntityId @ 0xAFE668)`.
+- Saves are text (`player.sav`, `Ability user;24|...`): the serialiser writes
+  exactly 24 slots and never the current set; the deserialiser has no bound
+  check, so extra sets must be stored by the extender, not in the save.
+- The mouse wheel already becomes synthetic key codes `0x400000A4` (up) and
+  `0x40000119` (down) in `InputManager::handleEvent` (`0x7EFC80`).
+- `plugins/ability_bar_probe` is a log-only plugin (vtable pass-through on
+  `update`, hash-gated) that verifies the above at runtime; the owner's steps
+  are in ability-bar.md section 2.1. Tools: `tools/pe_rtti.py`, `tools/asm_fn.py`.
+
+## Anchors for the previous build (`d10cec5f`)
 
 Found through string cross-references; roles are inferred from the strings and
 from the game's own `errors.log` and are **not** runtime-verified.

@@ -133,6 +133,47 @@ int RunDecoderOracle(const wchar_t* imagePath, const wchar_t* disassemblyPath)
     }
     Check(addresses.size() > 1000, "oracle disassembly has instructions");
 
+    // Function ranges from the exception directory (.pdata). MSVC puts switch
+    // jump tables inside functions in .text: dumpbin disassembles those dwords
+    // as nonsense, so the oracle skips an address whose aligned dword and a
+    // neighbour are both RVAs inside the function that contains them.
+    std::vector<std::pair<unsigned long, unsigned long>> functions;
+    {
+        const IMAGE_DATA_DIRECTORY& exceptions =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        for (unsigned s = 0; s < nt->FileHeader.NumberOfSections; ++s)
+        {
+            if (exceptions.VirtualAddress >= sections[s].VirtualAddress
+                && exceptions.VirtualAddress < sections[s].VirtualAddress + sections[s].Misc.VirtualSize)
+            {
+                std::size_t at = sections[s].PointerToRawData + (exceptions.VirtualAddress - sections[s].VirtualAddress);
+                for (std::size_t n = 0; n < exceptions.Size / 12 && at + 12 <= image.size(); ++n, at += 12)
+                {
+                    unsigned long begin = 0, end = 0;
+                    std::memcpy(&begin, &image[at], 4);
+                    std::memcpy(&end, &image[at + 4], 4);
+                    if (begin != 0 && end > begin) functions.emplace_back(begin, end);
+                }
+            }
+        }
+        std::sort(functions.begin(), functions.end());
+    }
+    auto inJumpTable = [&](unsigned long long rva, std::size_t offset, std::size_t sectionOffset, unsigned long sectionRva) {
+        auto it = std::upper_bound(functions.begin(), functions.end(), std::make_pair(static_cast<unsigned long>(rva), ~0ul));
+        if (it == functions.begin()) return false;
+        --it;
+        if (rva < it->first || rva >= it->second) return false;
+        auto entry = [&](std::ptrdiff_t index) {
+            const std::ptrdiff_t aligned = static_cast<std::ptrdiff_t>((rva & ~3ull) - sectionRva) + index * 4;
+            if (aligned < 0 || sectionOffset + aligned + 4 > image.size()) return false;
+            unsigned long value = 0;
+            std::memcpy(&value, &image[sectionOffset + aligned], 4);
+            return value >= it->first && value < it->second;
+        };
+        (void)offset;
+        return entry(0) && (entry(1) || entry(-1));
+    };
+
     unsigned long long compared = 0;
     unsigned long long mismatches = 0;
     unsigned long long rejected = 0;
@@ -153,6 +194,8 @@ int RunDecoderOracle(const wchar_t* imagePath, const wchar_t* disassemblyPath)
         }
         const unsigned long long rva = addresses[i] - base;
         std::size_t offset = 0;
+        std::size_t sectionOffset = 0;
+        unsigned long sectionRva = 0;
         bool found = false;
         for (unsigned s = 0; s < nt->FileHeader.NumberOfSections && !found; ++s)
         {
@@ -161,10 +204,16 @@ int RunDecoderOracle(const wchar_t* imagePath, const wchar_t* disassemblyPath)
                 && rva < sections[s].VirtualAddress + sections[s].Misc.VirtualSize)
             {
                 offset = sections[s].PointerToRawData + (rva - sections[s].VirtualAddress);
+                sectionOffset = sections[s].PointerToRawData;
+                sectionRva = sections[s].VirtualAddress;
                 found = true;
             }
         }
         if (!found || offset + 15 > image.size())
+        {
+            continue;
+        }
+        if (inJumpTable(rva, offset, sectionOffset, sectionRva))
         {
             continue;
         }

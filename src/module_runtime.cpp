@@ -3,6 +3,7 @@
 #include "plugin_api.h"
 #include "plugin_services.hpp"
 #include "conditions.hpp"
+#include "effects.hpp"
 #include "script_sandbox.hpp"
 
 #include <windows.h>
@@ -770,6 +771,14 @@ namespace
         soulash::conditions::ConditionSet set;
     };
     std::vector<std::unique_ptr<ModConditions>> g_conditionSets;
+    // <mods>\<mod>\extender\effects.json (docs/effects.md): loaded and counted
+    // the same way; the resolver has no state source or cast primitive yet.
+    struct ModEffects
+    {
+        std::string mod;
+        soulash::effects::EffectSet set;
+    };
+    std::vector<std::unique_ptr<ModEffects>> g_effectSets;
     wchar_t g_modsDirectory[MAX_PATH]{};
 
     bool ConfigureConditionsDirectory()
@@ -868,6 +877,7 @@ namespace
         });
 
         std::size_t totalConditions = 0;
+        std::size_t totalTriggers = 0;
         std::size_t loadedMods = 0;
         for (const std::wstring& mod : mods)
         {
@@ -900,14 +910,62 @@ namespace
             }
             SoulashDiagnosticsWritePluginMessage(
                 ("conditions " + name + ": " + std::to_string(entry->set.Items().size())
-                    + " condition(s) loaded").c_str());
+                    + " condition(s), " + std::to_string(entry->set.Triggers().size())
+                    + " trigger(s) loaded").c_str());
             totalConditions += entry->set.Items().size();
+            totalTriggers += entry->set.Triggers().size();
             ++loadedMods;
             g_conditionSets.push_back(std::move(entry));
         }
         SoulashDiagnosticsWritePluginMessage(
-            ("conditions: " + std::to_string(totalConditions) + " condition(s) from "
+            ("conditions: " + std::to_string(totalConditions) + " condition(s), "
+                + std::to_string(totalTriggers) + " trigger(s) from "
                 + std::to_string(loadedMods) + " mod(s)").c_str());
+
+        std::size_t totalSpells = 0;
+        std::size_t totalEffectTriggers = 0;
+        std::size_t effectMods = 0;
+        for (const std::wstring& mod : mods)
+        {
+            if (g_effectSets.size() >= MaximumConditionMods)
+            {
+                break;
+            }
+            const std::wstring path = root + mod + L"\\extender\\effects.json";
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                continue;
+            }
+            const std::string name = NarrowName(mod.c_str());
+            std::string text;
+            if (!ReadScriptFile(path, text))
+            {
+                SoulashDiagnosticsWritePluginMessage(
+                    ("effects " + name + " rejected: cannot read the file or it exceeds 256 KiB").c_str());
+                continue;
+            }
+            auto entry = std::make_unique<ModEffects>();
+            entry->mod = name;
+            std::string error;
+            if (!entry->set.Load(text, error))
+            {
+                SoulashDiagnosticsWritePluginMessage(("effects " + name + " rejected: " + error).c_str());
+                continue;
+            }
+            SoulashDiagnosticsWritePluginMessage(
+                ("effects " + name + ": " + std::to_string(entry->set.Spells().size())
+                    + " spell(s), " + std::to_string(entry->set.Triggers().size())
+                    + " trigger(s) loaded").c_str());
+            totalSpells += entry->set.Spells().size();
+            totalEffectTriggers += entry->set.Triggers().size();
+            ++effectMods;
+            g_effectSets.push_back(std::move(entry));
+        }
+        SoulashDiagnosticsWritePluginMessage(
+            ("effects: " + std::to_string(totalSpells) + " spell(s), "
+                + std::to_string(totalEffectTriggers) + " trigger(s) from "
+                + std::to_string(effectMods) + " mod(s)").c_str());
     }
 
     DWORD WINAPI LoadNativeModules(void*)

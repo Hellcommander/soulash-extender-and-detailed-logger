@@ -1,38 +1,121 @@
 {
   "spec": 1,
-  "requires": ["weapon_class", "health_percent", "inventory_count", "in_combat", "time_of_day", "equipped"],
+  "requires": [
+    "equipped",
+    "health_percent",
+    "in_combat",
+    "inventory_count",
+    "stamina_percent",
+    "time_of_day",
+    "weapon_class"
+  ],
   "conditions": [
     {
       "id": "charge_harvest_wounded",
-      "target": { "kind": "passive", "id": "arendeth_runic_magic_charge_harvest" },
+      "target": {
+        "kind": "passive",
+        "id": "arendeth_runic_magic_charge_harvest"
+      },
       "when": {
         "all": [
-          { "health_percent": { "max": 50 } },
-          { "weapon_class": ["Unarmed", "Natural"] }
+          {
+            "health_percent": {
+              "max": 50
+            }
+          },
+          {
+            "weapon_class": [
+              "Unarmed",
+              "Natural"
+            ]
+          }
         ]
       },
       "note": "Hoistable weapon_class is native; health_percent needs an evaluator."
     },
     {
       "id": "warding_rune_needs_charge",
-      "target": { "kind": "ability", "id": "arendeth_runic_magic_Cast_Warding_Rune" },
+      "target": {
+        "kind": "ability",
+        "id": "arendeth_runic_magic_Cast_Warding_Rune"
+      },
       "when": {
         "all": [
-          { "inventory_count": { "item": "arendeth_runic_magic_Rune_Charge", "min": 1 } },
-          { "not": { "in_combat": false } }
+          {
+            "inventory_count": {
+              "item": "arendeth_runic_magic_Rune_Charge",
+              "min": 1
+            }
+          },
+          {
+            "not": {
+              "in_combat": false
+            }
+          }
         ]
       }
     },
     {
       "id": "runic_strike_by_night_or_unarmed",
-      "target": { "kind": "passive", "id": "arendeth_runic_magic_runic_strike" },
+      "target": {
+        "kind": "passive",
+        "id": "arendeth_runic_magic_runic_strike"
+      },
       "when": {
         "any": [
-          { "time_of_day": ["Night", "Late Night", "Midnight"] },
-          { "equipped": { "slot": "right_hand", "empty": true } }
+          {
+            "time_of_day": [
+              "Night",
+              "Late Night",
+              "Midnight"
+            ]
+          },
+          {
+            "equipped": {
+              "slot": "right_hand",
+              "empty": true
+            }
+          }
         ]
       },
       "on_unavailable": "inactive"
+    }
+  ],
+  "triggers": [
+    {
+      "id": "wounded_first_circle_surge",
+      "on": {
+        "cast": "arendeth_runic_magic_Draw_First_Circle"
+      },
+      "cast": "arendeth_runic_magic_Conjure_Strength",
+      "chance": 0.5,
+      "when": {
+        "health_percent": {
+          "max": 50
+        }
+      },
+      "note": "Drawing the First Circle also conjures a Rune of Strength half the time, but only while wounded."
+    },
+    {
+      "id": "unarmed_attack_discharge",
+      "on": {
+        "attack": true
+      },
+      "cast": "arendeth_runic_magic_Cascade_Discharge",
+      "chance": 0.2,
+      "when": {
+        "all": [
+          {
+            "weapon_class": "Unarmed"
+          },
+          {
+            "stamina_percent": {
+              "min": 30
+            }
+          }
+        ]
+      },
+      "note": "weapon_class compiles to a native restrict_weapon_type; stamina needs the evaluator."
     }
   ]
 }
