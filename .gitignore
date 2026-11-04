@@ -8,3 +8,4 @@
 *.exe
 
 third_party/lua-*/
+__pycache__/

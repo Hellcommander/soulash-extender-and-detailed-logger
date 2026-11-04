@@ -4,11 +4,14 @@
 // makes is replacing one vtable entry of the DrawActionBar UI system with a
 // pass-through hook that calls the original and then reads memory.
 //
-// Everything below is keyed to one executable build. On any other build the
-// plugin logs "inactive" and does nothing. Offsets come from the disassembly
-// of build 924e1ef3 (version 0.10.4.0.1); see docs/ability-bar.md for the
-// evidence behind each one.
+// Offsets come from the disassembly of build 924e1ef3 (version 0.10.4.0.1)
+// and were re-checked on 60b72c10 (0.10.5.1); see docs/ability-bar.md for the
+// evidence behind each one. The plugin does not trust a build hash: at load it
+// verifies DrawActionBar's own code against every pattern it relies on
+// (plugins/common/ability_bar_layout.hpp) and takes the player-id global from
+// it. If anything does not match it logs "inactive" and does nothing.
 #include "plugin_api.h"
+#include "../common/ability_bar_layout.hpp"
 
 #include <windows.h>
 
@@ -19,19 +22,17 @@
 
 namespace
 {
-    // ---- Build 924e1ef3 (0.10.4.0.1) facts ----------------------------------
-    constexpr char SupportedExeSha256[] =
-        "924e1ef316ce5ab4aacf75c2eb83a16932151a0642a2e57af14e7025dac0d430";
-
-    // Global dword: the player's entity id (written by five functions, read by
-    // every UI system through `mov edx,[0xAFE668]`).
-    constexpr std::uintptr_t PlayerEntityIdRva = 0xAFE668;
+    // ---- Layout facts (verified at load by VerifyAbilityBarLayout) ----------
+    // The player's entity id is a global dword read by every UI system through
+    // `mov edx,[rip+X]` (0xAFE668 in 924e1ef3, 0xB07668 in 60b72c10); its
+    // address is taken from DrawActionBar::update at load.
 
     // DrawActionBar (RTTI ".?AVDrawActionBar@@", 0x38 bytes, vtable of 5):
     //   [0] scalar deleting destructor   [1] bool update(float dt)
     //   [2] (shared no-op)               [3] void draw(Renderer*)
     //   [4] void handleInput()           <- toggles the bar set on action 65
     constexpr unsigned int DrawActionBarUpdateSlot = 1;
+    constexpr unsigned int DrawActionBarHandleInputSlot = 4;
     constexpr std::uintptr_t DrawActionBarContextOffset = 0x08; // game context pointer
     constexpr std::uintptr_t DrawActionBarRectOffset = 0x10;    // 10 floats: layout rectangle(s)
     constexpr unsigned int DrawActionBarRectFloats = 10;
@@ -85,6 +86,18 @@ namespace
     unsigned long long g_lastHeartbeatFrame = 0;
     bool g_loggedFirstFrame = false;
     bool g_loggedFault = false;
+
+    // Step (c) groundwork (log-only): ability ids and the current save's name.
+    // Ability objects start with their id as an MSVC std::string (the save
+    // formatter 0x3672E0 in 60b72c10 copies Ability+0x00 and appends
+    // "*<int +0x158>*<count of vector<string> +0x140>", e.g. "acid_magic_acid_dart*0*0").
+    constexpr std::uintptr_t AbilityIdOffset = 0x00;
+    constexpr unsigned int MaxLoggedAbilities = 64;
+    const void* g_saveNameString = nullptr;   // std::string inside a static singleton
+    long long g_lastLoggedAbilityCount = -2;
+    std::uint32_t g_lastLoggedAbilityPlayer = 0;
+    const void* g_lastLoggedAbilitiesBegin = nullptr;
+    char g_lastSaveName[128] = "?";
 
     void Log(const char* format, ...)
     {
@@ -155,6 +168,63 @@ namespace
                 break;
             }
             used += static_cast<std::size_t>(written);
+        }
+    }
+
+    // One line per ~380 characters: "abilities[0..]: 0=id 1=id ...".
+    void LogAbilityIds(const unsigned char* begin, long long count)
+    {
+        char line[400];
+        std::size_t used = 0;
+        unsigned int first = 0;
+        const unsigned int shown = count > MaxLoggedAbilities ? MaxLoggedAbilities : static_cast<unsigned int>(count);
+        for (unsigned int i = 0; i < shown; ++i)
+        {
+            const auto ability = Read<const unsigned char*>(begin, i * sizeof(void*));
+            char id[96];
+            if (ability == nullptr
+                || !soulash_plugins::ReadMsvcString(ability + AbilityIdOffset, id, sizeof(id)))
+            {
+                std::memcpy(id, "<unreadable>", sizeof("<unreadable>"));
+            }
+            char entry[112];
+            const int length = _snprintf_s(entry, sizeof(entry), _TRUNCATE, "%s%u=%s", used == 0 ? "" : " ", i, id);
+            if (length < 0)
+            {
+                continue;
+            }
+            if (used + static_cast<std::size_t>(length) >= sizeof(line) - 1 && used > 0)
+            {
+                Log("abilities[%u..]: %s", first, line);
+                used = 0;
+                first = i;
+                _snprintf_s(entry, sizeof(entry), _TRUNCATE, "%u=%s", i, id);
+            }
+            const int appended = _snprintf_s(line + used, sizeof(line) - used, _TRUNCATE, "%s", entry);
+            used += appended < 0 ? 0 : static_cast<std::size_t>(appended);
+        }
+        if (used > 0)
+        {
+            Log("abilities[%u..]: %s%s", first, line, count > MaxLoggedAbilities ? " (more not shown)" : "");
+        }
+    }
+
+    void LogSaveNameIfChanged()
+    {
+        if (g_saveNameString == nullptr)
+        {
+            return;
+        }
+        char name[sizeof(g_lastSaveName)];
+        if (!soulash_plugins::ReadMsvcString(g_saveNameString, name, sizeof(name)))
+        {
+            // Zeroed until the game's singleton is constructed.
+            std::memcpy(name, "<not set>", sizeof("<not set>"));
+        }
+        if (std::strcmp(name, g_lastSaveName) != 0)
+        {
+            Log("save folder name='%s' (the save is %%APPDATA%%\\WizardsOfTheCode\\Soulash2\\saves\\%s)", name, name);
+            std::memcpy(g_lastSaveName, name, sizeof(name));
         }
     }
 
@@ -231,6 +301,18 @@ namespace
         Log("%s frame=%llu player_id=%u abilityUser=%p set=%d selected=%d abilities=%lld slots[set0 / set1]=%s",
             changed ? (g_haveSnapshot ? "CHANGE" : "snapshot") : "heartbeat",
             g_frames, playerId, abilityUser, currentSet, selected, abilityCount, slotText);
+        if (abilityCount >= 0
+            && (abilityCount != g_lastLoggedAbilityCount || playerId != g_lastLoggedAbilityPlayer
+                || abilitiesBegin != g_lastLoggedAbilitiesBegin))
+        {
+            Log("player_id=%u knows %lld abilit%s (slot values index this list):", playerId, abilityCount,
+                abilityCount == 1 ? "y" : "ies");
+            LogAbilityIds(abilitiesBegin, abilityCount);
+            g_lastLoggedAbilityCount = abilityCount;
+            g_lastLoggedAbilityPlayer = playerId;
+            g_lastLoggedAbilitiesBegin = abilitiesBegin;
+        }
+        LogSaveNameIfChanged();
         if (g_haveSnapshot && currentSet != g_lastSet)
         {
             Log("ability bar set switched %d -> %d (Ability Bar Switch, action 65, toggles +0x68)", g_lastSet, currentSet);
@@ -272,6 +354,70 @@ namespace
         return result;
     }
 
+    soulash_plugins::AbilityBarLayout GuardedVerifyLayout(void* vtable)
+    {
+        soulash_plugins::AbilityBarLayout layout;
+        __try
+        {
+            const auto* image = static_cast<const unsigned char*>(g_extender->gameBase);
+            void** slots = static_cast<void**>(vtable);
+            layout = soulash_plugins::VerifyAbilityBarLayout(image,
+                soulash_plugins::MappedImageSize(image),
+                static_cast<const unsigned char*>(slots[DrawActionBarUpdateSlot]),
+                static_cast<const unsigned char*>(slots[DrawActionBarHandleInputSlot]));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            layout = soulash_plugins::AbilityBarLayout{};
+            layout.failure = "access fault while reading game code";
+        }
+        return layout;
+    }
+
+    soulash_plugins::SaveNameLocation GuardedLocateSaveName(void* saver)
+    {
+        soulash_plugins::SaveNameLocation location;
+        __try
+        {
+            const auto* image = static_cast<const unsigned char*>(g_extender->gameBase);
+            location = soulash_plugins::LocateSaveName(image, soulash_plugins::MappedImageSize(image),
+                static_cast<const unsigned char*>(saver));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            location = soulash_plugins::SaveNameLocation{};
+            location.failure = "access fault while reading game code";
+        }
+        return location;
+    }
+
+    // Log-only: finds the std::string holding the current save's folder name.
+    void LocateSaveNameString()
+    {
+        void* savers[4]{};
+        unsigned int count = 0;
+        if (!g_extender->findFunctionsReferencingString(g_extender->pluginHandle, "Saving player", savers, 4, &count)
+            || count == 0)
+        {
+            Log("save name: no function references \"Saving player\"; save folder will not be logged");
+            return;
+        }
+        const char* failure = "";
+        for (unsigned int i = 0; i < count && i < 4; ++i)
+        {
+            const soulash_plugins::SaveNameLocation location = GuardedLocateSaveName(savers[i]);
+            if (location.found)
+            {
+                g_saveNameString = location.nameString;
+                Log("save name: std::string at singleton rva 0x%llX + 0x%X (writer %p)",
+                    static_cast<unsigned long long>(location.singletonRva), location.nameOffset, savers[i]);
+                return;
+            }
+            failure = location.failure;
+        }
+        Log("save name: not located (%s); save folder will not be logged", failure);
+    }
+
     bool Install()
     {
         void* vtable = nullptr;
@@ -288,8 +434,16 @@ namespace
             return false;
         }
         g_abilityUserVtable = abilityUserVtable;
-        g_playerEntityId = reinterpret_cast<const std::uint32_t*>(
-            static_cast<unsigned char*>(g_extender->gameBase) + PlayerEntityIdRva);
+        const soulash_plugins::AbilityBarLayout layout = GuardedVerifyLayout(vtable);
+        if (!layout.verified)
+        {
+            Log("inactive: game build %.8s does not match the verified ability-bar layout (%s); no hooks installed",
+                g_extender->gameExecutableSha256[0] == '\0' ? "unknown " : g_extender->gameExecutableSha256,
+                layout.failure);
+            return false;
+        }
+        g_playerEntityId = layout.playerEntityId;
+        LocateSaveNameString();
 
         void** slot = static_cast<void**>(vtable) + DrawActionBarUpdateSlot;
         g_originalUpdate = reinterpret_cast<UpdateFn>(*slot);
@@ -300,9 +454,11 @@ namespace
             g_originalUpdate = nullptr;
             return false;
         }
-        Log("active: DrawActionBar vtable=%p update=%p hooked, AbilityUser vtable=%p, player id at %p",
+        Log("active: game build %.8s, layout verified, DrawActionBar vtable=%p update=%p hooked, AbilityUser vtable=%p, player id at %p (rva 0x%llX)",
+            g_extender->gameExecutableSha256[0] == '\0' ? "unknown " : g_extender->gameExecutableSha256,
             vtable, reinterpret_cast<void*>(g_originalUpdate), abilityUserVtable,
-            static_cast<const void*>(g_playerEntityId));
+            static_cast<const void*>(g_playerEntityId),
+            static_cast<unsigned long long>(layout.playerEntityIdRva));
         return true;
     }
 }
@@ -320,13 +476,6 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     }
     g_extender = extender;
 
-    if (std::strcmp(extender->gameExecutableSha256, SupportedExeSha256) != 0)
-    {
-        Log("inactive: game build %.8s is not the analysed build %.8s (no hooks installed)",
-            extender->gameExecutableSha256[0] == '\0' ? "unknown " : extender->gameExecutableSha256,
-            SupportedExeSha256);
-        return TRUE;
-    }
     Install();
     return TRUE;
 }

@@ -8,8 +8,9 @@ is listed under.** Reproduce them with `tools/pe_xrefs.py`.
 
 | Build | `version.txt` | SHA-256 (first 8) | Seen in |
 | --- | --- | --- | --- |
-| newest | 0.10.4.0.1 | `924e1ef3` | game moved to `D:\games\Steam\...`; re-verified below |
-| previous | 0.10.3.4 | `d10cec5f` | analysed in the sections below |
+| newest | 0.10.5.1 | `60b72c10` | Steam update 2026-10-31; ability-bar layout re-verified (see below) |
+| previous | 0.10.4.0.1 | `924e1ef3` | game moved to `D:\games\Steam\...`; re-verified below; ability-bar probe runs |
+| older | 0.10.3.4 | `d10cec5f` | analysed in the sections below |
 | older | unknown | `7cec802f` | `proxy-crash.log` (2026-09-28), 23 crashes |
 | older | unknown | `09565e8d` | `proxy-crash.log`, 1 crash |
 
@@ -74,6 +75,30 @@ The BugSplat call is still the first thing `main` does after `IsDebuggerPresent`
 so the load-point conclusions above hold. Anchors found by string or RTTI name
 survived; every fixed RVA shifted by roughly 0x4000-0x4300, which is exactly
 why plugins should use the anchor API rather than addresses.
+
+## Build `60b72c10` (0.10.5.1, 2026-10-31): ability bar unchanged
+
+The Steam update kept the installed proxy (the vendor DLL was not replaced:
+`BugSplat64.dll` is still the proxy, `BugSplat64_original.dll` the vendor
+file). Static re-check of everything the ability-bar plugins use:
+
+| What | `924e1ef3` | `60b72c10` |
+| --- | --- | --- |
+| `DrawActionBar` vtable / `update` / `handleInput` | `0x8CEFE0` / `0x3FC3F0` / `0x3FC720` | `0x8D70C0` / `0x401120` / `0x401450` |
+| player entity id global | `0xAFE668` | `0xB07668` |
+| AbilityUser / UI-state getters | `0x91DA0` / `0x27D30` | `0x91FA0` / `0x27F20` (same page table, strides 0x260 / 0x130) |
+| AbilityUser vtable (dtor, serialise, deserialise) | `0x8B9430` | `0x8C14C8` (`0x6C650`, `0x6C910`, `0x6D090`) |
+| ability save formatter (`id*int*count`) | `0x3627E0` | `0x3672E0` |
+| player save writer (`"Saving player"`) | `0x6D09C0` area | `0x6D79D0` |
+
+Every struct offset (`context+0x100`, registry `+0x08`/`+0x1A0`, UI mode
+`+0x60`, blocked-mode mask `0x13200060400`, `AbilityUser+0x68` toggle, `+0xB0`
+timer, bar rectangle `+0x14/+0x20/+0x24/+0x28`) is byte-identical. Only the
+player-id global moved, so both plugins now derive it from `DrawActionBar::update`
+at load and verify every pattern instead of trusting an exe hash
+(`plugins/common/ability_bar_layout.hpp`; `native-tests.exe --ability-bar-layout
+<exe> 401120 401450 6d79d0` runs the same check on a file and prints
+`verified=1, player id rva 0xb07668`).
 
 The installed copy at this location has the vendor `BugSplat64.dll` and no
 `BugSplat64_original.dll`, i.e. the extender is not installed there. It also

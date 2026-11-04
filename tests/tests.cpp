@@ -4,6 +4,7 @@
 #include "effects.hpp"
 #include "script_sandbox.hpp"
 #include "x64_length.hpp"
+#include "../plugins/common/ability_bar_layout.hpp"
 
 #include <windows.h>
 
@@ -17,7 +18,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -733,6 +736,7 @@ namespace
 #include "sandbox_tests.inc"
 #include "conditions_tests.inc"
 #include "effects_tests.inc"
+#include "ability_bar_layout_tests.inc"
 
     // Child side of the debugger fallback test. Loads the proxy but never
     // calls any BugSplat export, so only the DllMain fallback can start it.
@@ -1756,6 +1760,7 @@ int wmain(int argc, wchar_t* argv[])
     {
         TestManifestParser();
         TestX64Decoder();
+        TestAbilityBarLayout();
         if (failures == 0)
         {
             std::cout << "PASS: native module manifest tests\n";
@@ -1807,6 +1812,11 @@ int wmain(int argc, wchar_t* argv[])
     if (argc == 3 && std::wstring_view(argv[1]) == L"--effects")
     {
         return RunEffectsTests(argv[2]);
+    }
+
+    if (argc == 6 && std::wstring_view(argv[1]) == L"--ability-bar-layout")
+    {
+        return RunAbilityBarLayoutOracle(argv[2], argv[3], argv[4], argv[5]);
     }
 
     if (argc == 2 && std::wstring_view(argv[1]) == L"--sandbox")

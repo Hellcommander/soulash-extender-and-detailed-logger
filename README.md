@@ -218,10 +218,13 @@ writes; the proxy itself is still never installed by any script. Pin the DLLs
 as described below (the build prints each SHA-256).
 
 - `AbilityBarProbe.dll` (`plugins/ability_bar_probe`): a **log-only** probe
-  for the ability hotbar. On game build `924e1ef3` it hooks the `DrawActionBar`
+  for the ability hotbar. On any game build whose `DrawActionBar` code matches
+  the verified layout (checked at load, `plugins/common/ability_bar_layout.hpp`;
+  `924e1ef3` / 0.10.4.0.1 and `60b72c10` / 0.10.5.1 do) it hooks the `DrawActionBar`
   UI system's `update` with a pass-through and logs the bar's slot array, the
   current set and every change (`AbilityBarProbe:` lines in the diagnostics
-  log). On any other build it logs `inactive` and does nothing. It exists to
+  log), plus the known abilities by id and the current save's folder name.
+  On a build that does not match it logs `inactive` and does nothing. It exists to
   verify the static analysis in [docs/ability-bar.md](docs/ability-bar.md)
   before any behaviour-changing work on multi-set hotbars starts.
 - `AbilityBarWheel.dll` (`plugins/ability_bar_wheel`): the mouse wheel

@@ -23,13 +23,18 @@ HOW TO BUILD AND TEST (Windows, x64)
   anchors and hooked update, conditions discovery ran (0 mods), effects discovery loaded arendeth_hydromancy
   (0 spells, 1 trigger). Nothing inside the game's logic is hooked yet; the probe is log-only.
 
-UNCOMMITTED WORK (git: branch hellcommander-native-extender-logger, last commit 867270e)
-- Conditional triggers, condition-file discovery, new-build notes, check-install fix, etc. (see `git status`).
-- Effects system (2026-10-24): docs/effects.md, docs/effects.schema.json, docs/examples/runic-magic-effects.json,
-  tools/effects_compile.py, src/effects.cpp/.hpp, tests/effects_tests.inc; small edits to tests.cpp, build.ps1, test.ps1,
-  module_runtime.cpp (effects.json discovery), conditions.hpp/.cpp (ParseJson exposed). Also a fix: on_attack_cast takes
-  its chance in secondary_value (validate_conditions.py emitted third_value).
-- tools/__pycache__/pe_xrefs.cpython-314.pyc is tracked by mistake: untrack it and add __pycache__ to .gitignore.
+SESSION 2026-11-04 (branch hellcommander-native-extender-logger, on top of 7a0843b)
+- GAME UPDATED 2026-10-31 to 0.10.5.1 (exe 60b72c10e3f120df...). The proxy survived the update. Static re-check: every
+  ability-bar struct offset is identical, only the player-id global moved (0xAFE668 -> 0xB07668); table in
+  docs/game-notes.md. Both plugins no longer gate on one exe hash: plugins/common/ability_bar_layout.hpp verifies
+  DrawActionBar's own code (all patterns, both getters) and derives the player-id global; synthetic tests in
+  tests/ability_bar_layout_tests.inc; `native-tests.exe --ability-bar-layout <exe> 401120 401450 6d79d0` = real-exe oracle.
+- The owner's last run (2026-10-25 08:34Z, still old build) refused BOTH plugins with error=5: stale [PluginHashes] pins.
+  The SuppressModifierKey fix has therefore NEVER RUN. New hashes are printed by every build.
+- Owner decisions for step 1(c): the game's two physical sets become sets 1-2 of N; sets are PER SAVE (sidecar).
+- Probe now also logs ability ids (Ability+0x00 std::string) and the current save folder name (static singleton
+  0xB081B0+0xC08, derived from the "Saving player" writer by LocateSaveName). Log-only; not yet run.
+- tools/__pycache__ untracked, __pycache__/ in .gitignore.
 
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
@@ -47,9 +52,10 @@ STANDING RULES FROM THE OWNER (keep following them)
   NOT about logging and NOT about stacker counts (the stacker system is a separate native mechanism).
 
 WHERE THE GAME IS
-- Current: D:\games\Steam\steamapps\common\Soulash 2   version 0.10.4.0.1   exe sha256 924e1ef316ce5ab4...
-  (extender NOT installed there; vendor BugSplat64.dll, no BugSplat64_original.dll)
-- Older copy: E:\SteamLibrary\steamapps\common\Soulash 2 (0.10.3.4, exe d10cec5f...).
+- Current: D:\games\Steam\steamapps\common\Soulash 2   version 0.10.5.1 (2026-10-31)   exe sha256 60b72c10e3f120df...
+  Proxy INSTALLED (BugSplat64.dll = proxy a2ebdff3..., BugSplat64_original.dll = vendor 4016763c...).
+  Previous build there: 0.10.4.0.1, 924e1ef3 (all runtime evidence so far is from that build).
+- Older copy E:\SteamLibrary\...\Soulash 2 (0.10.3.4, d10cec5f) is GONE as of 2026-11-04.
 - Owner's mod (read-only reference): <game>\data\mods\arendeth_runic_magic (Runic Magic, 680 json files).
 
 WHAT EXISTS (all tested with synthetic fixtures)
@@ -119,8 +125,12 @@ OPEN WORK, PRIORITISED
        while Ctrl was held (probe log). Fix: SuppressModifierKey=1 (default for ctrl) hides the modifier's key down/up
        events from the game while in the game world; SDL_GetModState still arms the wheel. Built + deployed, NOT RUN.
        Owner: paste the printed hashes again, hold Ctrl 0.5 s, scroll, send the "AbilityBarWheel:" lines.
+       2026-10-25 run: refused (error=5, stale pins) -> still NOT RUN. Now also verified for 0.10.5.1 (layout check).
    (c) THEN: N sets in extender storage keyed by ability id strings, swapped into the live 24 slots; sidecar file next
-       to the save, never player.sav. Ask the owner: keep Left Ctrl's two physical sets? per-save or global?
+       to the save, never player.sav. OWNER DECIDED (2026-11-04): physical sets = sets 1-2 of the N ring; per save.
+       Groundwork (docs/ability-bar.md 3.3): ability id = std::string at Ability+0x00; save folder = pref path + "saves/" +
+       std::string at singleton+0xC08 (both logged by the probe, unverified at runtime). Next: probe run on 0.10.5.1,
+       then find save-written / save-loaded hook points (writer 0x6D79D0, reader 0x6D7F80 in 60b72c10).
    Still do not patch anything else blind; every offset above is unverified until the probe log says otherwise.
 
 2. CONDITIONS: A REAL STATE SOURCE  (OWNER DIRECTIVE 2026-10-24: the extender itself must add conditional support
@@ -150,7 +160,7 @@ OPEN WORK, PRIORITISED
    - Re-check the recorded null-write crash (older build 7cec802f RVA 0x6E7E52) against the current build.
 
 4. HARDENING / HOUSEKEEPING
-   - Commit current work; untrack tools/__pycache__; add __pycache__ to .gitignore.
+   - (done 2026-11-04) untrack tools/__pycache__; __pycache__ in .gitignore.
    - Review Lua security fixes periodically (pinned 5.4.9); keep the sandbox limits.
    - Consider code signing, a release process, and the S2NF-compatible lifecycle only if S2NF's loader can be verified.
    - Possible: decide whether to suspend other threads while patching; distinguish "likely module involvement" from

@@ -23,9 +23,14 @@
 //     it into a pending step (and, by default, hides that event from the game
 //     so the camera does not zoom).
 //
-// Everything is keyed to one executable build and verified by the probe plugin
-// (docs/ability-bar.md section 2.3). On any other build it logs and stays idle.
+// The facts it uses were verified in the game by the probe plugin
+// (docs/ability-bar.md section 2.3) on build 924e1ef3 and re-checked statically
+// on 60b72c10 (0.10.5.1). It does not trust a build hash: at load it verifies
+// DrawActionBar's own code against every pattern it relies on
+// (plugins/common/ability_bar_layout.hpp) and takes the player-id global from
+// it. On a build where anything differs it logs and stays idle.
 #include "plugin_api.h"
+#include "../common/ability_bar_layout.hpp"
 
 #include <windows.h>
 
@@ -36,12 +41,10 @@
 
 namespace
 {
-    // ---- Build 924e1ef3 (0.10.4.0.1) facts (runtime-verified by AbilityBarProbe) ----
-    constexpr char SupportedExeSha256[] =
-        "924e1ef316ce5ab4aacf75c2eb83a16932151a0642a2e57af14e7025dac0d430";
-    constexpr std::uintptr_t PlayerEntityIdRva = 0xAFE668;
-
+    // ---- Layout facts (runtime-verified by AbilityBarProbe on 924e1ef3; checked
+    // against the running build's code at load by VerifyAbilityBarLayout) ----
     constexpr unsigned int DrawActionBarUpdateSlot = 1;
+    constexpr unsigned int DrawActionBarHandleInputSlot = 4;
     constexpr std::uintptr_t DrawActionBarContextOffset = 0x08;
     // Floats at +0x10..: the handler at 0x3FC7D7 accepts the cursor when
     // x in [+0x20, +0x28] and (windowHeight - y) in [+0x24, +0x14].
@@ -522,6 +525,26 @@ namespace
         return true;
     }
 
+    soulash_plugins::AbilityBarLayout GuardedVerifyLayout(void* vtable)
+    {
+        soulash_plugins::AbilityBarLayout layout;
+        __try
+        {
+            const auto* image = static_cast<const unsigned char*>(g_extender->gameBase);
+            void** slots = static_cast<void**>(vtable);
+            layout = soulash_plugins::VerifyAbilityBarLayout(image,
+                soulash_plugins::MappedImageSize(image),
+                static_cast<const unsigned char*>(slots[DrawActionBarUpdateSlot]),
+                static_cast<const unsigned char*>(slots[DrawActionBarHandleInputSlot]));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            layout = soulash_plugins::AbilityBarLayout{};
+            layout.failure = "access fault while reading game code";
+        }
+        return layout;
+    }
+
     bool Install()
     {
         const HMODULE sdl = GetModuleHandleW(L"SDL2.dll");
@@ -556,7 +579,21 @@ namespace
         }
         g_abilityUserVtable = abilityUserVtable;
         auto* base = static_cast<unsigned char*>(g_extender->gameBase);
-        g_playerEntityId = reinterpret_cast<const std::uint32_t*>(base + PlayerEntityIdRva);
+        const soulash_plugins::AbilityBarLayout layout = GuardedVerifyLayout(vtable);
+        if (!layout.verified)
+        {
+            Log("inactive: game build %.8s does not match the verified ability-bar layout (%s); no hooks installed",
+                g_extender->gameExecutableSha256[0] == '\0' ? "unknown " : g_extender->gameExecutableSha256,
+                layout.failure);
+            return false;
+        }
+        g_playerEntityId = layout.playerEntityId;
+        if (g_triggerOverBar && !layout.barRectVerified)
+        {
+            Log("Trigger=overbar needs the bar rectangle, which this build's code does not confirm; using Trigger=modifier (%s) instead",
+                g_modifierName);
+            g_triggerOverBar = false;
+        }
 
         void** iatSlot = GuardedFindPollEventIatSlot(base);
         if (iatSlot == nullptr || *iatSlot == nullptr)
@@ -589,7 +626,9 @@ namespace
             Log("patching the SDL_PollEvent IAT slot failed; inactive");
             return false;
         }
-        Log("active: trigger=%s, hold=%llu ms, suppress modifier key=%d, swallow wheel=%d, log events=%d, update hook on vtable %p (previous %p), SDL_PollEvent IAT slot %p (previous %p)",
+        Log("active: game build %.8s, layout verified (player id rva 0x%llX), trigger=%s, hold=%llu ms, suppress modifier key=%d, swallow wheel=%d, log events=%d, update hook on vtable %p (previous %p), SDL_PollEvent IAT slot %p (previous %p)",
+            g_extender->gameExecutableSha256[0] == '\0' ? "unknown " : g_extender->gameExecutableSha256,
+            static_cast<unsigned long long>(layout.playerEntityIdRva),
             g_triggerOverBar ? "over bar" : g_modifierName, g_holdMs, g_suppressModifierKey ? 1 : 0,
             g_swallowWheel ? 1 : 0, g_logEvents ? 1 : 0,
             vtable, reinterpret_cast<void*>(g_originalUpdate), static_cast<void*>(iatSlot),
@@ -615,13 +654,6 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
 
     if (!ReadConfiguration())
     {
-        return TRUE;
-    }
-    if (std::strcmp(extender->gameExecutableSha256, SupportedExeSha256) != 0)
-    {
-        Log("inactive: game build %.8s is not the verified build %.8s (no hooks installed)",
-            extender->gameExecutableSha256[0] == '\0' ? "unknown " : extender->gameExecutableSha256,
-            SupportedExeSha256);
         return TRUE;
     }
     Install();

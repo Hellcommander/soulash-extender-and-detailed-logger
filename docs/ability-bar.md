@@ -147,9 +147,15 @@ calls the original, then reads memory inside a `__try` block; a fault disables
 the probe and is logged instead of crashing the game.
 
 Anchors are build-independent where possible (`findRttiVtable("DrawActionBar")`,
-`findRttiVtable(".?AUAbilityUser@@")`); the struct offsets and the player-id
-global are not, so the plugin checks `gameExecutableSha256` against
-`924e1ef3...` and logs `inactive` on any other build without touching anything.
+`findRttiVtable(".?AUAbilityUser@@")`). The struct offsets and the player-id
+global are not, so at load both plugins run `VerifyAbilityBarLayout`
+(`plugins/common/ability_bar_layout.hpp`): it reads `DrawActionBar::update` and
+`handleInput`, takes the player-id global from their `mov edx,[rip+X]` loads
+(all must agree), follows the two component-getter calls and checks every
+instruction pattern whose offsets the plugins use. Any mismatch -> `inactive`,
+nothing touched. (Until 2026-11-04 this was an exact `gameExecutableSha256`
+check against `924e1ef3...`; the 0.10.5.1 update moved only the player-id
+global, see `docs/game-notes.md`.)
 
 What it logs (all lines start with `AbilityBarProbe:`; they go to the
 diagnostics log, `logs\proxy-crash.log` by default, and to the debugger):
@@ -274,7 +280,9 @@ screen, so keep the backup.
 `AbilityBarWheel.ini` (deployed next to it; **`Enabled=0` by default**, the
 plugin logs `disabled` and hooks nothing until the owner sets `Enabled=1`).
 
-How it works, on build `924e1ef3` only:
+How it works, on any build that passes `VerifyAbilityBarLayout` (if only the
+optional bar-rectangle pattern is missing, `Trigger=overbar` falls back to
+`Trigger=modifier`):
 
 1. Wraps the game's **IAT entry for `SDL2.dll!SDL_PollEvent`** (found by import
    name, build-independent; the exe has exactly one such slot, and
@@ -348,6 +356,31 @@ Scrolling "past the normal limits" (more than two sets) is step (c) below.
   `saves\` at save time; both need runtime confirmation.
 - Draw a small "set N/M" indicator; the game's own drawing needs no change.
 
-Open questions for the owner before (c): should the game's two physical sets
-remain reachable with Left Ctrl, or become sets 1 and 2 of the N? Should sets
-be per character (save) or global?
+Owner's decisions (2026-11-04): **the game's two physical sets become sets 1
+and 2 of the N** (one ring; Left Ctrl stays hidden by `SuppressModifierKey`),
+and **sets are per save** (sidecar in the save folder, never `player.sav`).
+
+Static groundwork done (build `60b72c10`, logged by the probe for runtime
+confirmation, nothing written):
+
+- **Ability id**: `Ability+0x00` is the id as an MSVC `std::string` (16-byte
+  SSO buffer or heap pointer, size `+0x10`, capacity `+0x18`). The save
+  formatter `0x3672E0(Ability*, string* out)` copy-constructs it (`0x22B80` is
+  the string copy constructor), appends `*` + int `+0x158` and `*` + the count of
+  a `vector<string>` at `+0x140` (stride 0x20) -> `acid_magic_acid_dart*0*0`.
+- **Save folder**: the player-save writer (`0x6D79D0`, the only user of
+  `"Saving player"`) builds `SDL_GetPrefPath("WizardsOfTheCode","Soulash2") +
+  "saves/" + name` in `0x4C1930`, with `name` the `std::string` at
+  `singleton + 0xC08`; the singleton is a static 0xC30-byte object at RVA
+  `0xB081B0`, constructed in place by `0x7BD110`. `LocateSaveName` derives both
+  from the writer's code (`call getter; lea rdx,[rax+off]`, then the getter's
+  `mov r8d,size; lea rbx,[object]`). The probe logs
+  `save folder name='...'` whenever it changes.
+- The probe logs `player_id=N knows K abilities` + `abilities[0..]: 0=id 1=id ...`
+  whenever the list changes: the slot values in its CHANGE lines index that list.
+
+Still needed before (c) writes anything: a probe run on 0.10.5.1 confirming the
+id strings match the save's `Ability user;` line and the save name matches the
+folder; then a hook point for "save written" / "save loaded" (the writer above
+and the `player.sav` reader `0x6D7F80`) so the sidecar is saved and re-applied
+at the right moments.
