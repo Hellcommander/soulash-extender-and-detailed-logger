@@ -171,17 +171,35 @@ if ($GameDir) {
     if (Test-Path -LiteralPath (Join-Path $GameDir 'Soulash 2.exe')) {
         $gamePluginDirectory = Join-Path $GameDir 'SoulashExtender\Plugins'
         New-Item -ItemType Directory -Path $gamePluginDirectory -Force | Out-Null
-        $pinLines = @()
+        $pins = [ordered]@{}
         foreach ($dll in Get-ChildItem -LiteralPath $realPluginDirectory -Filter *.dll) {
-            Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $gamePluginDirectory $dll.Name) -Force
-            $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dll.FullName).Hash.ToLowerInvariant()
+            $deployed = Join-Path $gamePluginDirectory $dll.Name
+            Copy-Item -LiteralPath $dll.FullName -Destination $deployed -Force
+            # Pin what is actually in the game folder, and only once the copy succeeded.
+            $pins[$dll.BaseName] = (Get-FileHash -Algorithm SHA256 -LiteralPath $deployed).Hash.ToLowerInvariant()
             Write-Output ("Deployed {0} -> {1}" -f $dll.Name, $gamePluginDirectory)
-            $pinLines += ('{0}={1}' -f $dll.BaseName, $hash)
         }
         # Every rebuild changes the hashes; with [Plugins] RequireHash=1 the game's
-        # SoulashExtender.ini must carry these lines or the plugins are refused (error=5).
-        Write-Output 'Paste into [PluginHashes] of the game''s SoulashExtender.ini (RequireHash=1):'
-        $pinLines | ForEach-Object { Write-Output "  $_" }
+        # SoulashExtender.ini (the extender's config, in the game folder) must carry
+        # them or the plugins are refused (error=5).
+        # Owner-authorised (2026-11-05): update ONLY these keys of [PluginHashes];
+        # everything else in the INI stays as it is (previous file kept as .bak).
+        . (Join-Path $PSScriptRoot 'plugin-pins.ps1')
+        $gameIni = Join-Path $GameDir 'SoulashExtender.ini'
+        try {
+            foreach ($change in Update-PluginPins -IniPath $gameIni -Pins $pins) {
+                switch ($change.Action) {
+                    'updated' { Write-Output ("Pinned  {0}: {1} -> {2}" -f $change.Name, $change.Old.Substring(0, [Math]::Min(8, $change.Old.Length)), $change.New.Substring(0, 8)) }
+                    'added' { Write-Output ("Pinned  {0}: (new) -> {1}" -f $change.Name, $change.New.Substring(0, 8)) }
+                    default { Write-Output ("Pinned  {0}: unchanged ({1})" -f $change.Name, $change.New.Substring(0, 8)) }
+                }
+            }
+        }
+        catch {
+            Write-Warning "Could not update [PluginHashes]: $($_.Exception.Message)"
+            Write-Output 'Paste into [PluginHashes] of the game''s SoulashExtender.ini (RequireHash=1):'
+            foreach ($name in $pins.Keys) { Write-Output ("  {0}={1}" -f $name, $pins[$name]) }
+        }
         # TestBot scripts are NOT deployed (the owner copies one in when using the bot);
         # the example is in .build\plugins\TestBot.script.
         foreach ($ini in Get-ChildItem -LiteralPath $realPluginDirectory -Filter *.ini) {

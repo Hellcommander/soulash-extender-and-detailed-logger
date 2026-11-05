@@ -8,6 +8,7 @@
 #include "../plugins/common/ability_bar_layout.hpp"
 #include "../plugins/common/test_bot_script.hpp"
 #include "../plugins/common/png_writer.hpp"
+#include "../plugins/common/pe_original.hpp"
 
 #include <windows.h>
 
@@ -773,6 +774,7 @@ namespace
 #include "ability_bar_layout_tests.inc"
 #include "test_bot_tests.inc"
 #include "update_guard_tests.inc"
+#include "pe_original_tests.inc"
 
     // Child side of the debugger fallback test. Loads the proxy but never
     // calls any BugSplat export, so only the DllMain fallback can start it.
@@ -1797,6 +1799,7 @@ int wmain(int argc, wchar_t* argv[])
         TestManifestParser();
         TestX64Decoder();
         TestAbilityBarLayout();
+        TestOriginalImagePointer();
         TestTestBotScript();
         TestTestBotCapture();
         TestUpdateGuardLogic();

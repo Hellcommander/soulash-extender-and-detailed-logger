@@ -76,7 +76,7 @@ error names the line and the bot does not run.
 | Command | Effect |
 | --- | --- |
 | `wait <ms>` | pause (0..600000) |
-| `wait_world [timeout_ms]` | wait until the player is in the game world (default 120000). A timeout aborts the run |
+| `wait_world [timeout_ms]` | wait until the player is in the game world (default 120000). A timeout aborts the run, and so does world detection being off (immediately, not after the timeout) |
 | `key <key> [hold_ms]` | press and release (default hold 50) |
 | `key_down <key>` / `key_up <key>` | half a key press |
 | `mod <none\|ctrl\|shift\|alt>[+...]` | set SDL's modifier state (`SDL_SetModState`; what `SDL_GetModState` reports, e.g. to AbilityBarWheel) |
@@ -112,6 +112,10 @@ writes its path into `<game>\SoulashExtender\TestBot\latest.txt`. The run folder
   `PASS`/`FAIL` lines, blocked Steam calls, `errors.log` extracts and the final
   `script finished ... -> PASS|FAIL` summary;
 * the snapshot PNGs (24-bit RGB, full drawable size, including the UI).
+
+If the game exits normally while a script is still running, the last line is
+`game exited during step N/M: script NOT finished`. A crash or kill leaves no
+such line.
 
 Snapshots hook the game's `SDL2.dll!SDL_GL_SwapWindow` import, but only when
 the script contains a `snapshot` step. Just before a frame is presented, the

@@ -73,6 +73,12 @@ TESTBOT TIER A (2026-11-05, owner approved; requested by the mod-authoring sessi
   back buffer, GL state saved/restored, PNG via plugins/common/png_writer.hpp + game's zlib1.dll on a worker thread)
   and mods_errors [max_errors] (logs\errors.log from its LAST "Loading mods:" line). Every run gets
   <game>\SoulashExtender\TestBot\<UTC>\results.txt; latest.txt points at it. NOT RUN in the game yet.
+- FIRST LIVE RUN 2026-11-05 11:56Z (mods session): blocking armed, parser OK, screen capture hook ready, but
+  wait_world stalled: TestBot AND AbilityBarWheel rejected the layout ("update/handleInput outside the game image")
+  because AbilityBarProbe (loads first, alphabetical) had already hooked DrawActionBar slot 1. Regression from
+  8bc159e. Fixed: plugins/common/pe_original.hpp verifies the ORIGINAL slot value read from the exe file (rebased);
+  hooks still chain through the current value. wait_world now aborts at once when world detection is off; a
+  normal game exit mid-script writes "script NOT finished" to results.txt.
 - Tier B (tile->screen mapping, dump_stacks, dump_entities: read-only RE first) and Tier C (spawn, cast, play_anim,
   load_mods, editor fields: calling game code) are NOT started; see the reply sent to the mods session.
 
@@ -80,7 +86,11 @@ STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.
   ONE EXCEPTION (owner's instruction, 2026-10-24): scripts\build.ps1 copies the built real plugins
-  (.build\plugins\*.dll) into <game>\SoulashExtender\Plugins after every build. Nothing else is written there.
+  (.build\plugins\*.dll) into <game>\SoulashExtender\Plugins after every build.
+  WIDENED 2026-11-05 (owner, confirmed in-session): right after that copy the build also updates those plugins'
+  keys in [PluginHashes] of the extender's own SoulashExtender.ini (it lives in the game folder but is the
+  extender's file, not the game's): scripts\plugin-pins.ps1, hash of the copied DLL, atomic write + .bak, never
+  creates the file/section, never touches other keys or RequireHash. Nothing else is written there.
 - Ask before downloading anything. Lua is fetched on demand by scripts/fetch-lua.ps1 with a pinned SHA-256;
   third-party source is deliberately NOT committed.
 - One supported install route: the BugSplat64.dll proxy (rename vendor DLL to BugSplat64_original.dll, paste the

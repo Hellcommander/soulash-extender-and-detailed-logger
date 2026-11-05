@@ -140,6 +140,44 @@ $fallbackMarkerBase = Join-Path $outputDirectory ("debugger-fallback-" + [guid]:
 & $testsPath --debugger-fallback $proxyPath $fakeOriginalPath $moduleManifestPath $fallbackMarkerBase
 if ($LASTEXITCODE -ne 0) { throw 'Debugger fallback test failed.' }
 
+# Build pin updater (scripts\plugin-pins.ps1) on temp copies of an INI.
+. (Join-Path $PSScriptRoot 'plugin-pins.ps1')
+$pinDirectory = Join-Path $outputDirectory ('pins-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $pinDirectory -Force | Out-Null
+try {
+    $a64 = 'a' * 64; $b64 = 'b' * 64; $c64 = 'c' * 64; $d64 = 'd' * 64
+    foreach ($newline in "`r`n", "`n") {
+        $ini = Join-Path $pinDirectory 'SoulashExtender.ini'
+        $before = @('; top comment', '[Plugins]', 'Enabled=1', 'RequireHash=1', '', '[PluginHashes]',
+            '; MyPlugin=<64 hex>', "AbilityBarProbe=$a64", "Other.Plugin=$b64", '', '[Conditions]', 'Enabled=1') -join $newline
+        [System.IO.File]::WriteAllText($ini, $before + $newline)
+        $changes = Update-PluginPins -IniPath $ini -Pins ([ordered]@{ AbilityBarProbe = $c64; TestBot = $d64 })
+        $after = [System.IO.File]::ReadAllText($ini)
+        $expected = (@('; top comment', '[Plugins]', 'Enabled=1', 'RequireHash=1', '', '[PluginHashes]',
+            '; MyPlugin=<64 hex>', "AbilityBarProbe=$c64", "Other.Plugin=$b64", "TestBot=$d64", '', '[Conditions]', 'Enabled=1') -join $newline) + $newline
+        if ($after -ne $expected) { throw "Pin update changed more than the pinned keys (newline $([int][char]$newline[-1]))." }
+        if (($changes | ForEach-Object { "$($_.Name):$($_.Action)" }) -join ',' -ne 'AbilityBarProbe:updated,TestBot:added') { throw 'Pin update reported the wrong changes.' }
+        if ([System.IO.File]::ReadAllText("$ini.bak") -ne $before + $newline) { throw 'Pin update did not keep the previous INI as .bak.' }
+        Remove-Item -LiteralPath "$ini.bak" -Force
+        $unchanged = Update-PluginPins -IniPath $ini -Pins ([ordered]@{ AbilityBarProbe = $c64 })
+        if ($unchanged.Action -ne 'unchanged' -or (Test-Path -LiteralPath "$ini.bak")) { throw 'An unchanged pin rewrote the INI.' }
+    }
+    $noSection = Join-Path $pinDirectory 'NoSection.ini'
+    [System.IO.File]::WriteAllText($noSection, "[Plugins]`r`nRequireHash=1`r`n")
+    $refused = $false
+    try { Update-PluginPins -IniPath $noSection -Pins ([ordered]@{ TestBot = $d64 }) | Out-Null } catch { $refused = $true }
+    if (-not $refused -or [System.IO.File]::ReadAllText($noSection) -ne "[Plugins]`r`nRequireHash=1`r`n") { throw 'A missing [PluginHashes] section was not refused untouched.' }
+    $missing = Join-Path $pinDirectory 'Missing.ini'
+    $refused = $false
+    try { Update-PluginPins -IniPath $missing -Pins ([ordered]@{ TestBot = $d64 }) | Out-Null } catch { $refused = $true }
+    if (-not $refused -or (Test-Path -LiteralPath $missing)) { throw 'A missing INI was not refused, or was created.' }
+    $refused = $false
+    try { Update-PluginPins -IniPath $ini -Pins ([ordered]@{ 'bad name' = $d64 }) | Out-Null } catch { $refused = $true }
+    if (-not $refused) { throw 'An invalid plugin id was accepted.' }
+}
+finally { Remove-Item -LiteralPath $pinDirectory -Recurse -Force }
+Write-Output 'PASS: build pin updater changes only the pinned keys, keeps line endings, refuses missing INI/section'
+
 # TestBot snapshots: an independent decoder (.NET / GDI+) must read our PNG,
 # with rows flipped from glReadPixels' bottom-up order.
 $pngPath = Join-Path $outputDirectory 'testbot-png-check.png'

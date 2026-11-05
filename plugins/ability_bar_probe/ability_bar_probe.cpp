@@ -12,6 +12,7 @@
 // it. If anything does not match it logs "inactive" and does nothing.
 #include "plugin_api.h"
 #include "../common/ability_bar_layout.hpp"
+#include "../common/pe_original.hpp"
 #include "../common/plugin_status.hpp"
 
 #include <windows.h>
@@ -368,8 +369,11 @@ namespace
             void** slots = static_cast<void**>(vtable);
             layout = soulash_plugins::VerifyAbilityBarLayout(image,
                 soulash_plugins::MappedImageSize(image),
-                static_cast<const unsigned char*>(slots[DrawActionBarUpdateSlot]),
-                static_cast<const unsigned char*>(slots[DrawActionBarHandleInputSlot]));
+                // Earlier plugins may have hooked these slots: verify the game's own code.
+                soulash_plugins::OriginalCodePointer(image, soulash_plugins::MappedImageSize(image),
+                    slots + DrawActionBarUpdateSlot),
+                soulash_plugins::OriginalCodePointer(image, soulash_plugins::MappedImageSize(image),
+                    slots + DrawActionBarHandleInputSlot));
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {

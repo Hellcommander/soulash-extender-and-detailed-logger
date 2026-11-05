@@ -38,6 +38,7 @@
 // PNGs; <game>\SoulashExtender\TestBot\latest.txt names the newest run.
 #include "plugin_api.h"
 #include "../common/ability_bar_layout.hpp"
+#include "../common/pe_original.hpp"
 #include "../common/plugin_status.hpp"
 #include "../common/png_writer.hpp"
 #include "../common/test_bot_script.hpp"
@@ -672,9 +673,11 @@ namespace
         {
             const auto* image = static_cast<const unsigned char*>(g_extender->gameBase);
             void** slots = static_cast<void**>(vtable);
-            layout = soulash_plugins::VerifyAbilityBarLayout(image, soulash_plugins::MappedImageSize(image),
-                static_cast<const unsigned char*>(slots[DrawActionBarUpdateSlot]),
-                static_cast<const unsigned char*>(slots[DrawActionBarHandleInputSlot]));
+            const std::size_t imageSize = soulash_plugins::MappedImageSize(image);
+            // AbilityBarProbe/AbilityBarWheel load first and hook slot 1: verify the game's own code.
+            layout = soulash_plugins::VerifyAbilityBarLayout(image, imageSize,
+                soulash_plugins::OriginalCodePointer(image, imageSize, slots + DrawActionBarUpdateSlot),
+                soulash_plugins::OriginalCodePointer(image, imageSize, slots + DrawActionBarHandleInputSlot));
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1339,6 +1342,11 @@ namespace
             return true;
 
         case testbot::Op::WaitWorld:
+            if (g_phase == 0 && g_originalUpdate == nullptr)
+            {
+                Fail(step, "world detection is off on this build (see the 'world detection' log line)", true);
+                return false;
+            }
             if (g_phase == 0)
             {
                 g_deadline = now + static_cast<unsigned long long>(step.a);
@@ -1805,7 +1813,24 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     return TRUE;
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
 {
+    // Normal process exit: leave a last line in results.txt if the script was
+    // still running. Loader lock is held and other threads are gone, so only
+    // try the lock and only call WriteFile.
+    if (reason == DLL_PROCESS_DETACH && reserved != nullptr && g_running && g_results != INVALID_HANDLE_VALUE
+        && TryAcquireSRWLockExclusive(&g_resultsLock))
+    {
+        char text[160];
+        const int length = _snprintf_s(text, sizeof(text), _TRUNCATE,
+            "[%9llu ms] game exited during step %zu/%zu: script NOT finished\r\n",
+            GetTickCount64() - g_resultsStartMs, g_stepIndex + 1, g_steps.size());
+        DWORD written = 0;
+        if (length > 0)
+        {
+            WriteFile(g_results, text, static_cast<DWORD>(length), &written, nullptr);
+        }
+        ReleaseSRWLockExclusive(&g_resultsLock);
+    }
     return TRUE;
 }
