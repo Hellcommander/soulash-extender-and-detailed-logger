@@ -32,7 +32,9 @@
 // through; world detection and bar-set reads, only on builds that pass
 // VerifyAbilityBarLayout), and, only when the script has snapshot steps, the
 // IAT entry for SDL2.dll!SDL_GL_SwapWindow (glReadPixels of the finished back
-// buffer, GL state saved/restored; PNGs written on a worker thread).
+// buffer, GL state saved/restored; PNGs written on a worker thread), and, only
+// when the script names screens, slot 7 (draw) of every verified *Screen
+// vtable (pass-through thunk recording `this`; see InstallScreenDetection).
 //
 // Output: <game>\SoulashExtender\TestBot\<UTC run id>\results.txt + snapshot
 // PNGs; <game>\SoulashExtender\TestBot\latest.txt names the newest run.
@@ -89,6 +91,9 @@ namespace
     using SdlGetWindowIdFn = std::uint32_t (*)(void* window);
     using SdlWarpMouseInWindowFn = void (*)(void* window, int x, int y);
     using SdlGetMouseStateFn = std::uint32_t (*)(int* x, int* y);
+    using SdlGetWindowSizeFn = void (*)(void* window, int* width, int* height);
+    constexpr std::uint32_t SdlMouseMotion = 0x400, SdlTextInput = 0x303;
+    constexpr int DragSteps = 10;
 
     // ---- Steam ----------------------------------------------------------------
     using FindOrCreateUserInterfaceFn = void* (*)(int steamUser, const char* version);
@@ -782,7 +787,7 @@ namespace
         return Push(event, "mouse wheel");
     }
 
-    bool PushButton(int button, int x, int y, bool down)
+    bool PushButton(int button, int x, int y, bool down, int clicks = 1)
     {
         unsigned char event[SdlEventSize]{};
         Put<std::uint32_t>(event, 0, down ? SdlMouseButtonDown : SdlMouseButtonUp);
@@ -790,10 +795,320 @@ namespace
         Put<std::uint32_t>(event, 8, FocusWindowId());
         event[16] = static_cast<unsigned char>(button);
         event[17] = down ? 1 : 0;
-        event[18] = 1;                                              // clicks
+        event[18] = static_cast<unsigned char>(clicks);             // 2 = double click
         Put<std::int32_t>(event, 20, x);
         Put<std::int32_t>(event, 24, y);
         return Push(event, down ? "mouse down" : "mouse up");
+    }
+
+    // SDL_MOUSEMOTION with an explicit button mask (SDL's own motion events from
+    // SDL_WarpMouseInWindow do not know about injected button presses).
+    bool PushMotion(int x, int y, int xrel, int yrel, std::uint32_t buttonMask)
+    {
+        unsigned char event[SdlEventSize]{};
+        Put<std::uint32_t>(event, 0, SdlMouseMotion);
+        Put<std::uint32_t>(event, 4, g_getTicks());
+        Put<std::uint32_t>(event, 8, FocusWindowId());
+        Put<std::uint32_t>(event, 16, buttonMask);                  // state
+        Put<std::int32_t>(event, 20, x);
+        Put<std::int32_t>(event, 24, y);
+        Put<std::int32_t>(event, 28, xrel);
+        Put<std::int32_t>(event, 32, yrel);
+        return Push(event, "mouse motion");
+    }
+
+    // SDL_TEXTINPUT: what a text field receives for typed characters.
+    bool PushText(char character)
+    {
+        unsigned char event[SdlEventSize]{};
+        Put<std::uint32_t>(event, 0, SdlTextInput);
+        Put<std::uint32_t>(event, 4, g_getTicks());
+        Put<std::uint32_t>(event, 8, FocusWindowId());
+        event[12] = static_cast<unsigned char>(character);          // text[32], NUL-terminated
+        return Push(event, "text input");
+    }
+
+    bool WarpTo(int x, int y)
+    {
+        void* window = FocusWindow();
+        if (window == nullptr)
+        {
+            return false;
+        }
+        g_warpMouse(window, x, y);
+        return true;
+    }
+
+    // ===========================================================================
+    // Screen detection (wait_screen / expect_screen / log_screen)
+    //
+    // Every full screen of the game (MainMenuScreen, GameScreen, the editor's
+    // EntityMakerScreen / MapMakerScreen / ProceduralMapMakerScreen /
+    // DataTableScreen / AnimatorScreen, ...) is a class with an 8-slot vtable
+    // whose slot 7 draws it and starts by clearing the frame (glClearColor,
+    // glClearDepth, glClear). A screen class is accepted only when its slot-7
+    // function calls the game's glClear import within its first 0x120 bytes.
+    // Its slot 7 then gets a 25-byte pass-through thunk:
+    //     mov rax, &g_lastDrawnScreen ; mov [rax], rcx ; mov rax, previous ; jmp rax
+    // which only records `this` and jumps on with every register and the stack
+    // untouched, so it is exact whatever the real signature. The script runner
+    // reads (and clears) the last drawn screen once per frame.
+    // ===========================================================================
+    constexpr unsigned int ScreenDrawSlot = 7;
+    constexpr unsigned int ScreenVtableSlots = 8;
+    constexpr std::size_t MaxScreens = 40;
+    constexpr std::size_t ThunkSize = 32;
+    constexpr std::size_t ThunkPageSize = 4096;
+    constexpr std::size_t GlClearScanBytes = 0x120;
+    constexpr unsigned long long ScreenFreshMs = 1000;
+
+    const char* const ScreenClassNames[] = {
+        "AnimatorScreen", "CemeteryScreen", "CharacterBasicInfoScreen", "CreditsScreen", "DataTableScreen",
+        "DifficultySelectionScreen", "EntityMakerScreen", "GameScreen", "LoadingScreen", "MainMenuScreen",
+        "MapMakerScreen", "ModsScreen", "OptionsScreen", "PlayerCreationScreen", "PreGameScreen",
+        "ProceduralMapMakerScreen", "SettingsScreen", "StartingLocationScreen", "WorldGenerationScreen",
+    };
+
+    struct ScreenClass
+    {
+        const char* name;
+        const void* vtable;
+    };
+
+    ScreenClass g_screens[MaxScreens]{};
+    std::size_t g_screenCount = 0;
+    void* volatile g_lastDrawnScreen = nullptr;     // written by the thunks
+    int g_currentScreen = -1;
+    unsigned long long g_currentScreenMs = 0;
+    bool g_screenDetection = false;
+    SdlGetWindowSizeFn g_getWindowSize = nullptr;
+    SdlGetWindowSizeFn g_getDrawableSizeForLog = nullptr;
+
+    // Does the function at `code` call through the import slot `importSlot`
+    // (FF 15 rel32) within its first GlClearScanBytes? SEH-guarded.
+    bool GuardedCallsImport(const unsigned char* code, const unsigned char* imageEnd, const void* importSlot)
+    {
+        __try
+        {
+            for (std::size_t i = 0; i + 6 <= GlClearScanBytes && code + i + 6 <= imageEnd; ++i)
+            {
+                if (code[i] == 0xFF && code[i + 1] == 0x15)
+                {
+                    std::int32_t displacement = 0;
+                    std::memcpy(&displacement, code + i + 2, sizeof(displacement));
+                    if (code + i + 6 + displacement == static_cast<const unsigned char*>(importSlot))
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    const void* GuardedReadVtable(const void* object)
+    {
+        __try
+        {
+            return *static_cast<const void* const*>(object);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+    }
+
+    bool ScriptUsesScreens()
+    {
+        for (const testbot::Step& step : g_steps)
+        {
+            if (step.op == testbot::Op::WaitScreen || step.op == testbot::Op::ExpectScreen
+                || step.op == testbot::Op::LogScreen)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void InstallScreenDetection(unsigned char* base)
+    {
+        const std::size_t imageSize = soulash_plugins::MappedImageSize(base);
+        void** glClearSlot = GuardedFindImportSlot(base, "OPENGL32.dll", "glClear");
+        if (imageSize == 0 || glClearSlot == nullptr)
+        {
+            Log("screen detection off: %s; wait_screen/expect_screen will FAIL",
+                imageSize == 0 ? "game image size unknown" : "no OPENGL32.dll!glClear import");
+            return;
+        }
+        const HMODULE sdl = GetModuleHandleW(L"SDL2.dll");
+        if (sdl != nullptr)
+        {
+            g_getWindowSize = reinterpret_cast<SdlGetWindowSizeFn>(GetProcAddress(sdl, "SDL_GetWindowSize"));
+            g_getDrawableSizeForLog = reinterpret_cast<SdlGetWindowSizeFn>(GetProcAddress(sdl, "SDL_GL_GetDrawableSize"));
+        }
+
+        struct Pending
+        {
+            const char* name;
+            void** slot;
+            void* previous;
+        };
+        Pending pending[MaxScreens]{};
+        std::size_t pendingCount = 0;
+        std::string skipped;
+        const unsigned char* imageEnd = base + imageSize;
+        for (const char* name : ScreenClassNames)
+        {
+            void* vtable = nullptr;
+            const char* why = nullptr;
+            if (!g_extender->findRttiVtable(g_extender->pluginHandle, name, &vtable) || vtable == nullptr)
+            {
+                why = "not found";
+            }
+            else
+            {
+                void** slots = static_cast<void**>(vtable);
+                bool inImage = reinterpret_cast<unsigned char*>(slots + ScreenVtableSlots) <= imageEnd;
+                for (unsigned int i = 0; inImage && i < ScreenVtableSlots; ++i)
+                {
+                    const unsigned char* code = soulash_plugins::OriginalCodePointer(base, imageSize, slots + i);
+                    inImage = code >= base && code < imageEnd;
+                }
+                const unsigned char* draw = inImage
+                    ? soulash_plugins::OriginalCodePointer(base, imageSize, slots + ScreenDrawSlot) : nullptr;
+                if (!inImage)
+                {
+                    why = "vtable shorter than 8 slots";
+                }
+                else if (!GuardedCallsImport(draw, imageEnd, glClearSlot))
+                {
+                    why = "slot 7 does not draw (no glClear)";
+                }
+                else if (pendingCount < MaxScreens)
+                {
+                    pending[pendingCount++] = {name, slots + ScreenDrawSlot, slots[ScreenDrawSlot]};
+                    g_screens[g_screenCount++] = {name, vtable};
+                }
+            }
+            if (why != nullptr)
+            {
+                skipped += std::string(skipped.empty() ? "" : ", ") + name + " (" + why + ")";
+            }
+        }
+        if (pendingCount == 0)
+        {
+            Log("screen detection off: no screen class verified (%s); wait_screen/expect_screen will FAIL", skipped.c_str());
+            g_screenCount = 0;
+            return;
+        }
+
+        // Write every thunk, make the page execute-only, then patch the slots.
+        auto* page = static_cast<unsigned char*>(VirtualAlloc(nullptr, ThunkPageSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (page == nullptr || pendingCount * ThunkSize > ThunkPageSize)
+        {
+            Log("screen detection off: cannot allocate thunks (error %lu)", GetLastError());
+            g_screenCount = 0;
+            return;
+        }
+        const auto seen = reinterpret_cast<std::uint64_t>(&g_lastDrawnScreen);
+        for (std::size_t i = 0; i < pendingCount; ++i)
+        {
+            unsigned char* thunk = page + i * ThunkSize;
+            const auto previous = reinterpret_cast<std::uint64_t>(pending[i].previous);
+            std::memset(thunk, 0xCC, ThunkSize);
+            thunk[0] = 0x48; thunk[1] = 0xB8;                       // mov rax, imm64
+            std::memcpy(thunk + 2, &seen, 8);
+            thunk[10] = 0x48; thunk[11] = 0x89; thunk[12] = 0x08;   // mov [rax], rcx
+            thunk[13] = 0x48; thunk[14] = 0xB8;                     // mov rax, imm64
+            std::memcpy(thunk + 15, &previous, 8);
+            thunk[23] = 0xFF; thunk[24] = 0xE0;                     // jmp rax
+        }
+        DWORD oldProtect = 0;
+        if (!VirtualProtect(page, ThunkPageSize, PAGE_EXECUTE_READ, &oldProtect))
+        {
+            Log("screen detection off: cannot make thunks executable (error %lu)", GetLastError());
+            g_screenCount = 0;
+            return;
+        }
+        FlushInstructionCache(GetCurrentProcess(), page, ThunkPageSize);
+        std::string hooked;
+        for (std::size_t i = 0; i < pendingCount; ++i)
+        {
+            void* thunk = page + i * ThunkSize;
+            if (g_extender->patchMemory(g_extender->pluginHandle, pending[i].slot, &thunk, sizeof(thunk)))
+            {
+                hooked += std::string(hooked.empty() ? "" : ", ") + pending[i].name;
+            }
+            else
+            {
+                skipped += std::string(skipped.empty() ? "" : ", ") + pending[i].name + " (patch failed)";
+                for (std::size_t k = 0; k < g_screenCount; ++k)
+                {
+                    if (g_screens[k].name == pending[i].name)
+                    {
+                        g_screens[k].vtable = nullptr;   // never matches
+                    }
+                }
+            }
+        }
+        g_screenDetection = !hooked.empty();
+        Log("screen detection %s: draw slot hooked on %s", g_screenDetection ? "on" : "off", hooked.empty() ? "nothing" : hooked.c_str());
+        if (!skipped.empty())
+        {
+            Log("screen classes not hooked: %s", skipped.c_str());
+        }
+    }
+
+    int FindScreen(const std::string& name)
+    {
+        for (std::size_t i = 0; i < g_screenCount; ++i)
+        {
+            if (g_screens[i].vtable != nullptr && name == g_screens[i].name)
+            {
+                return static_cast<int>(i);
+            }
+        }
+        return -1;
+    }
+
+    // Once per frame on the game thread.
+    void UpdateCurrentScreen(unsigned long long now)
+    {
+        if (!g_screenDetection)
+        {
+            return;
+        }
+        void* drawn = InterlockedExchangePointer(const_cast<void**>(&g_lastDrawnScreen), nullptr);
+        if (drawn == nullptr)
+        {
+            return;
+        }
+        const void* vtable = GuardedReadVtable(drawn);
+        for (std::size_t i = 0; i < g_screenCount; ++i)
+        {
+            if (g_screens[i].vtable != nullptr && g_screens[i].vtable == vtable)
+            {
+                if (static_cast<int>(i) != g_currentScreen)
+                {
+                    Log("screen: %s -> %s", g_currentScreen < 0 ? "(none)" : g_screens[g_currentScreen].name,
+                        g_screens[i].name);
+                }
+                g_currentScreen = static_cast<int>(i);
+                g_currentScreenMs = now;
+                return;
+            }
+        }
+    }
+
+    // The screen drawn within the last second, or nullptr.
+    const char* CurrentScreen(unsigned long long now)
+    {
+        return g_currentScreen >= 0 && now - g_currentScreenMs <= ScreenFreshMs ? g_screens[g_currentScreen].name : nullptr;
     }
 
     // ===========================================================================
@@ -1285,6 +1600,13 @@ namespace
         case testbot::Op::Log: return "log";
         case testbot::Op::Snapshot: return "snapshot";
         case testbot::Op::ModsErrors: return "mods_errors";
+        case testbot::Op::WaitScreen: return "wait_screen";
+        case testbot::Op::ExpectScreen: return "expect_screen";
+        case testbot::Op::LogScreen: return "log_screen";
+        case testbot::Op::Type: return "type";
+        case testbot::Op::Move: return "move";
+        case testbot::Op::Drag: return "drag";
+        case testbot::Op::DoubleClick: return "dclick";
         }
         return "?";
     }
@@ -1525,6 +1847,165 @@ namespace
             NextStep();
             return true;
         }
+
+        case testbot::Op::WaitScreen:
+        {
+            if (g_phase == 0)
+            {
+                if (!g_screenDetection)
+                {
+                    Fail(step, "screen detection is off (see the 'screen detection' log line)", true);
+                    return false;
+                }
+                g_counter = FindScreen(step.text);
+                if (g_counter < 0)
+                {
+                    Fail(step, "unknown or unverified screen class (see 'screen detection on: ...' for the list)", true);
+                    return false;
+                }
+                g_deadline = now + static_cast<unsigned long long>(step.a);
+                g_phase = 1;
+            }
+            if (g_currentScreen == g_counter && CurrentScreen(now) != nullptr)
+            {
+                Log("line %d: on screen %s", step.line, step.text.c_str());
+                NextStep();
+                return true;
+            }
+            if (now >= g_deadline)
+            {
+                char message[160];
+                const char* current = CurrentScreen(now);
+                _snprintf_s(message, sizeof(message), _TRUNCATE, "timed out; current screen %s",
+                    current != nullptr ? current : "(none drawn in the last second)");
+                Fail(step, message, true);
+            }
+            return false;
+        }
+
+        case testbot::Op::ExpectScreen:
+        {
+            ++g_checks;
+            const char* current = CurrentScreen(now);
+            if (!g_screenDetection || FindScreen(step.text) < 0)
+            {
+                Fail(step, !g_screenDetection ? "screen detection is off" : "unknown or unverified screen class", false);
+                return true;
+            }
+            if (current == nullptr || step.text != current)
+            {
+                char message[160];
+                _snprintf_s(message, sizeof(message), _TRUNCATE, "screen is %s, expected %s",
+                    current != nullptr ? current : "(none drawn in the last second)", step.text.c_str());
+                Fail(step, message, false);
+                return true;
+            }
+            Log("PASS line %d: screen is %s", step.line, current);
+            NextStep();
+            return true;
+        }
+
+        case testbot::Op::LogScreen:
+        {
+            const char* current = CurrentScreen(now);
+            int width = 0, height = 0, drawableWidth = 0, drawableHeight = 0;
+            void* window = FocusWindow();
+            if (window != nullptr && g_getWindowSize != nullptr)
+            {
+                g_getWindowSize(window, &width, &height);
+            }
+            if (window != nullptr && g_getDrawableSizeForLog != nullptr)
+            {
+                g_getDrawableSizeForLog(window, &drawableWidth, &drawableHeight);
+            }
+            Log("line %d: screen %s; window %dx%d (click coordinates), drawable %dx%d (snapshot pixels)", step.line,
+                !g_screenDetection ? "unknown (detection off)" : (current != nullptr ? current : "(none drawn in the last second)"),
+                width, height, drawableWidth, drawableHeight);
+            NextStep();
+            return true;
+        }
+
+        case testbot::Op::Type:
+            if (static_cast<std::size_t>(g_counter) >= step.text.size())
+            {
+                NextStep();
+                return true;
+            }
+            PushText(step.text[static_cast<std::size_t>(g_counter)]);
+            ++g_counter;
+            return false;   // one character per frame
+
+        case testbot::Op::Move:
+            if (!WarpTo(static_cast<int>(step.a), static_cast<int>(step.b)))
+            {
+                Fail(step, "no focused game window", false);
+                return true;
+            }
+            NextStep();
+            return false;
+
+        case testbot::Op::DoubleClick:
+        {
+            const int x = static_cast<int>(step.a), y = static_cast<int>(step.b), button = static_cast<int>(step.c);
+            switch (g_phase)
+            {
+            case 0:
+                if (!WarpTo(x, y))
+                {
+                    Fail(step, "no focused game window", false);
+                    return true;
+                }
+                break;
+            case 1: PushButton(button, x, y, true, 1); break;
+            case 2: PushButton(button, x, y, false, 1); break;
+            case 3: PushButton(button, x, y, true, 2); break;
+            default:
+                PushButton(button, x, y, false, 2);
+                NextStep();
+                return false;
+            }
+            ++g_phase;
+            return false;
+        }
+
+        case testbot::Op::Drag:
+        {
+            const int x1 = static_cast<int>(step.a), y1 = static_cast<int>(step.b);
+            const int x2 = static_cast<int>(step.c), y2 = static_cast<int>(step.d);
+            const int button = static_cast<int>(step.e);
+            const std::uint32_t mask = 1u << (button - 1);
+            if (g_phase == 0)
+            {
+                if (!WarpTo(x1, y1))
+                {
+                    Fail(step, "no focused game window", false);
+                    return true;
+                }
+                g_phase = 1;
+                return false;
+            }
+            if (g_phase == 1)
+            {
+                PushButton(button, x1, y1, true);
+                g_phase = 2;
+                g_counter = 0;
+                return false;
+            }
+            if (g_counter < DragSteps)
+            {
+                const int previousX = x1 + (x2 - x1) * static_cast<int>(g_counter) / DragSteps;
+                const int previousY = y1 + (y2 - y1) * static_cast<int>(g_counter) / DragSteps;
+                ++g_counter;
+                const int x = x1 + (x2 - x1) * static_cast<int>(g_counter) / DragSteps;
+                const int y = y1 + (y2 - y1) * static_cast<int>(g_counter) / DragSteps;
+                WarpTo(x, y);
+                PushMotion(x, y, x - previousX, y - previousY, mask);
+                return false;   // one step per frame
+            }
+            PushButton(button, x2, y2, false);
+            NextStep();
+            return false;
+        }
         }
         NextStep();
         return true;
@@ -1533,11 +2014,12 @@ namespace
     // Called on the game thread once per frame (after the event queue drains).
     void Tick()
     {
+        const unsigned long long now = NowMs();
+        UpdateCurrentScreen(now);
         if (!g_running)
         {
             return;
         }
-        const unsigned long long now = NowMs();
         for (int budget = 0; budget < 32 && g_running; ++budget)
         {
             if (g_stepIndex >= g_steps.size())
@@ -1765,6 +2247,10 @@ namespace
         if (ScriptHasSnapshots())
         {
             InstallScreenCapture(base);
+        }
+        if (ScriptUsesScreens())
+        {
+            InstallScreenDetection(base);
         }
         g_startedMs = NowMs();
         g_running = true;

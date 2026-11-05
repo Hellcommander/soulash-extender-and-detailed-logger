@@ -17,6 +17,16 @@
 //                                   interval_ms apart (0..60000, default 500) as PNGs in the run folder
 //   mods_errors [max_errors]        copy errors.log from its last "Loading mods:" pass into the
 //                                   results file; with max_errors, more [error] lines is a FAIL
+//   wait_screen <Screen> [timeout_ms]  until that screen class is drawn (default 30000; timeout aborts)
+//   expect_screen <Screen>          check the screen drawn last (counted PASS/FAIL)
+//   log_screen                      log the current screen and the window size
+//   type <text>                     text input (SDL_TEXTINPUT), one character per frame; printable
+//                                   ASCII, no '#' (comment), leading/trailing blanks dropped
+//   move <x> <y>                    move the mouse there (hover)
+//   drag <x1> <y1> <x2> <y2> [left|right|middle]  press at 1, move in steps, release at 2
+//   dclick <x> <y> [left|right|middle]            double click
+// <Screen>: an RTTI class name such as MainMenuScreen, EntityMakerScreen,
+// MapMakerScreen, ProceduralMapMakerScreen, DataTableScreen, AnimatorScreen.
 // <key>: a-z, 0-9, f1-f12, space, enter|return, escape|esc, tab, backspace,
 // up, down, left, right, lctrl, rctrl, lshift, rshift, lalt, ralt, or an SDL
 // keycode in decimal or 0x hex.
@@ -46,7 +56,14 @@ namespace soulash_plugins::testbot
         ExpectBarSet,
         Log,
         Snapshot,
-        ModsErrors
+        ModsErrors,
+        WaitScreen,
+        ExpectScreen,
+        LogScreen,
+        Type,
+        Move,
+        Drag,
+        DoubleClick
     };
 
     struct Step
@@ -55,9 +72,11 @@ namespace soulash_plugins::testbot
         int line = 0;
         std::int64_t a = 0;   // ms / notches / x / expected set / modifier mask
         std::int64_t b = 0;   // hold ms / y
-        std::int64_t c = 0;   // mouse button
+        std::int64_t c = 0;   // mouse button / drag x2
+        std::int64_t d = 0;   // drag y2
+        std::int64_t e = 0;   // drag button
         std::uint32_t key = 0;
-        std::string text;     // log text / snapshot name
+        std::string text;     // log / type text, snapshot or screen name
     };
 
     struct ParseResult
@@ -75,6 +94,39 @@ namespace soulash_plugins::testbot
     constexpr std::int64_t MaxSnapshotFrames = 20;
     constexpr std::int64_t MaxSnapshotIntervalMs = 60000;
     constexpr std::size_t MaxSnapshotNameLength = 32;
+
+    constexpr std::int64_t DefaultScreenTimeoutMs = 30000;
+    constexpr std::size_t MaxScreenNameLength = 48;
+    constexpr std::size_t MaxTypeLength = 200;
+    constexpr int MaxCoordinate = 16384;
+
+    // Screen names are RTTI class names: [A-Za-z0-9_], 1..48 characters.
+    inline bool IsScreenName(std::string_view name)
+    {
+        if (name.empty() || name.size() > MaxScreenNameLength)
+        {
+            return false;
+        }
+        for (const char c : name)
+        {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // left|right|middle -> SDL button 1|3|2, 0 = unknown.
+    inline int ParseButton(std::string_view text)
+    {
+        std::string button(text);
+        for (char& c : button)
+        {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return button == "left" ? 1 : (button == "middle" ? 2 : (button == "right" ? 3 : 0));
+    }
 
     // Snapshot names become file names: [A-Za-z0-9_-], 1..32 characters.
     inline bool IsSnapshotName(std::string_view name)
@@ -345,8 +397,7 @@ namespace soulash_plugins::testbot
                 }
                 if (args == 3)
                 {
-                    const std::string button = Lower(words[3]);
-                    step.c = button == "left" ? 1 : (button == "middle" ? 2 : (button == "right" ? 3 : 0));
+                    step.c = ParseButton(words[3]);
                     if (step.c == 0)
                     {
                         return fail(lineNumber, "click button must be left, right or middle");
@@ -386,9 +437,60 @@ namespace soulash_plugins::testbot
                     return fail(lineNumber, "mods_errors [max_errors 0..100000]");
                 }
             }
-            else if (command == "log")
+            else if (command == "wait_screen" || command == "expect_screen")
             {
-                step.op = Op::Log;
+                const bool wait = command == "wait_screen";
+                step.op = wait ? Op::WaitScreen : Op::ExpectScreen;
+                step.a = DefaultScreenTimeoutMs;
+                if (args < 1 || args > (wait ? 2u : 1u) || !IsScreenName(words[1])
+                    || (args == 2 && !integer(2, step.a, 1, MaxWaitMs)))
+                {
+                    return fail(lineNumber, wait ? "wait_screen <ScreenClassName> [timeout_ms 1..600000]"
+                                                 : "expect_screen <ScreenClassName>");
+                }
+                step.text.assign(words[1]);
+            }
+            else if (command == "log_screen")
+            {
+                step.op = Op::LogScreen;
+                if (args != 0)
+                {
+                    return fail(lineNumber, "log_screen takes no arguments");
+                }
+            }
+            else if (command == "move")
+            {
+                step.op = Op::Move;
+                if (args != 2 || !integer(1, step.a, 0, MaxCoordinate) || !integer(2, step.b, 0, MaxCoordinate))
+                {
+                    return fail(lineNumber, "move <x> <y>");
+                }
+            }
+            else if (command == "dclick")
+            {
+                step.op = Op::DoubleClick;
+                step.c = 1;
+                if (args < 2 || args > 3 || !integer(1, step.a, 0, MaxCoordinate) || !integer(2, step.b, 0, MaxCoordinate)
+                    || (args == 3 && (step.c = ParseButton(words[3])) == 0))
+                {
+                    return fail(lineNumber, "dclick <x> <y> [left|right|middle]");
+                }
+            }
+            else if (command == "drag")
+            {
+                step.op = Op::Drag;
+                step.e = 1;
+                if (args < 4 || args > 5 || !integer(1, step.a, 0, MaxCoordinate) || !integer(2, step.b, 0, MaxCoordinate)
+                    || !integer(3, step.c, 0, MaxCoordinate) || !integer(4, step.d, 0, MaxCoordinate)
+                    || (args == 5 && (step.e = ParseButton(words[5])) == 0))
+                {
+                    return fail(lineNumber, "drag <x1> <y1> <x2> <y2> [left|right|middle]");
+                }
+            }
+            else if (command == "log" || command == "type")
+            {
+                const bool typing = command == "type";
+                step.op = typing ? Op::Type : Op::Log;
                 const std::size_t at = static_cast<std::size_t>(words[0].data() - code.data()) + words[0].size();
                 std::string_view rest = code.substr(at);
                 while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t'))
@@ -401,13 +503,17 @@ namespace soulash_plugins::testbot
                 }
                 if (rest.empty())
                 {
-                    return fail(lineNumber, "log <text>");
+                    return fail(lineNumber, typing ? "type <text>" : "log <text>");
+                }
+                if (typing && rest.size() > MaxTypeLength)
+                {
+                    return fail(lineNumber, "type text longer than 200 characters");
                 }
                 for (const char c : rest)
                 {
                     if (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) > 0x7E)
                     {
-                        return fail(lineNumber, "log text must be printable ASCII");
+                        return fail(lineNumber, std::string(typing ? "type" : "log") + " text must be printable ASCII");
                     }
                 }
                 step.text.assign(rest);

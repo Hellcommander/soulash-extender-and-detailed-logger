@@ -82,6 +82,20 @@ TESTBOT TIER A (2026-11-05, owner approved; requested by the mod-authoring sessi
 - Tier B (tile->screen mapping, dump_stacks, dump_entities: read-only RE first) and Tier C (spawn, cast, play_anim,
   load_mods, editor fields: calling game code) are NOT started; see the reply sent to the mods session.
 
+TESTBOT EDITOR SUPPORT (2026-11-05, owner: "add support for bot to be able to use the mod editor and animation editor")
+- New commands: wait_screen <Screen> [timeout], expect_screen <Screen>, log_screen, type <text> (SDL_TEXTINPUT),
+  move, dclick, drag. Screen = RTTI class (MapMakerScreen, EntityMakerScreen, DataTableScreen,
+  ProceduralMapMakerScreen, AnimatorScreen, MainMenuScreen, GameScreen, ...).
+- Detection: pass-through thunks on vtable slot 7 (draw) of each *Screen class whose ORIGINAL slot 7 (from the exe
+  file) calls the glClear import within 0x120 bytes; 15 classes pass offline on 60b72c10. Installed only when the
+  script names screens.
+- FIRST LIVE RUN 2026-11-05 (mods session, run 20261105-122100Z): 49/49 PASS. Screen detection, snapshot,
+  wait_world, blocking, mods_errors work. Found: no editor menu screen (Mods page -> MapMakerScreen); top button bar
+  F1 MapMaker, F2 EntityMaker, F3 Abilities = AnimatorScreen, F4 MainMenu (reloads mods), F5 ProceduralMapMaker,
+  F6 Data Tables (DataTableScreen?), F9 Reload Assets; Escape does nothing. Coordinates in docs/test-bot.md.
+- Open: which button on the Mods page opens the editors; confirm F6 = DataTableScreen; PreGameScreen's purpose;
+  confirm type/move/dclick/drag live. Editor field values are not readable (Tier C).
+
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.

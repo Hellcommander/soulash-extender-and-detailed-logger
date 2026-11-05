@@ -194,6 +194,54 @@ void TestTestBotCapture()
         Check(allRefused, "testbot: bad snapshot / mods_errors arguments are refused (names can't escape the run folder)");
     }
 
+    // Editor commands: screens, text input, mouse move / drag / double click.
+    {
+        const tb::ParseResult parsed = tb::ParseScript(
+            "wait_screen MainMenuScreen\n"
+            "wait_screen AnimatorScreen 5000\n"
+            "expect_screen EntityMakerScreen\n"
+            "log_screen\n"
+            "type  Fire bolt (copy)  \n"
+            "move 10 20\n"
+            "dclick 30 40\n"
+            "dclick 30 40 right\n"
+            "drag 1 2 300 400\n"
+            "drag 1 2 3 4 Middle\n"
+            "click 5 6 right\n");
+        Check(parsed.ok && parsed.steps.size() == 11, "testbot: editor commands parse");
+        if (parsed.ok && parsed.steps.size() == 11)
+        {
+            const std::vector<tb::Step>& s = parsed.steps;
+            Check(s[0].op == tb::Op::WaitScreen && s[0].text == "MainMenuScreen" && s[0].a == 30000,
+                "testbot: wait_screen defaults to 30 s");
+            Check(s[1].text == "AnimatorScreen" && s[1].a == 5000, "testbot: wait_screen timeout");
+            Check(s[2].op == tb::Op::ExpectScreen && s[2].text == "EntityMakerScreen", "testbot: expect_screen");
+            Check(s[3].op == tb::Op::LogScreen, "testbot: log_screen");
+            Check(s[4].op == tb::Op::Type && s[4].text == "Fire bolt (copy)", "testbot: type keeps inner blanks, trims the ends");
+            Check(s[5].op == tb::Op::Move && s[5].a == 10 && s[5].b == 20, "testbot: move");
+            Check(s[6].op == tb::Op::DoubleClick && s[6].a == 30 && s[6].b == 40 && s[6].c == 1 && s[7].c == 3,
+                "testbot: dclick defaults to the left button");
+            Check(s[8].op == tb::Op::Drag && s[8].a == 1 && s[8].b == 2 && s[8].c == 300 && s[8].d == 400 && s[8].e == 1,
+                "testbot: drag coordinates, left button by default");
+            Check(s[9].e == 2, "testbot: drag button names are case-insensitive");
+            Check(s[10].op == tb::Op::Click && s[10].c == 3, "testbot: click still takes a button");
+        }
+        const std::string tooLong = "type " + std::string(tb::MaxTypeLength + 1, 'x');
+        const char* bad[] = {"wait_screen", "wait_screen Main-Menu", "wait_screen MainMenuScreen 0",
+            "wait_screen MainMenuScreen 600001", "wait_screen A B C", "expect_screen", "expect_screen A 5",
+            "expect_screen ../x", "log_screen now", "type", "type caf\xc3\xa9", tooLong.c_str(), "move 1",
+            "move -1 5", "move 1 16385", "dclick 1 2 side", "dclick 1", "drag 1 2 3", "drag 1 2 3 4 up",
+            "drag 1 2 3 4 left 6", "click 1 2 up"};
+        bool allRefused = true;
+        for (const char* line : bad)
+        {
+            allRefused = allRefused && !tb::ParseScript(line).ok;
+        }
+        Check(allRefused, "testbot: bad editor command arguments are refused");
+        Check(tb::ParseScript("type a # b").ok && tb::ParseScript("type a # b").steps[0].text == "a",
+            "testbot: '#' starts a comment after type");
+    }
+
     // Checksums against published values.
     const unsigned char iend[] = {'I', 'E', 'N', 'D'};
     Check(png::Crc32(iend, 4) == 0xAE426082u, "png: CRC-32 of IEND");

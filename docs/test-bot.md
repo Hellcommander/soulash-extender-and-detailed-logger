@@ -11,8 +11,9 @@ in `[PluginHashes]` when `RequireHash=1`.
 
 ## Turning it on
 
-1. Pin the hash the build prints (`TestBot=<sha256>`) in the game's
-   `SoulashExtender.ini` under `[PluginHashes]`.
+1. Pin the hash the build prints (`TestBot=<sha256>`) in the extender's
+   `<game>\SoulashExtender.ini` under `[PluginHashes]` (the build does this
+   itself when that section exists).
 2. Copy a script into `<game>\SoulashExtender\Plugins\` (the build does not
    deploy scripts; the example is `.build\plugins\TestBot.script`, source
    `plugins/test_bot/TestBot.script`).
@@ -86,6 +87,13 @@ error names the line and the bot does not run.
 | `log <text>` | marker line in the log |
 | `snapshot <name> [count] [interval_ms]` | capture `count` frames (1..20, default 1), `interval_ms` apart (0..60000, default 500), as `<name>_01.png`, `<name>_02.png`, ... in the run folder. `<name>`: 1..32 of `A-Z a-z 0-9 _ -`. The step ends when every frame is captured |
 | `mods_errors [max_errors]` | copy `<game>\logs\errors.log` from its **last** `Loading mods:` line into `results.txt` (the earlier core-only pass is skipped). With `max_errors`, more `[error]` lines than that is a counted FAIL |
+| `wait_screen <Screen> [timeout_ms]` | wait until that screen class is the one being drawn (default 30000). A timeout aborts the run and names the screen drawn instead; screen detection being off or an unknown name aborts immediately |
+| `expect_screen <Screen>` | check the screen drawn within the last second; counted PASS/FAIL |
+| `log_screen` | log the current screen, the window size (what `click`/`move`/`drag` coordinates mean) and the drawable size (snapshot pixels) |
+| `type <text>` | text input (`SDL_TEXTINPUT`), one character per frame, for the editors' text fields. Printable ASCII, at most 200 characters. Leading and trailing blanks are dropped and `#` starts a comment, so neither can be typed. Click into the field first; use `key backspace` / `key enter` for editing keys |
+| `move <x> <y>` | move the mouse there (hover, tooltips) |
+| `dclick <x> <y> [left\|right\|middle]` | double click (the second press carries `clicks=2`) |
+| `drag <x1> <y1> <x2> <y2> [left\|right\|middle]` | press at 1, move to 2 in 10 steps (one per frame; the motion events carry the held button), release at 2 |
 
 Keys: `a`-`z`, `0`-`9`, `f1`-`f12`, `space`, `enter`/`return`, `escape`/`esc`,
 `tab`, `backspace`, `up`/`down`/`left`/`right`, `lctrl`/`rctrl`/`lshift`/
@@ -143,6 +151,83 @@ snapshot storm_after 1
 mods_errors
 ```
 
+## Screens and the editors
+
+`<Screen>` is the RTTI class name of one of the game's full screens. On build
+60b72c10 these are accepted:
+
+| Screen | What it is |
+| --- | --- |
+| `MainMenuScreen`, `OptionsScreen`, `CreditsScreen`, `ModsScreen` | main menu and its pages |
+| `PlayerCreationScreen`, `WorldGenerationScreen`, `LoadingScreen`, `CemeteryScreen` | new game, loading, graveyard |
+| `PreGameScreen` | not identified yet |
+| `GameScreen` | the game world |
+| `MapMakerScreen` | editor: map editor (F1); the editors open here |
+| `EntityMakerScreen` | editor: entities (F2) |
+| `AnimatorScreen` | editor: abilities and animations (F3): ability list, animation list and a live preview |
+| `ProceduralMapMakerScreen` | editor: procedural maps (F5) |
+| `DataTableScreen` | editor: data tables (F6; not visited yet, so the class is not confirmed) |
+
+Confirmed in the game (build 60b72c10, window and drawable 1920x1080, first
+live run 2026-11-05):
+
+* **Way in:** `MainMenuScreen` → the Mods button (window pixels 244,202) →
+  `ModsScreen` → a button on the Mods page (not identified yet) →
+  `MapMakerScreen`. There is no separate editor menu screen; the editors open
+  straight into the map editor.
+* **Switching editors:** all editors share a button bar across the top
+  (y ≈ 26) with function keys: F1 Map Editor, F2 Entities, F3 Abilities
+  (`AnimatorScreen`, not `DataTableScreen`), F4 Main Menu (the game reloads all
+  mods on the way out), F5 Procedural Maps, F6 Data Tables, F9 Reload Assets.
+* **Escape** does nothing in any editor and changes no screen.
+* **Entity editor** (`EntityMakerScreen`): buttons "Save entity (ctrl+s)" and
+  "New entity"; Name field at about (738,111), Description at about (738,290).
+* **Abilities editor** (`AnimatorScreen`): buttons "New Ability" and "New
+  Animation"; Abilities search field at about (220,93), Animation search field
+  at about (220,570).
+
+The coordinates are window pixels at 1920x1080 and will differ at other window
+sizes; `log_screen` logs the window size. To map something new, run a script
+with `log_screen` and `snapshot` after each step and read `results.txt`, which
+also logs every change as `screen: A -> B`.
+
+How it works: every full screen is a class whose vtable slot 7 draws it, and
+that function begins by clearing the frame. TestBot accepts a class only when
+its slot-7 function (read from the exe file, so another plugin's hooks don't
+get in the way) calls the game's `OPENGL32.dll!glClear` import within its
+first 0x120 bytes. The three character-creation pages whose slot 7 is an empty
+stub, and the in-game panels with shorter vtables, are skipped and listed in
+the log. Each accepted slot 7 gets a 25-byte pass-through thunk that records
+`this` and jumps on with every register and the stack untouched. Once per
+frame the runner maps the last drawn object's vtable back to its class.
+The hooks are installed only when the script uses `wait_screen`,
+`expect_screen` or `log_screen`. The log line `screen detection on: draw slot
+hooked on ...` lists the screens a script can name.
+
+Reading or checking the values inside editor fields is not supported (that
+needs per-widget reverse engineering). Check results visually with `snapshot`,
+or through the files the editor saves.
+
+Example (open the entity editor from the main menu, type a name, check
+visually; coordinates for a 1920x1080 window):
+
+```
+wait_screen MainMenuScreen 120000
+log_screen                     # window size for the coordinates below
+click 244 202                  # main menu: Mods
+wait_screen ModsScreen
+snapshot mods_page             # find the editor button here, then click it:
+# click <x> <y>                # Mods page: open the editors (button not identified yet)
+wait_screen MapMakerScreen
+key f2                         # Entities
+wait_screen EntityMakerScreen
+click 738 111                  # the Name field
+key backspace
+type Storm caller
+snapshot entity_named
+mods_errors
+```
+
 ## Not verified yet
 
 Everything above is static analysis plus synthetic tests. (The PNG writer is
@@ -151,3 +236,9 @@ run against the game.) The first live run should confirm: `achievement/stat bloc
 `achievements+stats BLOCKED on STEAMUSERSTATS_INTERFACE_VERSION013` line
 (which appears when the game first asks for the interface), and the example
 script ending with `-> PASS`.
+
+First live run (2026-11-05, build 60b72c10, 49/49 steps, 0 failures): screen
+detection, `snapshot` (12 valid PNGs), `wait_world`, achievement blocking and
+`mods_errors` all came on and worked, and the screen changes above were logged.
+That script did not use `type`, `move`, `dclick` or `drag`, so those are not
+confirmed yet.
