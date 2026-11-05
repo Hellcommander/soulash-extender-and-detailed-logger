@@ -13,6 +13,10 @@
 //   click <x> <y> [left|right|middle]  move the mouse there (window pixels) and click
 //   expect_bar_set <n>              check the current ability-bar set (AbilityUser+0x68)
 //   log <text>                      write a marker line to the diagnostics log
+//   snapshot <name> [count] [interval_ms]  capture count frames (1..20, default 1)
+//                                   interval_ms apart (0..60000, default 500) as PNGs in the run folder
+//   mods_errors [max_errors]        copy errors.log from its last "Loading mods:" pass into the
+//                                   results file; with max_errors, more [error] lines is a FAIL
 // <key>: a-z, 0-9, f1-f12, space, enter|return, escape|esc, tab, backspace,
 // up, down, left, right, lctrl, rctrl, lshift, rshift, lalt, ralt, or an SDL
 // keycode in decimal or 0x hex.
@@ -40,7 +44,9 @@ namespace soulash_plugins::testbot
         Wheel,
         Click,
         ExpectBarSet,
-        Log
+        Log,
+        Snapshot,
+        ModsErrors
     };
 
     struct Step
@@ -51,7 +57,7 @@ namespace soulash_plugins::testbot
         std::int64_t b = 0;   // hold ms / y
         std::int64_t c = 0;   // mouse button
         std::uint32_t key = 0;
-        std::string text;     // log text
+        std::string text;     // log text / snapshot name
     };
 
     struct ParseResult
@@ -66,6 +72,26 @@ namespace soulash_plugins::testbot
     constexpr std::size_t MaxSteps = 2000;
     constexpr std::size_t MaxLineLength = 256;
     constexpr std::int64_t MaxWaitMs = 10 * 60 * 1000;
+    constexpr std::int64_t MaxSnapshotFrames = 20;
+    constexpr std::int64_t MaxSnapshotIntervalMs = 60000;
+    constexpr std::size_t MaxSnapshotNameLength = 32;
+
+    // Snapshot names become file names: [A-Za-z0-9_-], 1..32 characters.
+    inline bool IsSnapshotName(std::string_view name)
+    {
+        if (name.empty() || name.size() > MaxSnapshotNameLength)
+        {
+            return false;
+        }
+        for (const char c : name)
+        {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
 
     constexpr int ModNone = 0x0000;
     constexpr int ModLShift = 0x0001;
@@ -333,6 +359,31 @@ namespace soulash_plugins::testbot
                 if (args != 1 || !integer(1, step.a, 0, 63))
                 {
                     return fail(lineNumber, "expect_bar_set <0..63>");
+                }
+            }
+            else if (command == "snapshot")
+            {
+                step.op = Op::Snapshot;
+                step.a = 1;
+                step.b = 500;
+                if (args < 1 || args > 3 || !IsSnapshotName(words[1]))
+                {
+                    return fail(lineNumber, "snapshot <name: 1..32 of A-Z a-z 0-9 _ -> [count 1..20] [interval_ms 0..60000]");
+                }
+                if ((args >= 2 && !integer(2, step.a, 1, MaxSnapshotFrames))
+                    || (args == 3 && !integer(3, step.b, 0, MaxSnapshotIntervalMs)))
+                {
+                    return fail(lineNumber, "snapshot <name> [count 1..20] [interval_ms 0..60000]");
+                }
+                step.text.assign(words[1]);
+            }
+            else if (command == "mods_errors")
+            {
+                step.op = Op::ModsErrors;
+                step.a = -1;
+                if (args > 1 || (args == 1 && !integer(1, step.a, 0, 100000)))
+                {
+                    return fail(lineNumber, "mods_errors [max_errors 0..100000]");
                 }
             }
             else if (command == "log")

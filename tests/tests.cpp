@@ -4,8 +4,10 @@
 #include "effects.hpp"
 #include "script_sandbox.hpp"
 #include "x64_length.hpp"
+#include "update_guard_logic.hpp"
 #include "../plugins/common/ability_bar_layout.hpp"
 #include "../plugins/common/test_bot_script.hpp"
+#include "../plugins/common/png_writer.hpp"
 
 #include <windows.h>
 
@@ -645,6 +647,37 @@ namespace
             Check(at(expectedRtti) != npos,
                 "findRttiVtable resolves a class vtable by RTTI name");
             Check(at("rtti-none:ok") != npos, "missing RTTI class yields a null vtable");
+            Check(at("status:ok") != npos && at("status-invalid:ok") != npos,
+                "reportStatus accepts a valid status and rejects an invalid one");
+
+            // Update guard: report + state beside the proxy (<proxy dir>\SoulashExtender).
+            std::wstring guardDirectory(proxyPath);
+            guardDirectory.resize(guardDirectory.find_last_of(L"\\/") + 1);
+            guardDirectory += L"SoulashExtender\\";
+            std::string report;
+            std::string guardState;
+            bool reportReady = false;
+            for (unsigned attempt = 0; attempt < 500 && !reportReady; ++attempt)
+            {
+                report.clear();
+                guardState.clear();
+                reportReady = ReadLog((guardDirectory + L"compat-report.txt").c_str(), report)
+                    && report.find("end of report") != std::string::npos
+                    && ReadLog((guardDirectory + L"UpdateGuard.state").c_str(), guardState)
+                    && guardState.find("plugins_loaded=1") != std::string::npos;
+                if (!reportReady)
+                {
+                    Sleep(10);
+                }
+            }
+            Check(reportReady, "update guard writes compat-report.txt and its state after startup");
+            Check(report.find("Test.PluginA: loaded; active: synthetic ok") != std::string::npos
+                    && report.find("Test.PluginB: loaded; active: synthetic ok") != std::string::npos,
+                "compat report lists each plugin's load outcome and reported status");
+            Check(report.find("safe_mode=no") != std::string::npos, "compat report shows safe mode off");
+            Check(guardState.find("format=1") != std::string::npos
+                    && guardState.find("clean_exit=1") != std::string::npos,
+                "BugSplat destructor marks the session as a clean exit");
 
             std::string diagnosticsLog;
             Check(ReadLog(diagnosticsLogPath.c_str(), diagnosticsLog),
@@ -739,6 +772,7 @@ namespace
 #include "effects_tests.inc"
 #include "ability_bar_layout_tests.inc"
 #include "test_bot_tests.inc"
+#include "update_guard_tests.inc"
 
     // Child side of the debugger fallback test. Loads the proxy but never
     // calls any BugSplat export, so only the DllMain fallback can start it.
@@ -1764,6 +1798,8 @@ int wmain(int argc, wchar_t* argv[])
         TestX64Decoder();
         TestAbilityBarLayout();
         TestTestBotScript();
+        TestTestBotCapture();
+        TestUpdateGuardLogic();
         if (failures == 0)
         {
             std::cout << "PASS: native module manifest tests\n";
@@ -1820,6 +1856,11 @@ int wmain(int argc, wchar_t* argv[])
     if (argc == 6 && std::wstring_view(argv[1]) == L"--ability-bar-layout")
     {
         return RunAbilityBarLayoutOracle(argv[2], argv[3], argv[4], argv[5]);
+    }
+
+    if (argc == 3 && std::wstring_view(argv[1]) == L"--png")
+    {
+        return WriteTestPng(argv[2]);
     }
 
     if (argc == 3 && std::wstring_view(argv[1]) == L"--steam-stats-slots")

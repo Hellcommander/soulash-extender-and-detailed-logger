@@ -7,6 +7,7 @@
 
 #include "module_runtime.hpp"
 #include "plugin_services.hpp"
+#include "update_guard.hpp"
 
 extern "C" BOOL WINAPI SoulashDiagnosticsStart(const wchar_t* logPath);
 extern "C" BOOL WINAPI SoulashDiagnosticsWritePluginMessage(const char* message);
@@ -454,6 +455,9 @@ extern "C" void __cdecl ProxyDestructor(void* self)
     original.destructor(self);
     const DWORD lastError = GetLastError();
     soulash::module_runtime::StartOptInModule();
+    // The game destroys its BugSplat sender on its orderly shutdown path: the
+    // update guard counts this session as a clean exit.
+    soulash::update_guard::MarkCleanExit(false);
     SetLastError(lastError);
 }
 
@@ -478,8 +482,15 @@ extern "C" int __cdecl ProxySetGuardByteBufferSize(void* self, int size)
     return result;
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
 {
+    // reserved != NULL on DLL_PROCESS_DETACH: the process is exiting through
+    // ExitProcess (normal end). A crash ends in TerminateProcess/WER, which
+    // never gets here, so the session stays "unclean" for the update guard.
+    if (reason == DLL_PROCESS_DETACH && reserved != nullptr)
+    {
+        soulash::update_guard::MarkCleanExit(true);
+    }
     if (reason == DLL_PROCESS_ATTACH && IsDebuggerPresent())
     {
         // Only create a thread here: it starts after the loader lock is

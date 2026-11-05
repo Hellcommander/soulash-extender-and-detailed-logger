@@ -5,6 +5,7 @@
 #include "conditions.hpp"
 #include "effects.hpp"
 #include "script_sandbox.hpp"
+#include "update_guard.hpp"
 
 #include <windows.h>
 
@@ -506,6 +507,7 @@ namespace
             }
             SoulashDiagnosticsLogModuleEvent(path, id, "load_failed", ERROR_ACCESS_DENIED);
             ReportFailure("plugin refused: SHA-256 not listed in [PluginHashes]");
+            soulash::update_guard::RecordPluginOutcome(id, "REFUSED: its SHA-256 is not listed in [PluginHashes] (rebuilt or replaced? paste the new hash)");
             return false;
         }
         HMODULE module = LoadLibraryExW(
@@ -522,6 +524,7 @@ namespace
             const DWORD error = loadError;
             SoulashDiagnosticsLogModuleEvent(path, id, "load_failed", error);
             ReportFailure("cannot load native plugin", error);
+            soulash::update_guard::RecordPluginOutcome(id, ("LOAD FAILED: Windows error " + std::to_string(error)).c_str());
             return false;
         }
         SoulashDiagnosticsLogModuleEvent(path, id, "loaded", ERROR_SUCCESS);
@@ -547,6 +550,7 @@ namespace
                 SoulashDiagnosticsLogModuleEvent(
                     path, id, "initialization_failed", ERROR_TOO_MANY_NAMES);
                 ReportFailure("cannot allocate plugin interface (table full or duplicate id)");
+                soulash::update_guard::RecordPluginOutcome(id, "FAILED: no interface (table full or duplicate id)");
                 return false;
             }
             SoulashDiagnosticsLogModuleEvent(path, id, "initializing", ERROR_SUCCESS);
@@ -561,6 +565,7 @@ namespace
         {
             SoulashDiagnosticsLogModuleEvent(path, id, "loaded_without_initializer", ERROR_SUCCESS);
             DebugLog("loaded module has no plugin entry point; DllMain only");
+            soulash::update_guard::RecordPluginOutcome(id, "loaded (no entry point; DllMain only)");
             return true;
         }
 
@@ -569,9 +574,11 @@ namespace
             SoulashDiagnosticsLogModuleEvent(
                 path, id, "initialization_failed", ERROR_DLL_INIT_FAILED);
             ReportFailure("native plugin initialization returned failure");
+            soulash::update_guard::RecordPluginOutcome(id, "FAILED: its load function returned failure");
             return false;
         }
         SoulashDiagnosticsLogModuleEvent(path, id, "initialized", ERROR_SUCCESS);
+        soulash::update_guard::RecordPluginOutcome(id, load != nullptr ? "loaded" : "loaded (legacy v2 plugin)");
         return true;
     }
 
@@ -972,6 +979,17 @@ namespace
     {
         soulash::plugin_services::Initialize();
 
+        // Update guard: detect a new game build, decide safe mode, start the session record.
+        wchar_t proxyDirectory[MAX_PATH]{};
+        bool loadNative = true;
+        if (GetProxyDirectory(proxyDirectory))
+        {
+            loadNative = soulash::update_guard::BeginSession(proxyDirectory,
+                g_iniPath[0] != L'\0' ? g_iniPath : nullptr,
+                soulash::plugin_services::GameExecutableSha256(),
+                soulash::plugin_services::GameDirectory());
+        }
+
         std::vector<PluginEntry> plugins;
         CollectManifestPlugin(plugins);
         std::vector<PluginEntry> directoryPlugins;
@@ -987,9 +1005,19 @@ namespace
         }
 
         unsigned failures = 0;
+        unsigned loaded = 0;
         for (const PluginEntry& plugin : plugins)
         {
-            if (!LoadPlugin(plugin))
+            if (!loadNative)
+            {
+                soulash::update_guard::RecordPluginOutcome(plugin.id.c_str(), "SKIPPED: safe mode");
+                continue;
+            }
+            if (LoadPlugin(plugin))
+            {
+                ++loaded;
+            }
+            else
             {
                 ++failures;
             }
@@ -999,6 +1027,7 @@ namespace
         LoadConditionFiles();
         soulash::plugin_services::DispatchCoreMessage(SOULASH_EXTENDER_MSG_POSTLOAD);
         soulash::plugin_services::DispatchCoreMessage(SOULASH_EXTENDER_MSG_POSTPOSTLOAD);
+        soulash::update_guard::FinishStartup(loaded);
 
         DebugLog(failures == 0 ? "native plugins loaded" : "native plugins loaded with failures");
         InterlockedExchange(&g_startState, 2);

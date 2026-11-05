@@ -52,6 +52,30 @@ SESSION 2026-11-05: TEST BOT (owner request: "a bot driven mod that disables ach
 - Possible follow-ups: also neutralise the game's own Achievements component bookkeeping if the owner wants that;
   more script commands (repeat blocks, expect on other game state once state reads exist).
 
+SESSION 2026-11-05: UPDATE GUARD (owner request: "a system that helps the extender survive game updates")
+- Owner had just set TestBot Enabled=1 and pinned the hashes; the game has not run since. TestBot.script is NOT in
+  <game>\SoulashExtender\Plugins yet (owner copies it), and the pins are stale again after this session's rebuilds.
+- Proxy: src/update_guard.{hpp,cpp} + pure src/update_guard_logic.hpp (unit tests tests/update_guard_tests.inc).
+  Detects new exe/version.txt/vendor-DLL per start (SoulashExtender\UpdateGuard.state, 16 known builds), writes
+  SoulashExtender\compat-report.txt (build, per-plugin load outcome + self-reported status), crash-loop SAFE MODE
+  (2 unclean sessions with native plugins -> next start skips native plugins; scripts/data still load).
+  Clean exit = MiniDmpSender destructor OR DLL_PROCESS_DETACH with lpReserved != NULL. Both paths pass in test
+  processes; NOT yet observed in the real game -> first live check: UpdateGuard.state says clean_exit=1 after a quit.
+- Interface v3 gained reportStatus at its end (SOULASH_EXTENDER_HAS, SOULASH_EXTENDER_INTERFACE_V3_BASE_SIZE so new
+  plugins still load under the old installed proxy). All three plugins report via plugins/common/plugin_status.hpp.
+- scripts/repair-install.ps1 (report-only unless -Apply; -UpdateProxy upgrades an installed proxy). Owner-run only.
+  check-install.ps1 shows the last report's build/safe-mode/summary. Package INI template has [UpdateGuard].
+- The INSTALLED proxy is still a2ebdff3 (no guard). Installing the new one is the owner's step
+  (repair-install.ps1 -UpdateProxy -Apply). docs/update-guard.md.
+
+TESTBOT TIER A (2026-11-05, owner approved; requested by the mod-authoring session for arendeth_cinderstorm_magic)
+- New script commands: snapshot <name> [count 1..20] [interval_ms] (SDL_GL_SwapWindow IAT hook, glReadPixels of the
+  back buffer, GL state saved/restored, PNG via plugins/common/png_writer.hpp + game's zlib1.dll on a worker thread)
+  and mods_errors [max_errors] (logs\errors.log from its LAST "Loading mods:" line). Every run gets
+  <game>\SoulashExtender\TestBot\<UTC>\results.txt; latest.txt points at it. NOT RUN in the game yet.
+- Tier B (tile->screen mapping, dump_stacks, dump_entities: read-only RE first) and Tier C (spawn, cast, play_anim,
+  load_mods, editor fields: calling game code) are NOT started; see the reply sent to the mods session.
+
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.

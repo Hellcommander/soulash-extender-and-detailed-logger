@@ -15,6 +15,10 @@ namespace soulash::plugin_services
         const char* pluginId,
         const wchar_t* pluginDirectory);
 
+    // Game facts gathered by Initialize() ("" / L"" when unavailable).
+    const char* GameExecutableSha256();
+    const wchar_t* GameDirectory();
+
     // Sends a message from the extender itself to every listener.
     void DispatchCoreMessage(unsigned int type);
 

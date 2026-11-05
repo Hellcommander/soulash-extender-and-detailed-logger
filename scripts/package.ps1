@@ -78,7 +78,14 @@ if (-not (Test-Path -LiteralPath $iniPath)) {
         '',
         '[Conditions]',
         'Enabled=1',
-        '; Directory defaults to <game folder>\data\mods'
+        '; Directory defaults to <game folder>\data\mods',
+        '',
+        '[UpdateGuard]',
+        '; Detects game updates, writes SoulashExtender\compat-report.txt, and skips native',
+        '; plugins after repeated crashes (docs/update-guard.md). Defaults shown.',
+        'Enabled=1',
+        'SafeModeAfterUncleanExits=2',
+        'ForceSafeMode=0'
     )
     [System.IO.File]::WriteAllLines($iniPath, $ini, [System.Text.Encoding]::ASCII)
 }

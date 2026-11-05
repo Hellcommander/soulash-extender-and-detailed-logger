@@ -159,3 +159,116 @@ int RunSteamStatsSlotsOracle(const wchar_t* dllPath)
     FreeLibrary(module);
     return bad == 0 ? 0 : 1;
 }
+
+// TestBot snapshot / mods_errors commands and the PNG writer.
+void TestTestBotCapture()
+{
+    namespace tb = soulash_plugins::testbot;
+    namespace png = soulash_plugins::png;
+
+    {
+        const tb::ParseResult parsed = tb::ParseScript(
+            "snapshot storm_start\n"
+            "snapshot Storm-02 5 250\n"
+            "mods_errors\n"
+            "mods_errors 0\n");
+        Check(parsed.ok && parsed.steps.size() == 4, "testbot: snapshot and mods_errors parse");
+        if (parsed.ok && parsed.steps.size() == 4)
+        {
+            Check(parsed.steps[0].op == tb::Op::Snapshot && parsed.steps[0].text == "storm_start"
+                    && parsed.steps[0].a == 1 && parsed.steps[0].b == 500,
+                "testbot: snapshot defaults to 1 frame, 500 ms");
+            Check(parsed.steps[1].text == "Storm-02" && parsed.steps[1].a == 5 && parsed.steps[1].b == 250,
+                "testbot: snapshot count and interval");
+            Check(parsed.steps[2].op == tb::Op::ModsErrors && parsed.steps[2].a == -1 && parsed.steps[3].a == 0,
+                "testbot: mods_errors without and with a maximum");
+        }
+        const char* bad[] = {"snapshot", "snapshot ../x", "snapshot a.png", "snapshot x 0", "snapshot x 21",
+            "snapshot x 1 60001", "snapshot x 1 2 3", "snapshot abcdefghijklmnopqrstuvwxyz0123456",
+            "mods_errors -1", "mods_errors 1 2", "mods_errors x"};
+        bool allRefused = true;
+        for (const char* line : bad)
+        {
+            allRefused = allRefused && !tb::ParseScript(line).ok;
+        }
+        Check(allRefused, "testbot: bad snapshot / mods_errors arguments are refused (names can't escape the run folder)");
+    }
+
+    // Checksums against published values.
+    const unsigned char iend[] = {'I', 'E', 'N', 'D'};
+    Check(png::Crc32(iend, 4) == 0xAE426082u, "png: CRC-32 of IEND");
+    const unsigned char wiki[] = {'W', 'i', 'k', 'i', 'p', 'e', 'd', 'i', 'a'};
+    Check(png::Adler32(wiki, sizeof(wiki)) == 0x11E60398u, "png: Adler-32 of 'Wikipedia'");
+
+    // Stored zlib stream spanning several 65535-byte blocks.
+    {
+        std::vector<unsigned char> data(150000);
+        for (std::size_t i = 0; i < data.size(); ++i)
+        {
+            data[i] = static_cast<unsigned char>(i * 7);
+        }
+        const std::vector<unsigned char> z = png::StoredZlib(data.data(), data.size());
+        Check(z.size() == 2 + 3 * 5 + data.size() + 4 && z[0] == 0x78 && z[2] == 0 && z[2 + 5 + 65535] == 0
+                && z[2 + 2 * (5 + 65535)] == 1,
+            "png: stored deflate blocks are 64 KiB max and only the last is final");
+    }
+
+    // A 3x2 image read bottom-up (as glReadPixels returns it).
+    {
+        const unsigned char pixels[] = {
+            0, 0, 255,   255, 255, 255,   0, 0, 0,     // bottom row: blue, white, black
+            255, 0, 0,   0, 255, 0,       10, 20, 30,  // top row: red, green, (10,20,30)
+        };
+        const std::vector<unsigned char> file = png::EncodeRgb(pixels, 3, 2, true);
+        const unsigned char signature[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+        Check(file.size() > 8 + 25 + 12 && std::memcmp(file.data(), signature, 8) == 0
+                && std::memcmp(file.data() + 12, "IHDR", 4) == 0 && file[19] == 3 && file[23] == 2 && file[24] == 8
+                && file[25] == 2,
+            "png: signature and IHDR (3x2, 8-bit RGB)");
+        // Every chunk's CRC is right and the file ends with IEND.
+        bool crcOk = true;
+        std::size_t at = 8;
+        std::string last;
+        while (at + 12 <= file.size())
+        {
+            const std::uint32_t length = (std::uint32_t(file[at]) << 24) | (std::uint32_t(file[at + 1]) << 16)
+                | (std::uint32_t(file[at + 2]) << 8) | file[at + 3];
+            if (at + 12 + length > file.size())
+            {
+                crcOk = false;
+                break;
+            }
+            const std::uint32_t stored = (std::uint32_t(file[at + 8 + length]) << 24)
+                | (std::uint32_t(file[at + 9 + length]) << 16) | (std::uint32_t(file[at + 10 + length]) << 8)
+                | file[at + 11 + length];
+            crcOk = crcOk && stored == png::Crc32(file.data() + at + 4, length + 4);
+            last.assign(reinterpret_cast<const char*>(file.data() + at + 4), 4);
+            at += 12 + length;
+        }
+        Check(crcOk && at == file.size() && last == "IEND", "png: chunk CRCs and IEND");
+        Check(png::EncodeRgb(pixels, 0, 2, true).empty() && png::EncodeRgb(nullptr, 1, 1, false).empty()
+                && png::EncodeRgb(pixels, png::MaxDimension + 1, 1, false).empty(),
+            "png: invalid sizes are refused");
+    }
+
+    // A failing compressor falls back to stored blocks.
+    {
+        const unsigned char pixel[] = {1, 2, 3};
+        const auto failing = [](unsigned char*, unsigned long*, const unsigned char*, unsigned long, int) { return -2; };
+        Check(png::EncodeRgb(pixel, 1, 1, false, failing) == png::EncodeRgb(pixel, 1, 1, false),
+            "png: a failing compress2 falls back to stored deflate");
+    }
+}
+
+// --png <path>: writes the 3x2 bottom-up test image; scripts/test.ps1 decodes it with .NET.
+int WriteTestPng(const wchar_t* path)
+{
+    const unsigned char pixels[] = {
+        0, 0, 255,   255, 255, 255,   0, 0, 0,
+        255, 0, 0,   0, 255, 0,       10, 20, 30,
+    };
+    const std::vector<unsigned char> file = soulash_plugins::png::EncodeRgb(pixels, 3, 2, true);
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(file.data()), static_cast<std::streamsize>(file.size()));
+    return out.good() && !file.empty() ? 0 : 1;
+}

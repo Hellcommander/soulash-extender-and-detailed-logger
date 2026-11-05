@@ -1,5 +1,6 @@
 #include "plugin_services.hpp"
 #include "sha256.hpp"
+#include "update_guard.hpp"
 #include "x64_length.hpp"
 
 #include <windows.h>
@@ -898,6 +899,47 @@ namespace
     }
 }
 
+namespace
+{
+    // reportStatus: plugin -> update guard (compat-report.txt) + one log line.
+    BOOL WINAPI ReportStatus(unsigned int handle, unsigned int status, const char* detail)
+    {
+        if (status < SOULASH_PLUGIN_STATUS_ACTIVE || status > SOULASH_PLUGIN_STATUS_DEGRADED)
+        {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        char id[PluginIdCapacity]{};
+        AcquireSRWLockShared(&g_lock);
+        const bool valid = handle >= 1 && handle <= g_pluginCount;
+        if (valid)
+        {
+            strcpy_s(id, sizeof(id), g_plugins[handle - 1].id);
+        }
+        ReleaseSRWLockShared(&g_lock);
+        if (!valid)
+        {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        char text[201]{};
+        if (detail != nullptr)
+        {
+            std::size_t i = 0;
+            for (; i + 1 < sizeof(text) && detail[i] != '\0'; ++i)
+            {
+                const char c = detail[i];
+                text[i] = (c >= 0x20 && c <= 0x7E) ? c : '?';
+            }
+            text[i] = '\0';
+        }
+        soulash::update_guard::RecordPluginStatus(id, status, text);
+        static const char* const names[] = {"", "active", "inactive on this build", "disabled", "degraded on this build"};
+        Log("plugin %s status: %s%s%s", id, names[status], text[0] != '\0' ? " - " : "", text);
+        return TRUE;
+    }
+}
+
 namespace soulash::plugin_services
 {
     bool Sha256OfHandle(HANDLE file, char (&hex)[65])
@@ -908,6 +950,18 @@ namespace soulash::plugin_services
     void Initialize()
     {
         InitOnceExecuteOnce(&g_gameInfoOnce, GatherGameInfo, nullptr, nullptr);
+    }
+
+    const char* GameExecutableSha256()
+    {
+        Initialize();
+        return g_gameHash;
+    }
+
+    const wchar_t* GameDirectory()
+    {
+        Initialize();
+        return g_gameDirectory;
     }
 
     const SoulashExtenderInterface* CreateInterface(
@@ -955,6 +1009,7 @@ namespace soulash::plugin_services
             api.installDetourAuto = InstallDetourAuto;
             api.findFunctionsReferencingString = FindFunctionsReferencingString;
             api.findRttiVtable = FindRttiVtable;
+            api.reportStatus = ReportStatus;
             ++g_pluginCount;
             result = &api;
         }

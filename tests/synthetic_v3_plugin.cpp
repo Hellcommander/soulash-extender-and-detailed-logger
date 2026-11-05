@@ -289,6 +289,14 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     {
         return FALSE;
     }
+    if (SOULASH_EXTENDER_HAS(extender, reportStatus))
+    {
+        WriteMarker(extender->reportStatus(extender->pluginHandle, SOULASH_PLUGIN_STATUS_ACTIVE, "synthetic ok")
+            ? "status:ok" : "status:FAILED");
+        WriteMarker(!extender->reportStatus(extender->pluginHandle, 9, "bad")
+                && !extender->reportStatus(0, SOULASH_PLUGIN_STATUS_ACTIVE, "bad handle")
+            ? "status-invalid:ok" : "status-invalid:FAILED");
+    }
     // Only the first plugin (by handle) runs the detour and anchor checks.
     if (extender->pluginHandle == 1)
     {

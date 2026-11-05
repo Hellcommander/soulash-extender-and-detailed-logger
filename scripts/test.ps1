@@ -140,7 +140,33 @@ $fallbackMarkerBase = Join-Path $outputDirectory ("debugger-fallback-" + [guid]:
 & $testsPath --debugger-fallback $proxyPath $fakeOriginalPath $moduleManifestPath $fallbackMarkerBase
 if ($LASTEXITCODE -ne 0) { throw 'Debugger fallback test failed.' }
 
+# TestBot snapshots: an independent decoder (.NET / GDI+) must read our PNG,
+# with rows flipped from glReadPixels' bottom-up order.
+$pngPath = Join-Path $outputDirectory 'testbot-png-check.png'
+& $testsPath --png $pngPath
+if ($LASTEXITCODE -ne 0) { throw 'Writing the test PNG failed.' }
+Add-Type -AssemblyName System.Drawing
+$bitmap = [System.Drawing.Bitmap]::new($pngPath)
+try {
+    $expected = @(
+        @(0, 0, 255, 0, 0), @(1, 0, 0, 255, 0), @(2, 0, 10, 20, 30),
+        @(0, 1, 0, 0, 255), @(1, 1, 255, 255, 255), @(2, 1, 0, 0, 0))
+    if ($bitmap.Width -ne 3 -or $bitmap.Height -ne 2) { throw "Test PNG decodes as $($bitmap.Width)x$($bitmap.Height), expected 3x2." }
+    foreach ($e in $expected) {
+        $c = $bitmap.GetPixel($e[0], $e[1])
+        if ($c.R -ne $e[2] -or $c.G -ne $e[3] -or $c.B -ne $e[4]) { throw "Test PNG pixel ($($e[0]),$($e[1])) is $($c.R),$($c.G),$($c.B)." }
+    }
+}
+finally { $bitmap.Dispose(); Remove-Item -LiteralPath $pngPath -Force }
+Write-Output 'PASS: TestBot PNG writer output decodes correctly (GDI+), rows flipped from OpenGL order'
+
 $pluginDirectoryPath = Join-Path $outputDirectory 'plugin-dir'
+# Update guard: start the plugin-directory test from a fresh record so unclean
+# test processes from earlier runs can never put it into safe mode.
+foreach ($guardFile in 'UpdateGuard.state', 'compat-report.txt') {
+    $guardPath = Join-Path $outputDirectory "SoulashExtender\$guardFile"
+    if (Test-Path -LiteralPath $guardPath) { Remove-Item -LiteralPath $guardPath -Force }
+}
 $pluginMarkerPath = Join-Path $outputDirectory ("plugin-dir-" + [guid]::NewGuid().ToString('N') + '.txt')
 try {
     & $testsPath --plugin-dir $proxyPath $fakeOriginalPath $pluginDirectoryPath $pluginMarkerPath

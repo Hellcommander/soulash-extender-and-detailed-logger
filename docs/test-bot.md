@@ -84,6 +84,8 @@ error names the line and the bot does not run.
 | `click <x> <y> [left\|right\|middle]` | move the mouse there (window pixels) and click |
 | `expect_bar_set <n>` | check `AbilityUser+0x68`; failure is counted (`PASS`/`FAIL line N` in the log) |
 | `log <text>` | marker line in the log |
+| `snapshot <name> [count] [interval_ms]` | capture `count` frames (1..20, default 1), `interval_ms` apart (0..60000, default 500), as `<name>_01.png`, `<name>_02.png`, ... in the run folder. `<name>`: 1..32 of `A-Z a-z 0-9 _ -`. The step ends when every frame is captured |
+| `mods_errors [max_errors]` | copy `<game>\logs\errors.log` from its **last** `Loading mods:` line into `results.txt` (the earlier core-only pass is skipped). With `max_errors`, more `[error]` lines than that is a counted FAIL |
 
 Keys: `a`-`z`, `0`-`9`, `f1`-`f12`, `space`, `enter`/`return`, `escape`/`esc`,
 `tab`, `backspace`, `up`/`down`/`left`/`right`, `lctrl`/`rctrl`/`lshift`/
@@ -99,10 +101,49 @@ pass-through `SDL_PollEvent` import hook on the game thread. `wait_world` and
 only when `VerifyAbilityBarLayout` accepts the build. On any other build those
 two commands fail and everything else still works.
 
+## Run folder and results
+
+Every run with `Enabled=1` creates
+`<game>\SoulashExtender\TestBot\<UTC time, e.g. 20261105-143000Z>\` and
+writes its path into `<game>\SoulashExtender\TestBot\latest.txt`. The run folder holds:
+
+* `results.txt`: every TestBot log line with milliseconds since the run
+  started, one `step N/M: line L <command>` line as each step begins,
+  `PASS`/`FAIL` lines, blocked Steam calls, `errors.log` extracts and the final
+  `script finished ... -> PASS|FAIL` summary;
+* the snapshot PNGs (24-bit RGB, full drawable size, including the UI).
+
+Snapshots hook the game's `SDL2.dll!SDL_GL_SwapWindow` import, but only when
+the script contains a `snapshot` step. Just before a frame is presented, the
+hook reads the finished back buffer with `glReadPixels`. It saves and
+restores every piece of OpenGL state it touches (pack alignment, row length,
+skips, read buffer, read framebuffer and pack buffer bindings). PNG encoding
+and writing run on a separate thread, compressed with the game's own
+`zlib1.dll` when it is loaded. At most 3 frames are written at a time, and a
+4K frame costs about 25 MB of memory while it is being written. If no frame is
+presented for 5 s, the step fails rather than hangs.
+
+`mods_errors` reads the newest 4 MiB of `errors.log` and copies at most 3000
+lines. Run it after `wait_world`. Before that, the game may still be in its
+first, core-only loading pass.
+
+Example (visual check of an AoE ability on the bar):
+
+```
+wait_world
+key 3                      # select the ability in bar slot 3
+click 960 540              # target a tile (window pixels)
+snapshot storm 8 150       # 8 frames, 150 ms apart
+wait 3000
+snapshot storm_after 1
+mods_errors
+```
+
 ## Not verified yet
 
-Everything above is static analysis plus synthetic tests. The first live run
-should confirm: `achievement/stat blocking armed`, an
+Everything above is static analysis plus synthetic tests. (The PNG writer is
+checked by decoding its output with .NET. The OpenGL capture itself has never
+run against the game.) The first live run should confirm: `achievement/stat blocking armed`, an
 `achievements+stats BLOCKED on STEAMUSERSTATS_INTERFACE_VERSION013` line
 (which appears when the game first asks for the interface), and the example
 script ending with `-> PASS`.

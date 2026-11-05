@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -168,7 +169,42 @@ typedef struct SoulashExtenderInterface
         unsigned int pluginHandle,
         const char* className,
         void** vtable);
+
+    /* ---- Added after the first v3 release (2026-11-05). Optional: present
+     * only when structureSize >= SOULASH_EXTENDER_INTERFACE_V3_BASE_SIZE +
+     * sizeof(void*); use SOULASH_EXTENDER_HAS(extender, reportStatus). ----
+     *
+     * reportStatus: tells the update guard whether this plugin is working on
+     * the running game build. It goes into SoulashExtender\compat-report.txt,
+     * rewritten at every start, so a game update shows at a glance which
+     * plugins still work. status is one of SOULASH_PLUGIN_STATUS_*; detail is a
+     * short ASCII reason (truncated to 200 characters). May be called more than
+     * once; the last call wins. */
+    BOOL (WINAPI *reportStatus)(
+        unsigned int pluginHandle,
+        unsigned int status,
+        const char* detail);
 } SoulashExtenderInterface;
+
+enum
+{
+    SOULASH_PLUGIN_STATUS_ACTIVE = 1,      /* hooks installed, working on this build */
+    SOULASH_PLUGIN_STATUS_INACTIVE = 2,    /* does not support this game build; nothing hooked */
+    SOULASH_PLUGIN_STATUS_DISABLED = 3,    /* turned off by its own configuration */
+    SOULASH_PLUGIN_STATUS_DEGRADED = 4     /* running, but some features are off on this build */
+};
+
+/* Size of the interface as first released. Plugins should require only this
+ * much (not sizeof(SoulashExtenderInterface)), so a plugin built against a
+ * newer header still loads under an older installed proxy. */
+#define SOULASH_EXTENDER_INTERFACE_V3_BASE_SIZE \
+    ((unsigned int)offsetof(SoulashExtenderInterface, reportStatus))
+
+/* True when the running extender provides `member` (a field added after the
+ * first v3 release) and it is non-NULL. */
+#define SOULASH_EXTENDER_HAS(extender, member) \
+    ((extender)->structureSize >= offsetof(SoulashExtenderInterface, member) + sizeof((extender)->member) \
+        && (extender)->member != NULL)
 
 typedef BOOL (WINAPI *SoulashExtenderPluginLoadFn)(const SoulashExtenderInterface* extender);
 

@@ -30,17 +30,26 @@
 // the IAT entry for SDL2.dll!SDL_PollEvent (pass-through, used as the bot's
 // per-frame clock on the game thread), and DrawActionBar vtable slot 1 (pass-
 // through; world detection and bar-set reads, only on builds that pass
-// VerifyAbilityBarLayout).
+// VerifyAbilityBarLayout), and, only when the script has snapshot steps, the
+// IAT entry for SDL2.dll!SDL_GL_SwapWindow (glReadPixels of the finished back
+// buffer, GL state saved/restored; PNGs written on a worker thread).
+//
+// Output: <game>\SoulashExtender\TestBot\<UTC run id>\results.txt + snapshot
+// PNGs; <game>\SoulashExtender\TestBot\latest.txt names the newest run.
 #include "plugin_api.h"
 #include "../common/ability_bar_layout.hpp"
+#include "../common/plugin_status.hpp"
+#include "../common/png_writer.hpp"
 #include "../common/test_bot_script.hpp"
 
 #include <windows.h>
 
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -115,6 +124,8 @@ namespace
     using UpdateFn = int (*)(void* self, float dt);
 
     const SoulashExtenderInterface* g_extender = nullptr;
+    soulash_plugins::StartupReason g_startupReason;
+    bool g_enabled = false;
     bool g_stopOnFailure = false;
     bool g_logBlockedCalls = true;
 
@@ -161,6 +172,37 @@ namespace
     unsigned int g_failures = 0;
     unsigned int g_checks = 0;
     unsigned long long g_startedMs = 0;
+    std::size_t g_announcedStep = static_cast<std::size_t>(-1);
+
+    // Run folder <game>\SoulashExtender\TestBot\<UTC run id>\ with results.txt
+    // (every TestBot log line, step starts, errors.log extracts) and snapshots.
+    wchar_t g_runDirectory[MAX_PATH * 2] = L"";
+    HANDLE g_results = INVALID_HANDLE_VALUE;
+    SRWLOCK g_resultsLock = SRWLOCK_INIT;
+    unsigned long long g_resultsStartMs = 0;
+
+    void ResultRaw(const char* data, std::size_t size)
+    {
+        if (g_results == INVALID_HANDLE_VALUE || size == 0)
+        {
+            return;
+        }
+        AcquireSRWLockExclusive(&g_resultsLock);
+        DWORD written = 0;
+        WriteFile(g_results, data, static_cast<DWORD>(size), &written, nullptr);
+        ReleaseSRWLockExclusive(&g_resultsLock);
+    }
+
+    void ResultLine(const char* line)
+    {
+        if (g_results == INVALID_HANDLE_VALUE)
+        {
+            return;
+        }
+        char text[640];
+        _snprintf_s(text, sizeof(text), _TRUNCATE, "[%9llu ms] %s\r\n", GetTickCount64() - g_resultsStartMs, line);
+        ResultRaw(text, std::strlen(text));
+    }
 
     void Log(const char* format, ...)
     {
@@ -169,6 +211,8 @@ namespace
         va_start(args, format);
         _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args);
         va_end(args);
+        g_startupReason.Capture(line);
+        ResultLine(line);
         char prefixed[512];
         _snprintf_s(prefixed, sizeof(prefixed), _TRUNCATE, "TestBot: %s", line);
         g_extender->log(prefixed);
@@ -750,6 +794,476 @@ namespace
     }
 
     // ===========================================================================
+    // Run folder, screen capture (snapshot) and errors.log extraction (mods_errors)
+    // ===========================================================================
+    bool OpenRunFolder()
+    {
+        SYSTEMTIME now{};
+        GetSystemTime(&now);
+        wchar_t base[MAX_PATH * 2];
+        swprintf_s(base, L"%sSoulashExtender", g_extender->gameDirectory);
+        CreateDirectoryW(base, nullptr);
+        wcscat_s(base, L"\\TestBot");
+        CreateDirectoryW(base, nullptr);
+        for (int attempt = 0; attempt < 10; ++attempt)
+        {
+            swprintf_s(g_runDirectory, attempt == 0 ? L"%s\\%04u%02u%02u-%02u%02u%02uZ" : L"%s\\%04u%02u%02u-%02u%02u%02uZ-%d",
+                base, now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, attempt + 1);
+            if (CreateDirectoryW(g_runDirectory, nullptr))
+            {
+                wchar_t path[MAX_PATH * 2];
+                swprintf_s(path, L"%s\\results.txt", g_runDirectory);
+                g_resultsStartMs = GetTickCount64();
+                g_results = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                // latest.txt: where the newest run is, for whoever reads the results.
+                swprintf_s(path, L"%s\\latest.txt", base);
+                HANDLE latest = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (latest != INVALID_HANDLE_VALUE)
+                {
+                    char text[MAX_PATH * 4];
+                    const int length = _snprintf_s(text, sizeof(text), _TRUNCATE, "%S\r\n", g_runDirectory);
+                    DWORD written = 0;
+                    if (length > 0)
+                    {
+                        WriteFile(latest, text, static_cast<DWORD>(length), &written, nullptr);
+                    }
+                    CloseHandle(latest);
+                }
+                Log("run folder %S (results.txt%s)", g_runDirectory,
+                    g_results == INVALID_HANDLE_VALUE ? " could NOT be created" : "");
+                Log("game exe sha256 %s", g_extender->gameExecutableSha256 != nullptr ? g_extender->gameExecutableSha256 : "unknown");
+                return true;
+            }
+            if (GetLastError() != ERROR_ALREADY_EXISTS)
+            {
+                break;
+            }
+        }
+        Log("cannot create a run folder under %S (error %lu); no results file, snapshots disabled", base, GetLastError());
+        g_runDirectory[0] = L'\0';
+        return false;
+    }
+
+    // ---- snapshot: SDL_GL_SwapWindow import hook + glReadPixels of the back buffer
+    using SdlGlSwapWindowFn = void (*)(void* window);
+    using SdlGlGetDrawableSizeFn = void (*)(void* window, int* width, int* height);
+    using GlGetIntegervFn = void (WINAPI*)(unsigned int name, int* data);
+    using GlPixelStoreiFn = void (WINAPI*)(unsigned int name, int value);
+    using GlReadBufferFn = void (WINAPI*)(unsigned int mode);
+    using GlReadPixelsFn = void (WINAPI*)(int x, int y, int width, int height, unsigned int format, unsigned int type, void* data);
+    using GlGetErrorFn = unsigned int (WINAPI*)();
+    using GlBindFn = void (WINAPI*)(unsigned int target, unsigned int name);
+    using WglGetProcAddressFn = PROC (WINAPI*)(LPCSTR name);
+    using WglGetCurrentContextFn = HGLRC (WINAPI*)();
+
+    constexpr unsigned int GlPackRowLength = 0x0D02, GlPackSkipRows = 0x0D03, GlPackSkipPixels = 0x0D04,
+        GlPackAlignment = 0x0D05, GlReadBufferName = 0x0C02, GlBack = 0x0405, GlRgb = 0x1907, GlUnsignedByte = 0x1401,
+        GlReadFramebuffer = 0x8CA8, GlReadFramebufferBinding = 0x8CAA, GlPixelPackBuffer = 0x88EB,
+        GlPixelPackBufferBinding = 0x88ED;
+    constexpr long MaxWritersInFlight = 3;
+    constexpr unsigned long long CaptureStallMs = 5000;
+
+    SdlGlSwapWindowFn g_originalSwapWindow = nullptr;
+    SdlGlGetDrawableSizeFn g_getDrawableSize = nullptr;
+    GlGetIntegervFn g_glGetIntegerv = nullptr;
+    GlPixelStoreiFn g_glPixelStorei = nullptr;
+    GlReadBufferFn g_glReadBuffer = nullptr;
+    GlReadPixelsFn g_glReadPixels = nullptr;
+    GlGetErrorFn g_glGetError = nullptr;
+    WglGetProcAddressFn g_wglGetProcAddress = nullptr;
+    WglGetCurrentContextFn g_wglGetCurrentContext = nullptr;
+    GlBindFn g_glBindFramebuffer = nullptr;
+    GlBindFn g_glBindBuffer = nullptr;
+    bool g_glExtensionsResolved = false;
+    soulash_plugins::png::Compress2Fn g_compress2 = nullptr;
+    bool g_captureReady = false;
+
+    // Shared between the script runner and the swap hook (normally the same thread).
+    std::atomic<bool> g_captureActive{false};
+    std::atomic<int> g_captureDone{0};
+    std::atomic<bool> g_captureFailed{false};
+    std::atomic<unsigned long long> g_captureNextDue{0};
+    std::atomic<unsigned long long> g_captureLastProgress{0};
+    std::atomic<long> g_writersInFlight{0};
+    int g_captureTotal = 0;
+    unsigned long long g_captureInterval = 0;
+    int g_captureLine = 0;
+    char g_captureName[testbot::MaxSnapshotNameLength + 1] = "";
+    char g_captureError[160] = "";
+
+    struct SnapshotJob
+    {
+        std::vector<unsigned char> pixels;
+        int width = 0;
+        int height = 0;
+        int line = 0;
+        wchar_t path[MAX_PATH * 2]{};
+    };
+
+    DWORD WINAPI SnapshotWriter(void* parameter)
+    {
+        SnapshotJob* job = static_cast<SnapshotJob*>(parameter);
+        std::vector<unsigned char> png;
+        try
+        {
+            png = soulash_plugins::png::EncodeRgb(job->pixels.data(), job->width, job->height, true, g_compress2, 1);
+        }
+        catch (...)
+        {
+            png.clear();
+        }
+        bool ok = false;
+        if (!png.empty())
+        {
+            HANDLE file = CreateFileW(job->path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (file != INVALID_HANDLE_VALUE)
+            {
+                DWORD written = 0;
+                ok = WriteFile(file, png.data(), static_cast<DWORD>(png.size()), &written, nullptr) != FALSE
+                    && written == png.size();
+                CloseHandle(file);
+            }
+        }
+        const wchar_t* name = wcsrchr(job->path, L'\\');
+        if (ok)
+        {
+            Log("snapshot line %d: wrote %S (%dx%d, %zu bytes)", job->line, name != nullptr ? name + 1 : job->path,
+                job->width, job->height, png.size());
+        }
+        else
+        {
+            Log("snapshot line %d: FAILED to write %S (error %lu)", job->line, job->path, GetLastError());
+        }
+        delete job;
+        g_writersInFlight.fetch_sub(1);
+        return 0;
+    }
+
+    void CaptureFailed(const char* message)
+    {
+        strcpy_s(g_captureError, message);
+        g_captureFailed.store(true);
+    }
+
+    // All GL calls in one SEH-guarded function (no C++ objects in here). Saves
+    // and restores every bit of state it touches; the game never notices.
+    bool GuardedReadBackBuffer(int width, int height, unsigned char* pixels, unsigned int* glError, bool* bindingsOk)
+    {
+        __try
+        {
+            for (int i = 0; i < 16 && g_glGetError() != 0; ++i)
+            {
+            }
+            int alignment = 4, rowLength = 0, skipRows = 0, skipPixels = 0, readBuffer = 0, readFramebuffer = 0, packBuffer = 0;
+            g_glGetIntegerv(GlPackAlignment, &alignment);
+            g_glGetIntegerv(GlPackRowLength, &rowLength);
+            g_glGetIntegerv(GlPackSkipRows, &skipRows);
+            g_glGetIntegerv(GlPackSkipPixels, &skipPixels);
+            g_glGetIntegerv(GlReadBufferName, &readBuffer);
+            g_glGetIntegerv(GlReadFramebufferBinding, &readFramebuffer);   // INVALID_ENUM before GL 3: stays 0
+            g_glGetIntegerv(GlPixelPackBufferBinding, &packBuffer);        // INVALID_ENUM before GL 2.1: stays 0
+            for (int i = 0; i < 16 && g_glGetError() != 0; ++i)
+            {
+            }
+            *bindingsOk = (readFramebuffer == 0 || g_glBindFramebuffer != nullptr)
+                && (packBuffer == 0 || g_glBindBuffer != nullptr);
+            if (!*bindingsOk)
+            {
+                return true;
+            }
+            if (readFramebuffer != 0)
+            {
+                g_glBindFramebuffer(GlReadFramebuffer, 0);
+            }
+            if (packBuffer != 0)
+            {
+                g_glBindBuffer(GlPixelPackBuffer, 0);
+            }
+            g_glPixelStorei(GlPackAlignment, 1);
+            g_glPixelStorei(GlPackRowLength, 0);
+            g_glPixelStorei(GlPackSkipRows, 0);
+            g_glPixelStorei(GlPackSkipPixels, 0);
+            g_glReadBuffer(GlBack);
+            g_glReadPixels(0, 0, width, height, GlRgb, GlUnsignedByte, pixels);
+            *glError = g_glGetError();
+            g_glReadBuffer(static_cast<unsigned int>(readBuffer));
+            g_glPixelStorei(GlPackAlignment, alignment);
+            g_glPixelStorei(GlPackRowLength, rowLength);
+            g_glPixelStorei(GlPackSkipRows, skipRows);
+            g_glPixelStorei(GlPackSkipPixels, skipPixels);
+            if (packBuffer != 0)
+            {
+                g_glBindBuffer(GlPixelPackBuffer, static_cast<unsigned int>(packBuffer));
+            }
+            if (readFramebuffer != 0)
+            {
+                g_glBindFramebuffer(GlReadFramebuffer, static_cast<unsigned int>(readFramebuffer));
+            }
+            for (int i = 0; i < 16 && g_glGetError() != 0; ++i)
+            {
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    GlBindFn ResolveGlExtension(const char* name)
+    {
+        const PROC proc = g_wglGetProcAddress(name);
+        const auto value = reinterpret_cast<std::intptr_t>(proc);
+        return value >= -1 && value <= 3 ? nullptr : reinterpret_cast<GlBindFn>(proc);
+    }
+
+    void CaptureFrame(void* window)
+    {
+        const unsigned long long now = NowMs();
+        if (g_wglGetCurrentContext() == nullptr)
+        {
+            CaptureFailed("no current OpenGL context on the thread that presents frames");
+            return;
+        }
+        if (!g_glExtensionsResolved)
+        {
+            g_glExtensionsResolved = true;
+            g_glBindFramebuffer = ResolveGlExtension("glBindFramebuffer");
+            g_glBindBuffer = ResolveGlExtension("glBindBuffer");
+        }
+        int width = 0, height = 0;
+        g_getDrawableSize(window, &width, &height);
+        if (width <= 0 || height <= 0 || width > soulash_plugins::png::MaxDimension
+            || height > soulash_plugins::png::MaxDimension)
+        {
+            char message[96];
+            _snprintf_s(message, sizeof(message), _TRUNCATE, "unusable drawable size %dx%d", width, height);
+            CaptureFailed(message);
+            return;
+        }
+        SnapshotJob* job = new (std::nothrow) SnapshotJob;
+        if (job == nullptr)
+        {
+            CaptureFailed("out of memory");
+            return;
+        }
+        try
+        {
+            job->pixels.resize(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
+        }
+        catch (...)
+        {
+            delete job;
+            CaptureFailed("out of memory for the frame buffer copy");
+            return;
+        }
+        unsigned int glError = 0;
+        bool bindingsOk = true;
+        if (!GuardedReadBackBuffer(width, height, job->pixels.data(), &glError, &bindingsOk))
+        {
+            delete job;
+            g_captureReady = false;
+            CaptureFailed("reading the frame faulted; screen capture switched off for this session");
+            return;
+        }
+        if (!bindingsOk || glError != 0)
+        {
+            delete job;
+            char message[128];
+            _snprintf_s(message, sizeof(message), _TRUNCATE, bindingsOk
+                ? "glReadPixels reported GL error 0x%X" : "a framebuffer/pack buffer is bound and cannot be unbound (no GL 3 entry points)", glError);
+            CaptureFailed(message);
+            return;
+        }
+        const int index = g_captureDone.load() + 1;
+        job->width = width;
+        job->height = height;
+        job->line = g_captureLine;
+        swprintf_s(job->path, L"%s\\%S_%02d.png", g_runDirectory, g_captureName, index);
+        g_writersInFlight.fetch_add(1);
+        HANDLE thread = CreateThread(nullptr, 0, SnapshotWriter, job, 0, nullptr);
+        if (thread != nullptr)
+        {
+            CloseHandle(thread);
+        }
+        else
+        {
+            SnapshotWriter(job);   // no thread: write it here (one slow frame)
+        }
+        g_captureDone.store(index);
+        g_captureNextDue.store(now + g_captureInterval);
+        g_captureLastProgress.store(now);
+    }
+
+    void SwapWindowHook(void* window)
+    {
+        if (g_captureActive.load() && g_captureReady && !g_captureFailed.load() && g_captureDone.load() < g_captureTotal
+            && NowMs() >= g_captureNextDue.load() && g_writersInFlight.load() < MaxWritersInFlight)
+        {
+            CaptureFrame(window);
+        }
+        g_originalSwapWindow(window);
+    }
+
+    bool ScriptHasSnapshots()
+    {
+        for (const testbot::Step& step : g_steps)
+        {
+            if (step.op == testbot::Op::Snapshot)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void InstallScreenCapture(unsigned char* base)
+    {
+        const HMODULE sdl = GetModuleHandleW(L"SDL2.dll");
+        const HMODULE gl = GetModuleHandleW(L"opengl32.dll");
+        if (g_runDirectory[0] == L'\0' || sdl == nullptr || gl == nullptr)
+        {
+            Log("screen capture unavailable (%s); snapshot steps will FAIL",
+                g_runDirectory[0] == L'\0' ? "no run folder" : (sdl == nullptr ? "SDL2.dll not loaded" : "opengl32.dll not loaded"));
+            return;
+        }
+        g_getDrawableSize = reinterpret_cast<SdlGlGetDrawableSizeFn>(GetProcAddress(sdl, "SDL_GL_GetDrawableSize"));
+        g_glGetIntegerv = reinterpret_cast<GlGetIntegervFn>(GetProcAddress(gl, "glGetIntegerv"));
+        g_glPixelStorei = reinterpret_cast<GlPixelStoreiFn>(GetProcAddress(gl, "glPixelStorei"));
+        g_glReadBuffer = reinterpret_cast<GlReadBufferFn>(GetProcAddress(gl, "glReadBuffer"));
+        g_glReadPixels = reinterpret_cast<GlReadPixelsFn>(GetProcAddress(gl, "glReadPixels"));
+        g_glGetError = reinterpret_cast<GlGetErrorFn>(GetProcAddress(gl, "glGetError"));
+        g_wglGetProcAddress = reinterpret_cast<WglGetProcAddressFn>(GetProcAddress(gl, "wglGetProcAddress"));
+        g_wglGetCurrentContext = reinterpret_cast<WglGetCurrentContextFn>(GetProcAddress(gl, "wglGetCurrentContext"));
+        if (g_getDrawableSize == nullptr || g_glGetIntegerv == nullptr || g_glPixelStorei == nullptr
+            || g_glReadBuffer == nullptr || g_glReadPixels == nullptr || g_glGetError == nullptr
+            || g_wglGetProcAddress == nullptr || g_wglGetCurrentContext == nullptr)
+        {
+            Log("screen capture unavailable (SDL/OpenGL functions missing); snapshot steps will FAIL");
+            return;
+        }
+        const HMODULE zlib = GetModuleHandleW(L"zlib1.dll");
+        g_compress2 = zlib == nullptr ? nullptr
+                                      : reinterpret_cast<soulash_plugins::png::Compress2Fn>(GetProcAddress(zlib, "compress2"));
+        void** slot = GuardedFindImportSlot(base, "SDL2.dll", "SDL_GL_SwapWindow");
+        if (slot == nullptr || *slot == nullptr)
+        {
+            Log("screen capture unavailable (no SDL2.dll!SDL_GL_SwapWindow import); snapshot steps will FAIL");
+            return;
+        }
+        g_originalSwapWindow = reinterpret_cast<SdlGlSwapWindowFn>(*slot);
+        void* hook = reinterpret_cast<void*>(&SwapWindowHook);
+        if (!g_extender->patchMemory(g_extender->pluginHandle, slot, &hook, sizeof(hook)))
+        {
+            g_originalSwapWindow = nullptr;
+            Log("screen capture unavailable (patching the SDL_GL_SwapWindow import failed); snapshot steps will FAIL");
+            return;
+        }
+        g_captureReady = true;
+        Log("screen capture ready: SDL_GL_SwapWindow import hooked (slot %p, previous %p), PNG %s",
+            static_cast<void*>(slot), reinterpret_cast<void*>(g_originalSwapWindow),
+            g_compress2 != nullptr ? "compressed with the game's zlib1.dll" : "uncompressed (zlib1.dll not loaded)");
+    }
+
+    // ---- mods_errors: <game>\logs\errors.log from its last "Loading mods:" line
+    constexpr std::size_t MaxErrorsLogBytes = 4 * 1024 * 1024;
+    constexpr unsigned MaxCopiedLogLines = 3000;
+
+    // Returns false with a message when the log cannot be read.
+    bool ExtractModsErrors(const testbot::Step& step, unsigned& errors, unsigned& warnings, char (&message)[160])
+    {
+        wchar_t path[MAX_PATH * 2];
+        swprintf_s(path, L"%slogs\\errors.log", g_extender->gameDirectory);
+        HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            _snprintf_s(message, sizeof(message), _TRUNCATE, "cannot open logs\\errors.log (error %lu)", GetLastError());
+            return false;
+        }
+        LARGE_INTEGER size{};
+        std::string text;
+        bool ok = GetFileSizeEx(file, &size) != FALSE && size.QuadPart >= 0;
+        if (ok)
+        {
+            const long long start = size.QuadPart > static_cast<long long>(MaxErrorsLogBytes)
+                ? size.QuadPart - static_cast<long long>(MaxErrorsLogBytes) : 0;
+            LARGE_INTEGER offset{};
+            offset.QuadPart = start;
+            text.resize(static_cast<std::size_t>(size.QuadPart - start));
+            DWORD read = 0;
+            ok = SetFilePointerEx(file, offset, nullptr, FILE_BEGIN) != FALSE
+                && (text.empty() || ReadFile(file, text.data(), static_cast<DWORD>(text.size()), &read, nullptr) != FALSE);
+            text.resize(read);
+        }
+        CloseHandle(file);
+        if (!ok)
+        {
+            _snprintf_s(message, sizeof(message), _TRUNCATE, "cannot read logs\\errors.log");
+            return false;
+        }
+        const std::size_t marker = text.rfind("Loading mods:");
+        std::size_t begin = 0;
+        if (marker != std::string::npos)
+        {
+            const std::size_t lineStart = text.rfind('\n', marker);
+            begin = lineStart == std::string::npos ? 0 : lineStart + 1;
+        }
+        std::string block;
+        char header[200];
+        _snprintf_s(header, sizeof(header), _TRUNCATE, "---- line %d: logs\\errors.log, %s ----\r\n", step.line,
+            marker != std::string::npos ? "from its last \"Loading mods:\" line" : "no \"Loading mods:\" line, whole file");
+        block += header;
+        errors = 0;
+        warnings = 0;
+        unsigned copied = 0, total = 0;
+        std::size_t position = begin;
+        while (position < text.size())
+        {
+            std::size_t end = text.find('\n', position);
+            if (end == std::string::npos)
+            {
+                end = text.size();
+            }
+            std::string_view line(text.data() + position, end - position);
+            position = end + 1;
+            if (!line.empty() && line.back() == '\r')
+            {
+                line.remove_suffix(1);
+            }
+            if (line.empty())
+            {
+                continue;
+            }
+            ++total;
+            if (line.find("[error]") != std::string_view::npos)
+            {
+                ++errors;
+            }
+            else if (line.find("[warning]") != std::string_view::npos)
+            {
+                ++warnings;
+            }
+            if (copied < MaxCopiedLogLines)
+            {
+                ++copied;
+                block += "  | ";
+                block.append(line.data(), line.size());
+                block += "\r\n";
+            }
+        }
+        if (copied < total)
+        {
+            block += "  | ... (" + std::to_string(total - copied) + " more line(s) not copied)\r\n";
+        }
+        block += "---- end of errors.log extract ----\r\n";
+        ResultRaw(block.data(), block.size());
+        _snprintf_s(message, sizeof(message), _TRUNCATE, "%u error line(s), %u warning line(s), %u line(s) in the pass",
+            errors, warnings, total);
+        return true;
+    }
+
+    // ===========================================================================
     // Script runner
     // ===========================================================================
     const char* OpName(testbot::Op op)
@@ -766,6 +1280,8 @@ namespace
         case testbot::Op::Click: return "click";
         case testbot::Op::ExpectBarSet: return "expect_bar_set";
         case testbot::Op::Log: return "log";
+        case testbot::Op::Snapshot: return "snapshot";
+        case testbot::Op::ModsErrors: return "mods_errors";
         }
         return "?";
     }
@@ -927,6 +1443,80 @@ namespace
             Log("mark line %d: %s", step.line, step.text.c_str());
             NextStep();
             return true;
+
+        case testbot::Op::Snapshot:
+            if (g_phase == 0)
+            {
+                if (!g_captureReady)
+                {
+                    Fail(step, "screen capture unavailable (see the 'screen capture' log line)", false);
+                    return true;
+                }
+                strcpy_s(g_captureName, step.text.c_str());
+                g_captureLine = step.line;
+                g_captureTotal = static_cast<int>(step.a);
+                g_captureInterval = static_cast<unsigned long long>(step.b);
+                g_captureDone.store(0);
+                g_captureFailed.store(false);
+                g_captureNextDue.store(now);
+                g_captureLastProgress.store(now);
+                g_captureActive.store(true);
+                g_phase = 1;
+                return false;
+            }
+            if (g_captureFailed.load())
+            {
+                g_captureActive.store(false);
+                Fail(step, g_captureError, false);
+                return true;
+            }
+            if (g_captureDone.load() >= g_captureTotal)
+            {
+                g_captureActive.store(false);
+                Log("line %d: snapshot %s: %d frame(s) captured", step.line, g_captureName, g_captureTotal);
+                NextStep();
+                return true;
+            }
+            if (now > g_captureLastProgress.load() + g_captureInterval + CaptureStallMs)
+            {
+                g_captureActive.store(false);
+                Fail(step, "no frame was presented for 5 s (SDL_GL_SwapWindow hook not reached?)", false);
+                return true;
+            }
+            return false;
+
+        case testbot::Op::ModsErrors:
+        {
+            unsigned errors = 0, warnings = 0;
+            char message[160];
+            if (!ExtractModsErrors(step, errors, warnings, message))
+            {
+                if (step.a >= 0)
+                {
+                    ++g_checks;
+                }
+                Fail(step, message, false);
+                return true;
+            }
+            if (step.a < 0)
+            {
+                Log("line %d: errors.log last mod pass: %s (copied to results.txt)", step.line, message);
+                NextStep();
+                return true;
+            }
+            ++g_checks;
+            if (errors > static_cast<unsigned long long>(step.a))
+            {
+                char failure[200];
+                _snprintf_s(failure, sizeof(failure), _TRUNCATE, "errors.log last mod pass: %s; at most %lld allowed",
+                    message, step.a);
+                Fail(step, failure, false);
+                return true;
+            }
+            Log("PASS line %d: errors.log last mod pass: %s (at most %lld errors allowed)", step.line, message, step.a);
+            NextStep();
+            return true;
+        }
         }
         NextStep();
         return true;
@@ -946,6 +1536,14 @@ namespace
             {
                 Finish("finished");
                 return;
+            }
+            if (g_announcedStep != g_stepIndex)
+            {
+                g_announcedStep = g_stepIndex;
+                char line[96];
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "step %zu/%zu: line %d %s", g_stepIndex + 1, g_steps.size(),
+                    g_steps[g_stepIndex].line, OpName(g_steps[g_stepIndex].op));
+                ResultLine(line);
             }
             if (!RunStep(g_steps[g_stepIndex], now))
             {
@@ -1114,6 +1712,8 @@ namespace
                 iniPath);
             return;
         }
+        g_enabled = true;
+        OpenRunFolder();
         g_stopOnFailure = GetPrivateProfileIntW(L"TestBot", L"StopOnFailure", 0, iniPath) != 0;
         g_logBlockedCalls = GetPrivateProfileIntW(L"TestBot", L"LogBlockedCalls", 1, iniPath) != 0;
         InitializeCriticalSection(&g_patchLock);
@@ -1154,6 +1754,10 @@ namespace
         {
             return;
         }
+        if (ScriptHasSnapshots())
+        {
+            InstallScreenCapture(base);
+        }
         g_startedMs = NowMs();
         g_running = true;
         Log("bot ACTIVE: %zu step(s), stop on failure=%d; achievements and stats are blocked for this session",
@@ -1165,7 +1769,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     const SoulashExtenderInterface* extender)
 {
     if (extender == nullptr
-        || extender->structureSize < sizeof(SoulashExtenderInterface)
+        || extender->structureSize < SOULASH_EXTENDER_INTERFACE_V3_BASE_SIZE
         || extender->interfaceVersion != SOULASH_EXTENDER_INTERFACE_VERSION
         || extender->pluginId == nullptr
         || extender->pluginDirectory == nullptr
@@ -1174,7 +1778,30 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
         return FALSE;
     }
     g_extender = extender;
+    g_startupReason.Begin();
     Start();
+    g_startupReason.End();
+    if (!g_enabled)
+    {
+        soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_DISABLED, "Enabled=0 in TestBot.ini");
+    }
+    else if (!g_blockingReady)
+    {
+        // Fail closed: nothing runs, and the report says why.
+        soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_INACTIVE, g_startupReason.Last());
+    }
+    else if (!g_running)
+    {
+        char detail[200];
+        _snprintf_s(detail, sizeof(detail), _TRUNCATE, "achievements blocked, bot NOT running: %s",
+            g_startupReason.Last());
+        soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_DEGRADED, detail);
+    }
+    else
+    {
+        soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_ACTIVE,
+            "achievements and stats blocked; script running");
+    }
     return TRUE;
 }
 

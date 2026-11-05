@@ -248,12 +248,18 @@ if ($LASTEXITCODE -ne 0) { throw 'Compiling opt-in module runtime failed.' }
     "/Fo$proxyManifestObjectPath" (Join-Path $sourceDirectory 'manifest.cpp')
 if ($LASTEXITCODE -ne 0) { throw 'Compiling proxy manifest parser failed.' }
 
+$proxyUpdateGuardObjectPath = Join-Path $outputDirectory 'proxy_update_guard.obj'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /I $includeDirectory /c `
+    "/Fo$proxyUpdateGuardObjectPath" (Join-Path $sourceDirectory 'update_guard.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling the update guard failed.' }
+
 & link.exe /nologo /dll /machine:x64 `
     "/def:$sourceDirectory\bugsplat_proxy.def" `
     "/implib:$proxyImportLibraryPath" "/out:$proxyPath" `
     $proxyObjectPath $proxyDiagnosticsObjectPath `
     $proxyModuleRuntimeObjectPath $proxyManifestObjectPath `
     $proxyPluginServicesObjectPath $proxyX64ObjectPath $proxySha256ObjectPath `
+    $proxyUpdateGuardObjectPath `
     $sandboxObjectPath $conditionsObjectPath $effectsObjectPath @luaObjects bcrypt.lib
 if ($LASTEXITCODE -ne 0) { throw 'Building BugSplat64.dll proxy failed.' }
 

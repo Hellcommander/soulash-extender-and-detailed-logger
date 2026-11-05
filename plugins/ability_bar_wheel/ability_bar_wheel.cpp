@@ -31,6 +31,7 @@
 // it. On a build where anything differs it logs and stays idle.
 #include "plugin_api.h"
 #include "../common/ability_bar_layout.hpp"
+#include "../common/plugin_status.hpp"
 
 #include <windows.h>
 
@@ -99,6 +100,7 @@ namespace
     using UpdateFn = int (*)(void* self, float dt);
 
     const SoulashExtenderInterface* g_extender = nullptr;
+    soulash_plugins::StartupReason g_startupReason;
     bool g_swallowWheel = true;
     bool g_triggerOverBar = false;      // Trigger=overbar; otherwise Trigger=modifier
     int g_modifierMask = SdlModCtrl;    // Modifier=ctrl|shift|alt
@@ -136,6 +138,7 @@ namespace
         va_start(args, format);
         _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args);
         va_end(args);
+        g_startupReason.Capture(line);
         char prefixed[512];
         _snprintf_s(prefixed, sizeof(prefixed), _TRUNCATE, "AbilityBarWheel: %s", line);
         g_extender->log(prefixed);
@@ -324,6 +327,8 @@ namespace
             {
                 g_faulted = true;
                 Log("memory read faulted in the event hook (0x%08lX); disabled", GetExceptionCode());
+                soulash_plugins::ReportStatus(g_extender, SOULASH_PLUGIN_STATUS_DEGRADED,
+                    "memory read faulted in the event hook mid-game; wheel switching stopped");
             }
             return false;
         }
@@ -401,6 +406,8 @@ namespace
             {
                 g_faulted = true;
                 Log("memory access faulted while switching (0x%08lX); disabled", GetExceptionCode());
+                soulash_plugins::ReportStatus(g_extender, SOULASH_PLUGIN_STATUS_DEGRADED,
+                    "memory access faulted while switching sets mid-game; wheel switching stopped");
             }
         }
     }
@@ -641,7 +648,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     const SoulashExtenderInterface* extender)
 {
     if (extender == nullptr
-        || extender->structureSize < sizeof(SoulashExtenderInterface)
+        || extender->structureSize < SOULASH_EXTENDER_INTERFACE_V3_BASE_SIZE
         || extender->interfaceVersion != SOULASH_EXTENDER_INTERFACE_VERSION
         || extender->pluginId == nullptr
         || extender->pluginDirectory == nullptr
@@ -654,9 +661,15 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
 
     if (!ReadConfiguration())
     {
+        soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_DISABLED, "Enabled=0 in AbilityBarWheel.ini");
         return TRUE;
     }
-    Install();
+    g_startupReason.Begin();
+    const bool active = Install();
+    g_startupReason.End();
+    soulash_plugins::ReportStatus(extender,
+        active ? SOULASH_PLUGIN_STATUS_ACTIVE : SOULASH_PLUGIN_STATUS_INACTIVE,
+        active ? "layout verified; DrawActionBar and SDL_PollEvent hooked" : g_startupReason.Last());
     return TRUE;
 }
 

@@ -12,6 +12,7 @@
 // it. If anything does not match it logs "inactive" and does nothing.
 #include "plugin_api.h"
 #include "../common/ability_bar_layout.hpp"
+#include "../common/plugin_status.hpp"
 
 #include <windows.h>
 
@@ -72,6 +73,7 @@ namespace
     using UpdateFn = int (*)(void* self, float dt);
 
     const SoulashExtenderInterface* g_extender = nullptr;
+    soulash_plugins::StartupReason g_startupReason;
     UpdateFn g_originalUpdate = nullptr;
     const void* g_abilityUserVtable = nullptr;
     const std::uint32_t* g_playerEntityId = nullptr;
@@ -106,6 +108,7 @@ namespace
         va_start(args, format);
         _vsnprintf_s(line, sizeof(line), _TRUNCATE, format, args);
         va_end(args);
+        g_startupReason.Capture(line);
         char prefixed[512];
         _snprintf_s(prefixed, sizeof(prefixed), _TRUNCATE, "AbilityBarProbe: %s", line);
         g_extender->log(prefixed);
@@ -338,6 +341,8 @@ namespace
                 g_loggedFault = true;
                 Log("memory read faulted (code 0x%08lX); probe disabled, game unaffected",
                     GetExceptionCode());
+                soulash_plugins::ReportStatus(g_extender, SOULASH_PLUGIN_STATUS_DEGRADED,
+                    "memory read faulted mid-game; probe stopped itself (game unaffected)");
             }
         }
     }
@@ -467,7 +472,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     const SoulashExtenderInterface* extender)
 {
     if (extender == nullptr
-        || extender->structureSize < sizeof(SoulashExtenderInterface)
+        || extender->structureSize < SOULASH_EXTENDER_INTERFACE_V3_BASE_SIZE
         || extender->interfaceVersion != SOULASH_EXTENDER_INTERFACE_VERSION
         || extender->gameExecutableSha256 == nullptr
         || extender->gameBase == nullptr)
@@ -476,7 +481,12 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     }
     g_extender = extender;
 
-    Install();
+    g_startupReason.Begin();
+    const bool active = Install();
+    g_startupReason.End();
+    soulash_plugins::ReportStatus(extender,
+        active ? SOULASH_PLUGIN_STATUS_ACTIVE : SOULASH_PLUGIN_STATUS_INACTIVE,
+        active ? "layout verified; DrawActionBar hooked" : g_startupReason.Last());
     return TRUE;
 }
 

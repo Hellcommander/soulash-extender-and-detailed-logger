@@ -132,6 +132,22 @@ else {
     $warnings.Add('SoulashExtender.ini is missing: diagnostics and plugins are disabled.')
 }
 
+# Update guard (proxy side): last start's compatibility report.
+$report = Join-Path $GameDir 'SoulashExtender\compat-report.txt'
+if (Test-Path -LiteralPath $report) {
+    foreach ($line in Get-Content -LiteralPath $report) {
+        if ($line -match '^(written_utc|game_build|safe_mode|summary)=(.*)$') {
+            Write-Output ('Last start   : {0} = {1}' -f $Matches[1], $Matches[2])
+        }
+    }
+    if ((Get-Content -LiteralPath $report -Raw) -match 'safe_mode=YES') {
+        $warnings.Add('The last start was in SAFE MODE (native plugins skipped after repeated crashes). See SoulashExtender\compat-report.txt.')
+    }
+}
+if ($warnings | Where-Object { $_ -like 'EXTENDER NOT INSTALLED*' }) {
+    Write-Output 'Fix          : scripts\repair-install.ps1 (report only), then scripts\repair-install.ps1 -Apply'
+}
+
 foreach ($message in $problems) { Write-Output "PROBLEM      : $message" }
 foreach ($message in $warnings) { Write-Output "WARNING      : $message" }
 if ($problems.Count -eq 0 -and $warnings.Count -eq 0) { Write-Output 'OK           : no issues found.' }

@@ -526,15 +526,31 @@ that, because the extender is loaded by being that file. After any game update:
    `EXTENDER NOT INSTALLED` when the vendor file is back, a changed vendor DLL,
    a build that `docs/game-notes.md` does not know, and plugin or chain files
    that no longer match their SHA-256 pins. It changes nothing.
-3. Re-install as described below (rename the vendor DLL to
-   `BugSplat64_original.dll`, then copy this build's `BugSplat64.dll`), or
-   simply paste the packaged proxy back (see "Keeping it installed").
+3. Run `scripts\repair-install.ps1` (report only), then
+   `scripts\repair-install.ps1 -Apply`. It moves the restored vendor DLL to
+   `BugSplat64_original.dll`, backs up the old one if the vendor file changed,
+   and copies the proxy back. It refuses if the new vendor DLL no longer
+   exports the four functions the proxy forwards to. You can also re-install
+   by hand as described below.
 4. Treat anchors and any pinned hashes as stale until re-verified for the new
    exe: string and RTTI anchors usually survive an update, fixed RVAs do not.
 
 The game's own start-up never reports a missing extender; plugins simply do not
 load. Check the diagnostics log: a start with the extender active writes a
 `timestamp_utc=` / `exe_sha256=` block and module events.
+
+### Update guard
+
+The proxy keeps a record of the game build. At every start it writes
+`SoulashExtender\compat-report.txt` with the build (`game_build=UPDATED since
+the last start ...`), the vendor DLL hash, and every plugin's load outcome and
+self-reported status (active / INACTIVE on this build / disabled / DEGRADED).
+After two consecutive sessions with native plugins loaded that ended without a
+clean exit, it starts the next session in **safe mode**: no native plugins, but
+scripts and data files still load. Exiting the game normally once leaves safe
+mode. Configuration is in `[UpdateGuard]`. Details, including the not yet
+runtime-verified clean-exit detection, are in
+[docs/update-guard.md](docs/update-guard.md).
 
 ### Keeping it installed
 
