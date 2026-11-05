@@ -148,9 +148,23 @@ $wheelExports = & dumpbin.exe /nologo /exports $abilityBarWheelPath
 if ($LASTEXITCODE -ne 0 -or ($wheelExports -join "`n") -notmatch 'SoulashExtenderPluginLoad') {
     throw 'AbilityBarWheel.dll does not export SoulashExtenderPluginLoad.'
 }
+$testBotPath = Join-Path $realPluginDirectory 'TestBot.dll'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /LD /I $includeDirectory `
+    "/Fo$objectDirectory" `
+    (Join-Path $repoRoot 'plugins\test_bot\test_bot.cpp') `
+    /Fe:$testBotPath
+if ($LASTEXITCODE -ne 0) { throw 'Building the test bot plugin failed.' }
+$testBotExports = & dumpbin.exe /nologo /exports $testBotPath
+if ($LASTEXITCODE -ne 0 -or ($testBotExports -join "`n") -notmatch 'SoulashExtenderPluginLoad') {
+    throw 'TestBot.dll does not export SoulashExtenderPluginLoad.'
+}
 # INI templates ship next to the DLLs; an existing INI at the destination is kept.
 Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\ability_bar_wheel\AbilityBarWheel.ini') `
     -Destination (Join-Path $realPluginDirectory 'AbilityBarWheel.ini') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\test_bot\TestBot.ini') `
+    -Destination (Join-Path $realPluginDirectory 'TestBot.ini') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\test_bot\TestBot.script') `
+    -Destination (Join-Path $realPluginDirectory 'TestBot.script') -Force
 
 # Deploy the real plugins into the game's SoulashExtender\Plugins folder.
 if ($GameDir) {
@@ -168,6 +182,8 @@ if ($GameDir) {
         # SoulashExtender.ini must carry these lines or the plugins are refused (error=5).
         Write-Output 'Paste into [PluginHashes] of the game''s SoulashExtender.ini (RequireHash=1):'
         $pinLines | ForEach-Object { Write-Output "  $_" }
+        # TestBot scripts are NOT deployed (the owner copies one in when using the bot);
+        # the example is in .build\plugins\TestBot.script.
         foreach ($ini in Get-ChildItem -LiteralPath $realPluginDirectory -Filter *.ini) {
             $target = Join-Path $gamePluginDirectory $ini.Name
             if (-not (Test-Path -LiteralPath $target)) {

@@ -236,6 +236,14 @@ as described below (the build prints each SHA-256).
   next to it) says `Enabled=1`. Same build gate as the probe. Hooks: the
   game's IAT entry for `SDL2.dll!SDL_PollEvent` and `DrawActionBar::update`,
   both pass-through.
+- `TestBot.dll` (`plugins/test_bot`): a built-in **test bot** that replays a
+  step script (keys, modifiers, wheel, clicks, waits, wait-for-world,
+  ability-bar checks) through `SDL_PushEvent`. **While it is enabled, Steam
+  achievements and stats are blocked** for the whole session (the
+  `ISteamUserStats` write methods report success without reaching Steam).
+  If blocking cannot be installed the bot refuses to run. **Off by default**
+  (`TestBot.ini`, `Enabled=0`); scripts are not deployed by the build. See
+  [docs/test-bot.md](docs/test-bot.md).
 
 Plugin INI templates (`plugins/<name>/<Name>.ini`) are deployed next to the
 DLLs; an existing INI keeps its values and only gains options the template has

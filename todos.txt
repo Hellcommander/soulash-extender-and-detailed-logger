@@ -36,6 +36,22 @@ SESSION 2026-11-04 (branch hellcommander-native-extender-logger, on top of 7a084
   0xB081B0+0xC08, derived from the "Saving player" writer by LocateSaveName). Log-only; not yet run.
 - tools/__pycache__ untracked, __pycache__/ in .gitignore.
 
+SESSION 2026-11-05: TEST BOT (owner request: "a bot driven mod that disables achievements when active, for testing")
+- Owner chose: a BUILT-IN test bot (not an external control channel), blocking achievements AND stats.
+- plugins/test_bot -> TestBot.dll + TestBot.ini (Enabled=0) + example TestBot.script; docs/test-bot.md.
+  Blocking: IAT hook on steam_api64!SteamInternal_FindOrCreateUserInterface, private vtable copy for
+  STEAMUSERSTATS_INTERFACE_* objects with the 8 write methods stubbed (slots decoded at runtime from steam_api64's
+  flat exports; v013 = 2,3,4,6,7,9,12,20). Fail closed. Fallback self-request once in the world.
+  Bot: step script (plugins/common/test_bot_script.hpp, unit-tested), SDL_PushEvent input, SDL_PollEvent hook as the
+  game-thread clock, DrawActionBar update hook for wait_world / expect_bar_set.
+- The build deploys TestBot.dll and TestBot.ini (existing rule); it does NOT deploy scripts (owner copies one in).
+- NOT RUN in the game yet. First run: pin the hash, copy the script, Enabled=1, check for "blocking armed",
+  "achievements+stats BLOCKED on STEAMUSERSTATS_INTERFACE_VERSION013" and the final "-> PASS".
+- Plugin builds are not reproducible (hashes change on every rebuild even without source changes): always use the
+  hashes printed by the LAST build.
+- Possible follow-ups: also neutralise the game's own Achievements component bookkeeping if the owner wants that;
+  more script commands (repeat blocks, expect on other game state once state reads exist).
+
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.
