@@ -170,6 +170,16 @@ $triggersExports = & dumpbin.exe /nologo /exports $triggersPath
 if ($LASTEXITCODE -ne 0 -or ($triggersExports -join "`n") -notmatch 'SoulashExtenderPluginLoad') {
     throw 'Triggers.dll does not export SoulashExtenderPluginLoad.'
 }
+$variantsPath = Join-Path $realPluginDirectory 'Variants.dll'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /LD /I $includeDirectory `
+    "/Fo$objectDirectory" `
+    (Join-Path $repoRoot 'plugins\variants\variants.cpp') `
+    /Fe:$variantsPath
+if ($LASTEXITCODE -ne 0) { throw 'Building the variants plugin failed.' }
+$variantsExports = & dumpbin.exe /nologo /exports $variantsPath
+if ($LASTEXITCODE -ne 0 -or ($variantsExports -join "`n") -notmatch 'SoulashExtenderPluginLoad') {
+    throw 'Variants.dll does not export SoulashExtenderPluginLoad.'
+}
 # INI templates ship next to the DLLs; an existing INI at the destination is kept.
 Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\ability_bar_wheel\AbilityBarWheel.ini') `
     -Destination (Join-Path $realPluginDirectory 'AbilityBarWheel.ini') -Force
@@ -179,6 +189,8 @@ Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\test_bot\TestBot.script') `
     -Destination (Join-Path $realPluginDirectory 'TestBot.script') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\triggers\Triggers.ini') `
     -Destination (Join-Path $realPluginDirectory 'Triggers.ini') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\variants\Variants.ini') `
+    -Destination (Join-Path $realPluginDirectory 'Variants.ini') -Force
 
 # Deploy the real plugins into the game's SoulashExtender\Plugins folder.
 if ($GameDir) {

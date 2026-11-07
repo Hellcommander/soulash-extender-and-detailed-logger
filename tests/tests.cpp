@@ -13,6 +13,7 @@
 #include "../plugins/common/ability_queue.hpp"
 #include "../plugins/common/game_state.hpp"
 #include "../plugins/common/trigger_rules.hpp"
+#include "../plugins/common/variant_index.hpp"
 
 #include <windows.h>
 
@@ -784,6 +785,7 @@ namespace
 #include "update_guard_tests.inc"
 #include "pe_original_tests.inc"
 #include "trigger_tests.inc"
+#include "variant_tests.inc"
 
     // Child side of the debugger fallback test. Loads the proxy but never
     // calls any BugSplat export, so only the DllMain fallback can start it.
@@ -1813,6 +1815,8 @@ int wmain(int argc, wchar_t* argv[])
         TestAbilityQueue();
         TestGameState();
         TestTriggerRules();
+        TestVariantPaths();
+        TestVariantIndex();
         TestTestBotScript();
         TestTestBotCapture();
         TestTestBotStatus();
