@@ -170,6 +170,24 @@ that it has been confirmed that it can survive updates")
   party/companions/stacker/inventory_count/time_of_day/season/biome/in_combat/in_settlement, delayed casts,
   conditions that gate passives/abilities (no evaluation point hooked), entity -> data id for equipped.item.
 
+SESSION 2026-11-07: VARIANTS PLUGIN (owner: "a feature for mods that has one version of skill for default game and
+another version of a skill with the extender (deeper skill options)")
+- plugins/variants -> Variants.dll + Variants.ini (Enabled=1, Mode=log default); docs/variants.md. A mod puts the
+  extender version of any data file at the same relative path below <mod>\extender\variants\ (whole-file override),
+  plus extender-only files/folders (additions, injected into folder listings). mod.json and extender\ are refused.
+- RE (static, 526b6ab4): mod JSON is read via the DYNAMIC UCRT (_wfsopen/_fsopen; reader 0x4E93B0), folders via the
+  static STL filesystem -> KERNEL32 CreateFile2/FindFirstFileExW/FindNextFileW/FindClose/GetFileAttributesExW/
+  MoveFileExW/CopyFile2/CreateDirectoryW (0x823DD0-0x824FF8); ability loader 0x4ED7E0 lists {}/abilities. The mod
+  editor's ability save 0x5473D0 reads the ability REGISTRY (0x8B4A0 + map::at 0x4249F0) and writes
+  data/mods/{}/abilities/{}.json -> with variants loaded it would write extender data over plain-game files.
+- Hooks = the game exe's import slots (found by name, any DLL), pass-through. Active mode: reads of mapped paths ->
+  variant; every write/delete/rename/mkdir inside a mod that has variants (except mod.json and extender\) ->
+  <mod>\extender\editor_saves\<same path>. Pure logic in plugins/common/variant_index.hpp, tests/variant_tests.inc.
+- Verified: unit tests + full test.ps1 pass; an end-to-end run in a stand-in game exe (same imports, /MD) passed
+  every read/listing/write check in both modes (scratch only, not in the repo). NOT RUN IN THE GAME; not deployed
+  yet (the run that built it skipped the game deploy because another session had uncommitted Triggers changes).
+- Open: whole-file only (no JSON merge patch); editor_saves never cleaned; images/fonts go through SDL (no variants).
+
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.
@@ -297,6 +315,16 @@ OPEN WORK, PRIORITISED
    tools/runic_registry.json to generate effects.json from it.
 
 3. RUNTIME VERIFICATION (needs the owner to run the game; everything so far is static/synthetic)
+   - (2026-11-07) Triggers ran in the game in Mode=log, driven by TestBot through its inbox (saves: `test`,
+     Dawson Grass; loading it rewrites the save's world files, so that save is no longer the Oct 24 state).
+     All eight hooks installed; cast/attack/kill/turn/damaged/dodge events, delayed casts, stacks, party, clock
+     and inventory verified live; crit and block not yet seen; Mode=active untried. Findings in
+     docs/triggers.md section 7. The game crash of the first run is the engine's own fmt::format_error in its
+     reverse-heal message (docs/game-notes.md), not the extender.
+   - The extender CORE in the game folder (BugSplat64.dll, 2026-10-24) is older than the repo: its conditions
+     loader still rejects the new `on` events (kill/turn/damaged/...) with "trigger 'on' must be {cast} or
+     {attack: true}". The Triggers plugin loads the rule files itself, so rules work, but the core's log line is
+     misleading until the owner copies .build\BugSplat64.dll over (owner action; the build only deploys plugins).
    - Install the packaged proxy in a COPY or with rollback ready; confirm the BugSplat ctor trigger and plugin loading.
    - Verify anchors (RTTI MainMenuScreen, DrawActionBar, "Loading mods:" string) at runtime.
    - Verify the first game-hook candidate: a "data about to load" message at the mod-loading entry

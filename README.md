@@ -259,8 +259,25 @@ as described below (the build prints each SHA-256).
   game function and component is located and verified from the game's own code
   and RTTI at load; nothing is keyed by a build hash, and a hook that is not
   found only disables its event. Ships with `Triggers.ini` `Mode=log` (hooks
-  installed, everything logged, nothing queued); `Mode=active` queues. Not yet
-  run in the game. See [docs/triggers.md](docs/triggers.md).
+  installed, everything logged, nothing queued); `Mode=active` queues. First
+  log-mode runs in the game on 2026-11-07: all eight hooks fire, crit and block
+  still unobserved, `Mode=active` untried. It also logs every first-chance C++
+  exception in the process with its type, `what()` and stack, which named the
+  game's own `fmt::format_error` behind a crash. See
+  [docs/triggers.md](docs/triggers.md).
+- `Variants.dll` (`plugins/variants`): **one version of a skill for the plain
+  game, a deeper one with the extender**. A mod keeps its plain-game files where
+  they are and puts the extender version of any file at the same relative path
+  below `<mod>\extender\variants\` (plus files and folders that exist only
+  there). With the plugin active the game loads those instead; without the
+  extender nothing changes. Pass-through hooks on the game's own import slots
+  for its file calls (`_wfsopen`/`_fsopen`, STL filesystem `CreateFile2`,
+  `FindFirstFileExW`, ...); no game code patched, no build hash. Because the
+  mod editor saves from what is loaded, every write into a mod with variants
+  goes to `<mod>\extender\editor_saves\` instead, so plain-game files are never
+  overwritten. Ships with `Variants.ini` `Mode=log` (logs what would change);
+  `Mode=active` loads the variants. Not yet run in the game. See
+  [docs/variants.md](docs/variants.md).
 
 Plugin INI templates (`plugins/<name>/<Name>.ini`) are deployed next to the
 DLLs; an existing INI keeps its values and only gains options the template has
