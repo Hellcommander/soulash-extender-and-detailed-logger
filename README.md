@@ -291,6 +291,20 @@ Refusals are logged as `load_failed` events and happen before any of the
 plugin's code runs. This is integrity pinning for files you already trust, not
 malware detection, and the INI itself must be protected from edits.
 
+Pinning is optional (`RequireHash` is off by default). To turn it on without
+computing hashes by hand, use the hash finder (packaged next to the proxy):
+
+- Double-click `PluginHashes.cmd` in the game folder. It lists every DLL in the
+  plugin folder with its SHA-256 and whether its pin is `new`, `ok` or
+  `CHANGED`, prints the `[PluginHashes]` lines, then asks whether to write them
+  into `SoulashExtender.ini` and whether to set `RequireHash=1`.
+- Or run `scripts\plugin-hashes.ps1` (report only), `-Write` (add/update the
+  pins), `-RequireHash` (pins plus `RequireHash=1`), `-GameDir "<folder>"`.
+
+Only the pins of the plugins found and the `RequireHash` line change; the
+previous file is kept as `SoulashExtender.ini.bak`. Run it again after adding
+or updating a plugin. A `[Chain]` target's `NextSha256` is printed, not written.
+
 ## Plugin authoring (interface v3, experimental)
 
 Export `SoulashExtenderPluginLoad(const SoulashExtenderInterface*)` as declared

@@ -252,7 +252,7 @@ finally {
 
 $distDirectory = Join-Path $outputDirectory ("dist-" + [guid]::NewGuid().ToString('N'))
 & (Join-Path $PSScriptRoot 'package.ps1') -OutputDirectory $distDirectory | Out-Null
-foreach ($expected in 'BugSplat64.dll', 'SoulashExtender.ini', 'INSTALL.txt', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.txt', 'check-install.ps1', 'SoulashExtender\Plugins', 'SoulashExtender\Scripts') {
+foreach ($expected in 'BugSplat64.dll', 'SoulashExtender.ini', 'INSTALL.txt', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.txt', 'check-install.ps1', 'plugin-hashes.ps1', 'plugin-pins.ps1', 'PluginHashes.cmd', 'SoulashExtender\Plugins', 'SoulashExtender\Scripts') {
     if (-not (Test-Path -LiteralPath (Join-Path $distDirectory $expected))) { throw "Package is missing $expected." }
 }
 $packagedIni = Get-Content -LiteralPath (Join-Path $distDirectory 'SoulashExtender.ini') -Raw

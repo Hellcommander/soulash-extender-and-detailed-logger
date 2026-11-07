@@ -36,8 +36,9 @@ foreach ($name in 'SoulashExtender\Plugins', 'SoulashExtender\Scripts') {
 
 $dllPath = Join-Path $OutputDirectory 'BugSplat64.dll'
 Copy-Item -LiteralPath $proxySource -Destination $dllPath -Force
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'check-install.ps1') `
-    -Destination (Join-Path $OutputDirectory 'check-install.ps1') -Force
+foreach ($tool in 'check-install.ps1', 'plugin-hashes.ps1', 'plugin-pins.ps1', 'PluginHashes.cmd') {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $tool) -Destination (Join-Path $OutputDirectory $tool) -Force
+}
 $dllHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $dllPath).Hash.ToLowerInvariant()
 
 # The DLL contains Lua; its MIT notice must accompany binaries. The text is
@@ -67,7 +68,8 @@ if (-not (Test-Path -LiteralPath $iniPath)) {
         '[Plugins]',
         'Enabled=1',
         'Directory=SoulashExtender\Plugins',
-        '; Set RequireHash=1 and list each plugin below to load only pinned DLLs:',
+        '; Optional: set RequireHash=1 and list each plugin below to load only pinned DLLs.',
+        '; PluginHashes.cmd (in the game folder) finds the hashes and can write them in.',
         '; RequireHash=1',
         '',
         '[PluginHashes]',
@@ -101,6 +103,7 @@ $install = @(
     '     Never overwrite an existing BugSplat64_original.dll; stop and sort that out first.',
     '  3. Copy these into the game folder:',
     '       BugSplat64.dll, SoulashExtender.ini, SoulashExtender\ (and check-install.ps1 if wanted).',
+    '     For the optional hash pinning also copy PluginHashes.cmd, plugin-hashes.ps1 and plugin-pins.ps1.',
     '  4. Plugin DLLs go in SoulashExtender\Plugins, sandboxed *.lua scripts in',
     '     SoulashExtender\Scripts. Diagnostics go to logs\proxy-crash.log.',
     '',
@@ -113,15 +116,19 @@ $install = @(
     'Rollback (game closed): delete the proxy BugSplat64.dll, rename BugSplat64_original.dll',
     'back to BugSplat64.dll, and verify its signature.',
     '',
-    'Both plugins and the proxy run with full process privileges. Pin plugins in the INI',
-    '([Plugins] RequireHash=1 and [PluginHashes]). Scripts are sandboxed but the sandbox',
+    'Both plugins and the proxy run with full process privileges. Optionally pin plugins in the',
+    'INI ([Plugins] RequireHash=1 and [PluginHashes]): double-click PluginHashes.cmd in the game',
+    'folder; it lists each plugin''s SHA-256 and asks before writing the pins (and RequireHash=1)',
+    'into SoulashExtender.ini. Run it again after adding or updating a plugin.',
+    'Scripts are sandboxed but the sandbox',
     'lowers risk, it does not remove it. Tested against synthetic targets only.',
     '',
     "BugSplat64.dll (proxy) SHA-256: $dllHash"
 )
 [System.IO.File]::WriteAllLines((Join-Path $OutputDirectory 'INSTALL.txt'), $install, [System.Text.Encoding]::ASCII)
 
-$sums = foreach ($name in 'BugSplat64.dll', 'check-install.ps1', 'SoulashExtender.ini', 'INSTALL.txt', 'THIRD_PARTY_NOTICES.txt') {
+$sums = foreach ($name in 'BugSplat64.dll', 'check-install.ps1', 'plugin-hashes.ps1', 'plugin-pins.ps1', 'PluginHashes.cmd',
+        'SoulashExtender.ini', 'INSTALL.txt', 'THIRD_PARTY_NOTICES.txt') {
     $file = Join-Path $OutputDirectory $name
     '{0} *{1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant(), $name
 }
