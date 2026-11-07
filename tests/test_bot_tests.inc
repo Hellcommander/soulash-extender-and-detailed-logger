@@ -134,6 +134,74 @@ void TestTestBotScript()
     }
 }
 
+// Names for results.txt and status.json: DescribeStep is the parser in reverse.
+void TestTestBotStatus()
+{
+    namespace tb = soulash_plugins::testbot;
+
+    struct Case
+    {
+        const char* line;
+        const char* described;
+    };
+    const Case cases[] = {
+        {"KEY A", "key a 50"},
+        {"key lctrl 30", "key lctrl 30"},
+        {"key F12", "key f12 50"},
+        {"key 0x400000E1", "key lshift 50"},
+        {"key 500", "key 500 50"},
+        {"key_down space", "key_down space"},
+        {"key_up Escape", "key_up escape"},
+        {"wait 250", "wait 250"},
+        {"wait_world", "wait_world 120000"},
+        {"mod ctrl+alt", "mod ctrl+alt"},
+        {"mod none", "mod none"},
+        {"wheel -3", "wheel -3"},
+        {"click 100 200", "click 100 200 left"},
+        {"dclick 30 40 Right", "dclick 30 40 right"},
+        {"move 10 20", "move 10 20"},
+        {"drag 1 2 3 4 middle", "drag 1 2 3 4 middle"},
+        {"expect_bar_set 1", "expect_bar_set 1"},
+        {"log   start of run  # comment", "log start of run"},
+        {"type  Fire bolt (copy)  ", "type Fire bolt (copy)"},
+        {"snapshot storm", "snapshot storm 1 500"},
+        {"snapshot Storm-02 5 250", "snapshot Storm-02 5 250"},
+        {"mods_errors", "mods_errors"},
+        {"mods_errors 0", "mods_errors 0"},
+        {"wait_screen MainMenuScreen", "wait_screen MainMenuScreen 30000"},
+        {"expect_screen EntityMakerScreen", "expect_screen EntityMakerScreen"},
+        {"log_screen", "log_screen"},
+    };
+    for (const Case& entry : cases)
+    {
+        const tb::ParseResult parsed = tb::ParseScript(entry.line);
+        const std::string described = parsed.ok && parsed.steps.size() == 1 ? tb::DescribeStep(parsed.steps[0]) : "<parse error>";
+        Check(described == entry.described, (std::string("testbot: DescribeStep '") + entry.line + "' -> '" + described
+            + "', expected '" + entry.described + "'").c_str());
+        // Round trip: the description parses back into the same step.
+        const tb::ParseResult again = tb::ParseScript(described);
+        const bool same = again.ok && again.steps.size() == 1 && parsed.ok && parsed.steps.size() == 1
+            && again.steps[0].op == parsed.steps[0].op && again.steps[0].a == parsed.steps[0].a
+            && again.steps[0].b == parsed.steps[0].b && again.steps[0].c == parsed.steps[0].c
+            && again.steps[0].d == parsed.steps[0].d && again.steps[0].e == parsed.steps[0].e
+            && again.steps[0].key == parsed.steps[0].key && again.steps[0].text == parsed.steps[0].text;
+        Check(same, (std::string("testbot: DescribeStep round trip for '") + entry.line + "'").c_str());
+    }
+    Check(std::string(tb::OpName(tb::Op::DoubleClick)) == "dclick" && std::string(tb::OpName(tb::Op::WaitWorld)) == "wait_world",
+        "testbot: OpName");
+
+    Check(tb::JsonQuote("plain") == "\"plain\"", "testbot: JsonQuote plain text");
+    Check(tb::JsonQuote("a\"b\\c") == "\"a\\\"b\\\\c\"", "testbot: JsonQuote escapes quotes and backslashes");
+    Check(tb::JsonQuote("x\n\t\x01y") == "\"x\\n\\t\\u0001y\"", "testbot: JsonQuote escapes control characters");
+    Check(tb::JsonQuote("caf\xC3\xA9") == "\"caf\xC3\xA9\"", "testbot: JsonQuote passes UTF-8 through");
+    Check(tb::JsonQuote("") == "\"\"", "testbot: JsonQuote of an empty string");
+
+    if (failures == 0)
+    {
+        std::cout << "PASS: test bot step descriptions and JSON quoting\n";
+    }
+}
+
 // Manual oracle: decode the ISteamUserStats write methods from a real
 // steam_api64.dll (mapped without running its DllMain).
 int RunSteamStatsSlotsOracle(const wchar_t* dllPath)

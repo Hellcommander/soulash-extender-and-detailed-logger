@@ -1802,6 +1802,7 @@ int wmain(int argc, wchar_t* argv[])
         TestOriginalImagePointer();
         TestTestBotScript();
         TestTestBotCapture();
+        TestTestBotStatus();
         TestUpdateGuardLogic();
         if (failures == 0)
         {

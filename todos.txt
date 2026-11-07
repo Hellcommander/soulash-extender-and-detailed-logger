@@ -96,6 +96,31 @@ TESTBOT EDITOR SUPPORT (2026-11-05, owner: "add support for bot to be able to us
 - Open: which button on the Mods page opens the editors; confirm F6 = DataTableScreen; PreGameScreen's purpose;
   confirm type/move/dclick/drag live. Editor field values are not readable (Tier C).
 
+TESTBOT LIVE FEEDBACK (2026-11-06, owner: "improve the bot plugin so it can provide live feedback to the agent
+running the bot")
+- Bot -> watcher: <game>\SoulashExtender\TestBot\status.json: state (idle/running/waiting/finished/aborted/
+  stopped/not_running+reason/exited), job {index,name,source}, current step (DescribeStep = the script line
+  normalised),
+  waiting_for (wait_world/wait_screen with time left and the screen drawn now), checks/failures/last_failure,
+  screen, in_world/bar_set, window/drawable, blocked calls, snapshots, live_frame, loop_hz, log_tail (16 lines).
+  Written via tmp + MoveFileEx (fallback: in place) on change (>=100 ms apart), heartbeat 1 s, forced at Finish,
+  first write in PluginLoad, "exited" record in DllMain. live.png: SDL_GL_SwapWindow hook reused (installed
+  whenever LiveFrameMs>0, script or not), one frame in flight, snapshot steps have priority. TestBot.ini
+  LiveFrameMs=2000 (min 250, 0 off). results.txt step lines now carry the arguments.
+- Pure helpers in plugins/common/test_bot_script.hpp: OpName, KeyName, ModName, DescribeStep (round-trips through
+  the parser), JsonQuote; tests in tests/test_bot_tests.inc (TestTestBotStatus).
+- NOT RUN in the game yet. First live check: status.json heartbeat ticks while the main menu is up, state goes
+  waiting -> running -> finished, live.png refreshes every 2 s and is a valid PNG, "exited" appears after a quit.
+- Agent -> bot (owner asked for it the same day, reversing the 2026-11-05 "no control channel" choice): the
+  INBOX. <TestBot>\inbox\*.script run in name order whenever no job runs (polled every 500 ms on the game
+  thread; a file still open for writing is skipped; taken files move to <run>\jobNN_<name>.script, or are
+  deleted); inbox\stop aborts the running job (-> STOPPED). Each script = a job (BeginJob resets the runner
+  state; snapshot/screen hooks installed lazily on first need via EnsureScreenCapture/EnsureScreenDetection).
+  Without an INI script the bot idles (state idle, plugin status ACTIVE "idle, inbox open"). TestBot.ini
+  Inbox=1 (0 closes it). status.json: inbox {dir, accepting, pending, jobs_done, last_error}.
+- Not done: no agent -> bot commands other than scripts and stop (no pause, no single-step, no state queries
+  beyond status.json). Scripts cannot read editor fields (Tier C).
+
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.

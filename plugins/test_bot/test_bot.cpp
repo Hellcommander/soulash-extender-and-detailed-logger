@@ -37,7 +37,15 @@
 // vtable (pass-through thunk recording `this`; see InstallScreenDetection).
 //
 // Output: <game>\SoulashExtender\TestBot\<UTC run id>\results.txt + snapshot
-// PNGs; <game>\SoulashExtender\TestBot\latest.txt names the newest run.
+// PNGs; <game>\SoulashExtender\TestBot\latest.txt names the newest run. Live
+// feedback while the game runs: <game>\SoulashExtender\TestBot\status.json
+// (state, current step, what it waits for, screen, counters, last log lines;
+// rewritten atomically on every change and at least once a second) and
+// live.png (the current frame, refreshed every LiveFrameMs; 0 turns it off).
+// Input (Inbox=1): *.script files dropped into <game>\SoulashExtender\TestBot\
+// inbox run, in name order, whenever no script is running (each is moved into
+// the run folder as it is taken); a file named `stop` there aborts the running
+// script. Each script is a "job" with its own PASS/FAIL line.
 #include "plugin_api.h"
 #include "../common/ability_bar_layout.hpp"
 #include "../common/pe_original.hpp"
@@ -134,6 +142,12 @@ namespace
     bool g_enabled = false;
     bool g_stopOnFailure = false;
     bool g_logBlockedCalls = true;
+    constexpr int DefaultLiveFrameMs = 2000;
+    constexpr int MinLiveFrameMs = 250;
+    unsigned long long g_liveFrameMs = 0;     // LiveFrameMs: refresh <TestBot>\live.png this often (0 = off)
+    bool g_inbox = true;                      // Inbox: run *.script files dropped into <TestBot>\inbox
+    bool g_ready = false;                     // blocking, SDL and the poll hook are in place: scripts can run
+    unsigned char* g_gameBase = nullptr;
 
     // Steam blocking
     bool g_blockingReady = false;
@@ -183,9 +197,51 @@ namespace
     // Run folder <game>\SoulashExtender\TestBot\<UTC run id>\ with results.txt
     // (every TestBot log line, step starts, errors.log extracts) and snapshots.
     wchar_t g_runDirectory[MAX_PATH * 2] = L"";
+    wchar_t g_testBotDirectory[MAX_PATH * 2] = L"";    // <game>\SoulashExtender\TestBot
     HANDLE g_results = INVALID_HANDLE_VALUE;
     SRWLOCK g_resultsLock = SRWLOCK_INIT;
     unsigned long long g_resultsStartMs = 0;
+
+    // The last log lines, for status.json (guarded by g_resultsLock).
+    constexpr std::size_t LogTailLines = 16;
+    std::string g_logTail[LogTailLines];
+    std::size_t g_logTailNext = 0;
+    std::size_t g_logTailCount = 0;
+
+    // Live status (<TestBot>\status.json), written on the game thread only.
+    enum class RunState
+    {
+        NotRunning,     // the bot cannot run scripts this session (blocking refused, SDL hooks missing)
+        Idle,           // ready, no script yet: waiting for the inbox
+        Running,
+        Finished,
+        Aborted,
+        Stopped         // by a `stop` file in the inbox
+    };
+    RunState g_runState = RunState::NotRunning;
+    const char* g_result = nullptr;                   // "PASS" / "FAIL" / "STOPPED" once the script has ended
+
+    // Jobs: the INI script and every inbox script, in order.
+    unsigned int g_jobIndex = 0;                      // 0 = no job yet
+    std::string g_jobName;
+    const char* g_jobSource = "";                     // "ini" / "inbox"
+    unsigned int g_jobsDone = 0;
+    unsigned int g_inboxPending = 0;
+    unsigned long long g_inboxCheckedMs = 0;
+    std::string g_lastJobError;                       // an inbox script that could not be run
+    wchar_t g_inboxStuck[MAX_PATH] = L"";             // a taken file that could neither be moved nor deleted
+    bool g_captureInstallTried = false;
+    bool g_screenInstallTried = false;
+    std::string g_notRunningReason;
+    std::string g_lastFailure;
+    unsigned long long g_stepStartedMs = 0;
+    std::atomic<bool> g_statusDirty{false};           // set by Log() from any thread
+    bool g_statusForce = false;
+    unsigned long long g_statusWrittenMs = 0;
+    unsigned long long g_loopTicks = 0;
+    unsigned long long g_loopRateMs = 0;
+    unsigned int g_loopHz = 0;                        // event-loop iterations per second
+    std::atomic<unsigned long> g_snapshotsWritten{0};
 
     void ResultRaw(const char* data, std::size_t size)
     {
@@ -199,15 +255,39 @@ namespace
         ReleaseSRWLockExclusive(&g_resultsLock);
     }
 
+    // One stamped line: into results.txt and the log tail that status.json shows.
     void ResultLine(const char* line)
     {
-        if (g_results == INVALID_HANDLE_VALUE)
+        if (g_resultsStartMs == 0)
         {
-            return;
+            return;   // before the run folder exists only proxy-crash.log gets the line
         }
         char text[640];
-        _snprintf_s(text, sizeof(text), _TRUNCATE, "[%9llu ms] %s\r\n", GetTickCount64() - g_resultsStartMs, line);
-        ResultRaw(text, std::strlen(text));
+        const int length = _snprintf_s(text, sizeof(text) - 2, _TRUNCATE, "[%9llu ms] %s",
+            GetTickCount64() - g_resultsStartMs, line);
+        const std::size_t size = length < 0 ? std::strlen(text) : static_cast<std::size_t>(length);
+        AcquireSRWLockExclusive(&g_resultsLock);
+        try
+        {
+            g_logTail[g_logTailNext].assign(text, size);
+            g_logTailNext = (g_logTailNext + 1) % LogTailLines;
+            if (g_logTailCount < LogTailLines)
+            {
+                ++g_logTailCount;
+            }
+        }
+        catch (...)
+        {
+        }
+        if (g_results != INVALID_HANDLE_VALUE)
+        {
+            text[size] = '\r';
+            text[size + 1] = '\n';
+            DWORD written = 0;
+            WriteFile(g_results, text, static_cast<DWORD>(size + 2), &written, nullptr);
+        }
+        ReleaseSRWLockExclusive(&g_resultsLock);
+        g_statusDirty.store(true);
     }
 
     void Log(const char* format, ...)
@@ -945,13 +1025,6 @@ namespace
                 imageSize == 0 ? "game image size unknown" : "no OPENGL32.dll!glClear import");
             return;
         }
-        const HMODULE sdl = GetModuleHandleW(L"SDL2.dll");
-        if (sdl != nullptr)
-        {
-            g_getWindowSize = reinterpret_cast<SdlGetWindowSizeFn>(GetProcAddress(sdl, "SDL_GetWindowSize"));
-            g_getDrawableSizeForLog = reinterpret_cast<SdlGetWindowSizeFn>(GetProcAddress(sdl, "SDL_GL_GetDrawableSize"));
-        }
-
         struct Pending
         {
             const char* name;
@@ -1123,6 +1196,7 @@ namespace
         CreateDirectoryW(base, nullptr);
         wcscat_s(base, L"\\TestBot");
         CreateDirectoryW(base, nullptr);
+        wcscpy_s(g_testBotDirectory, base);
         for (int attempt = 0; attempt < 10; ++attempt)
         {
             swprintf_s(g_runDirectory, attempt == 0 ? L"%s\\%04u%02u%02u-%02u%02u%02uZ" : L"%s\\%04u%02u%02u-%02u%02u%02uZ-%d",
@@ -1215,8 +1289,48 @@ namespace
         int width = 0;
         int height = 0;
         int line = 0;
+        bool live = false;                  // live.png: written to `path`, then renamed over `finalPath`
         wchar_t path[MAX_PATH * 2]{};
+        wchar_t finalPath[MAX_PATH * 2]{};
     };
+
+    // Live frame (LiveFrameMs): the current frame as <TestBot>\live.png, one in flight at a time.
+    std::atomic<bool> g_liveInFlight{false};
+    std::atomic<unsigned long long> g_liveNextDue{0};
+    std::atomic<unsigned long long> g_liveWrittenMs{0};
+    std::atomic<unsigned long> g_liveFrames{0};
+    std::atomic<unsigned long> g_liveErrors{0};
+    std::atomic<int> g_liveWidth{0};
+    std::atomic<int> g_liveHeight{0};
+
+    bool WriteWholeFile(const wchar_t* path, const void* data, std::size_t size)
+    {
+        HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        DWORD written = 0;
+        const bool ok = WriteFile(file, data, static_cast<DWORD>(size), &written, nullptr) != FALSE && written == size;
+        CloseHandle(file);
+        return ok;
+    }
+
+    // Writes `temporary`, then renames it over `path`, so a reader never sees a
+    // partial file. If the rename is refused (a reader holds `path` open without
+    // FILE_SHARE_DELETE), `path` is written in place instead.
+    bool PublishFile(const wchar_t* temporary, const wchar_t* path, const void* data, std::size_t size)
+    {
+        if (!WriteWholeFile(temporary, data, size))
+        {
+            return false;
+        }
+        if (MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING))
+        {
+            return true;
+        }
+        return WriteWholeFile(path, data, size);
+    }
 
     DWORD WINAPI SnapshotWriter(void* parameter)
     {
@@ -1230,27 +1344,40 @@ namespace
         {
             png.clear();
         }
-        bool ok = false;
-        if (!png.empty())
+        const bool ok = !png.empty()
+            && (job->live ? PublishFile(job->path, job->finalPath, png.data(), png.size())
+                          : WriteWholeFile(job->path, png.data(), png.size()));
+        const DWORD error = ok ? 0 : GetLastError();
+        const wchar_t* target = job->live ? job->finalPath : job->path;
+        const wchar_t* name = wcsrchr(target, L'\\');
+        name = name != nullptr ? name + 1 : target;
+        if (job->live)
         {
-            HANDLE file = CreateFileW(job->path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (file != INVALID_HANDLE_VALUE)
+            if (ok)
             {
-                DWORD written = 0;
-                ok = WriteFile(file, png.data(), static_cast<DWORD>(png.size()), &written, nullptr) != FALSE
-                    && written == png.size();
-                CloseHandle(file);
+                g_liveWidth.store(job->width);
+                g_liveHeight.store(job->height);
+                g_liveWrittenMs.store(NowMs());
+                if (g_liveFrames.fetch_add(1) == 0)
+                {
+                    Log("live frame: %S refreshed every %llu ms (%dx%d, %zu bytes)", name, g_liveFrameMs, job->width,
+                        job->height, png.size());
+                }
             }
+            else if (g_liveErrors.fetch_add(1) == 0)
+            {
+                Log("live frame: FAILED to write %S (error %lu); will keep trying", target, error);
+            }
+            g_liveInFlight.store(false);
         }
-        const wchar_t* name = wcsrchr(job->path, L'\\');
-        if (ok)
+        else if (ok)
         {
-            Log("snapshot line %d: wrote %S (%dx%d, %zu bytes)", job->line, name != nullptr ? name + 1 : job->path,
-                job->width, job->height, png.size());
+            g_snapshotsWritten.fetch_add(1);
+            Log("snapshot line %d: wrote %S (%dx%d, %zu bytes)", job->line, name, job->width, job->height, png.size());
         }
         else
         {
-            Log("snapshot line %d: FAILED to write %S (error %lu)", job->line, job->path, GetLastError());
+            Log("snapshot line %d: FAILED to write %S (error %lu)", job->line, job->path, error);
         }
         delete job;
         g_writersInFlight.fetch_sub(1);
@@ -1335,13 +1462,13 @@ namespace
         return value >= -1 && value <= 3 ? nullptr : reinterpret_cast<GlBindFn>(proc);
     }
 
-    void CaptureFrame(void* window)
+    // Reads the finished back buffer into a new job; nullptr with a message when it cannot.
+    SnapshotJob* ReadFrame(void* window, char (&error)[160])
     {
-        const unsigned long long now = NowMs();
         if (g_wglGetCurrentContext() == nullptr)
         {
-            CaptureFailed("no current OpenGL context on the thread that presents frames");
-            return;
+            strcpy_s(error, "no current OpenGL context on the thread that presents frames");
+            return nullptr;
         }
         if (!g_glExtensionsResolved)
         {
@@ -1354,16 +1481,14 @@ namespace
         if (width <= 0 || height <= 0 || width > soulash_plugins::png::MaxDimension
             || height > soulash_plugins::png::MaxDimension)
         {
-            char message[96];
-            _snprintf_s(message, sizeof(message), _TRUNCATE, "unusable drawable size %dx%d", width, height);
-            CaptureFailed(message);
-            return;
+            _snprintf_s(error, sizeof(error), _TRUNCATE, "unusable drawable size %dx%d", width, height);
+            return nullptr;
         }
         SnapshotJob* job = new (std::nothrow) SnapshotJob;
         if (job == nullptr)
         {
-            CaptureFailed("out of memory");
-            return;
+            strcpy_s(error, "out of memory");
+            return nullptr;
         }
         try
         {
@@ -1372,8 +1497,8 @@ namespace
         catch (...)
         {
             delete job;
-            CaptureFailed("out of memory for the frame buffer copy");
-            return;
+            strcpy_s(error, "out of memory for the frame buffer copy");
+            return nullptr;
         }
         unsigned int glError = 0;
         bool bindingsOk = true;
@@ -1381,23 +1506,23 @@ namespace
         {
             delete job;
             g_captureReady = false;
-            CaptureFailed("reading the frame faulted; screen capture switched off for this session");
-            return;
+            strcpy_s(error, "reading the frame faulted; screen capture switched off for this session");
+            return nullptr;
         }
         if (!bindingsOk || glError != 0)
         {
             delete job;
-            char message[128];
-            _snprintf_s(message, sizeof(message), _TRUNCATE, bindingsOk
+            _snprintf_s(error, sizeof(error), _TRUNCATE, bindingsOk
                 ? "glReadPixels reported GL error 0x%X" : "a framebuffer/pack buffer is bound and cannot be unbound (no GL 3 entry points)", glError);
-            CaptureFailed(message);
-            return;
+            return nullptr;
         }
-        const int index = g_captureDone.load() + 1;
         job->width = width;
         job->height = height;
-        job->line = g_captureLine;
-        swprintf_s(job->path, L"%s\\%S_%02d.png", g_runDirectory, g_captureName, index);
+        return job;
+    }
+
+    void StartWriter(SnapshotJob* job)
+    {
         g_writersInFlight.fetch_add(1);
         HANDLE thread = CreateThread(nullptr, 0, SnapshotWriter, job, 0, nullptr);
         if (thread != nullptr)
@@ -1408,17 +1533,65 @@ namespace
         {
             SnapshotWriter(job);   // no thread: write it here (one slow frame)
         }
+    }
+
+    // snapshot step: one frame of the current series.
+    void CaptureFrame(void* window)
+    {
+        const unsigned long long now = NowMs();
+        char error[160];
+        SnapshotJob* job = ReadFrame(window, error);
+        if (job == nullptr)
+        {
+            CaptureFailed(error);
+            return;
+        }
+        const int index = g_captureDone.load() + 1;
+        job->line = g_captureLine;
+        swprintf_s(job->path, L"%s\\%S_%02d.png", g_runDirectory, g_captureName, index);
+        StartWriter(job);
         g_captureDone.store(index);
         g_captureNextDue.store(now + g_captureInterval);
         g_captureLastProgress.store(now);
     }
 
+    // LiveFrameMs: the current frame for whoever watches the run. A failed read
+    // (minimised window, GL error) is retried later; a fault turns capture off.
+    void CaptureLiveFrame(void* window)
+    {
+        const unsigned long long now = NowMs();
+        char error[160];
+        SnapshotJob* job = ReadFrame(window, error);
+        if (job == nullptr)
+        {
+            g_liveNextDue.store(now + (g_liveFrameMs > 1000 ? g_liveFrameMs : 1000));
+            if (g_liveErrors.fetch_add(1) == 0)
+            {
+                Log("live frame: %s%s", error, g_captureReady ? "; will keep trying" : "");
+            }
+            return;
+        }
+        job->live = true;
+        swprintf_s(job->path, L"%s\\live.tmp.png", g_testBotDirectory);
+        swprintf_s(job->finalPath, L"%s\\live.png", g_testBotDirectory);
+        g_liveInFlight.store(true);
+        g_liveNextDue.store(now + g_liveFrameMs);
+        StartWriter(job);
+    }
+
     void SwapWindowHook(void* window)
     {
+        bool captured = false;
         if (g_captureActive.load() && g_captureReady && !g_captureFailed.load() && g_captureDone.load() < g_captureTotal
             && NowMs() >= g_captureNextDue.load() && g_writersInFlight.load() < MaxWritersInFlight)
         {
             CaptureFrame(window);
+            captured = true;
+        }
+        if (!captured && g_liveFrameMs != 0 && g_captureReady && !g_liveInFlight.load()
+            && NowMs() >= g_liveNextDue.load() && g_writersInFlight.load() < MaxWritersInFlight)
+        {
+            CaptureLiveFrame(window);
         }
         g_originalSwapWindow(window);
     }
@@ -1582,46 +1755,343 @@ namespace
     }
 
     // ===========================================================================
-    // Script runner
+    // Live status for whoever watches the run (a person or an agent):
+    // <game>\SoulashExtender\TestBot\status.json. Rewritten through a temporary
+    // file and a rename (readers never see a partial file) on every change and at
+    // least once a second while the game pumps events, so a stale `updated_utc`
+    // means the game is not running its event loop (loading, hung, or gone).
     // ===========================================================================
-    const char* OpName(testbot::Op op)
+    constexpr unsigned long long StatusHeartbeatMs = 1000;
+    constexpr unsigned long long StatusMinIntervalMs = 100;
+    constexpr unsigned long long LoopRateWindowMs = 500;
+    constexpr int StatusSchema = 1;
+
+    std::string Utf8(const wchar_t* text)
     {
-        switch (op)
+        std::string out;
+        const int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+        if (needed > 1)
         {
-        case testbot::Op::Wait: return "wait";
-        case testbot::Op::WaitWorld: return "wait_world";
-        case testbot::Op::Key: return "key";
-        case testbot::Op::KeyDown: return "key_down";
-        case testbot::Op::KeyUp: return "key_up";
-        case testbot::Op::Mod: return "mod";
-        case testbot::Op::Wheel: return "wheel";
-        case testbot::Op::Click: return "click";
-        case testbot::Op::ExpectBarSet: return "expect_bar_set";
-        case testbot::Op::Log: return "log";
-        case testbot::Op::Snapshot: return "snapshot";
-        case testbot::Op::ModsErrors: return "mods_errors";
-        case testbot::Op::WaitScreen: return "wait_screen";
-        case testbot::Op::ExpectScreen: return "expect_screen";
-        case testbot::Op::LogScreen: return "log_screen";
-        case testbot::Op::Type: return "type";
-        case testbot::Op::Move: return "move";
-        case testbot::Op::Drag: return "drag";
-        case testbot::Op::DoubleClick: return "dclick";
+            out.resize(static_cast<std::size_t>(needed));
+            WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), needed, nullptr, nullptr);
+            out.pop_back();   // the terminator
+        }
+        return out;
+    }
+
+    void UtcNow(char (&text)[40])
+    {
+        SYSTEMTIME now{};
+        GetSystemTime(&now);
+        _snprintf_s(text, sizeof(text), _TRUNCATE, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ", now.wYear, now.wMonth,
+            now.wDay, now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+    }
+
+    const char* RunStateName(RunState state)
+    {
+        switch (state)
+        {
+        case RunState::NotRunning: return "not_running";
+        case RunState::Idle: return "idle";
+        case RunState::Running: return "running";
+        case RunState::Finished: return "finished";
+        case RunState::Aborted: return "aborted";
+        case RunState::Stopped: return "stopped";
         }
         return "?";
     }
 
-    void Finish(const char* why)
+    // What the current step is waiting for, or "" when it is not waiting.
+    std::string WaitingFor(unsigned long long now)
     {
-        g_running = false;
+        if (!g_running || g_stepIndex >= g_steps.size())
+        {
+            return "";
+        }
+        const testbot::Step& step = g_steps[g_stepIndex];
+        const unsigned long long left = g_phase == 0 ? static_cast<unsigned long long>(step.a)
+                                                     : (g_deadline > now ? g_deadline - now : 0);
+        char text[240];
+        switch (step.op)
+        {
+        case testbot::Op::WaitWorld:
+            _snprintf_s(text, sizeof(text), _TRUNCATE,
+                "the game world (load a save or start a new game); %llu s before the run aborts", (left + 999) / 1000);
+            return text;
+        case testbot::Op::WaitScreen:
+        {
+            const char* current = CurrentScreen(now);
+            _snprintf_s(text, sizeof(text), _TRUNCATE, "screen %s (now %s); %llu s before the run aborts",
+                step.text.c_str(), current != nullptr ? current : "none drawn in the last second", (left + 999) / 1000);
+            return text;
+        }
+        case testbot::Op::Wait:
+            _snprintf_s(text, sizeof(text), _TRUNCATE, "pause, %llu ms left", left);
+            return text;
+        case testbot::Op::Snapshot:
+            if (g_phase != 0)
+            {
+                _snprintf_s(text, sizeof(text), _TRUNCATE, "snapshot %s: %d/%d frame(s) captured", g_captureName,
+                    g_captureDone.load(), g_captureTotal);
+                return text;
+            }
+            return "";
+        default:
+            return "";
+        }
+    }
+
+    // Minimal JSON object builder; fields in insertion order.
+    struct JsonObject
+    {
+        std::string text = "{";
+        bool first = true;
+
+        void Key(const char* name)
+        {
+            text += first ? "\"" : ",\"";
+            first = false;
+            text += name;
+            text += "\":";
+        }
+
+        void Raw(const char* name, const std::string& value)
+        {
+            Key(name);
+            text += value;
+        }
+
+        void Str(const char* name, std::string_view value)
+        {
+            Key(name);
+            text += testbot::JsonQuote(value);
+        }
+
+        void StrOrNull(const char* name, const char* value)
+        {
+            Key(name);
+            text += value != nullptr && value[0] != '\0' ? testbot::JsonQuote(value) : std::string("null");
+        }
+
+        void Num(const char* name, long long value)
+        {
+            Key(name);
+            text += std::to_string(value);
+        }
+
+        void Bool(const char* name, bool value)
+        {
+            Key(name);
+            text += value ? "true" : "false";
+        }
+
+        void Null(const char* name)
+        {
+            Key(name);
+            text += "null";
+        }
+
+        std::string Close()
+        {
+            text += '}';
+            return text;
+        }
+    };
+
+    std::string JsonSize(int width, int height)
+    {
+        return width > 0 && height > 0 ? "[" + std::to_string(width) + "," + std::to_string(height) + "]"
+                                       : std::string("null");
+    }
+
+    std::string BuildStatus(unsigned long long now)
+    {
+        char stamp[40];
+        UtcNow(stamp);
+        const std::string waiting = WaitingFor(now);
+        JsonObject json;
+        json.Num("schema", StatusSchema);
+        json.Str("updated_utc", stamp);
+        json.Num("run_ms", static_cast<long long>(now - g_resultsStartMs));
+        json.Num("pid", static_cast<long long>(GetCurrentProcessId()));
+        json.Str("state", g_running && !waiting.empty() ? "waiting" : RunStateName(g_runState));
+        if (g_jobIndex == 0)
+        {
+            json.Str("reason", g_notRunningReason);
+        }
+        json.StrOrNull("result", g_result);
+        json.Str("run_dir", Utf8(g_runDirectory));
+        if (g_jobIndex != 0)
+        {
+            JsonObject job;
+            job.Num("index", g_jobIndex);
+            job.Str("name", g_jobName);
+            job.Str("source", g_jobSource);
+            json.Raw("job", job.Close());
+        }
+        else
+        {
+            json.Null("job");
+        }
+        json.Num("steps_total", static_cast<long long>(g_steps.size()));
+        json.Num("steps_done", static_cast<long long>(g_stepIndex));
+        if (g_running && g_stepIndex < g_steps.size())
+        {
+            const testbot::Step& step = g_steps[g_stepIndex];
+            JsonObject current;
+            current.Num("index", static_cast<long long>(g_stepIndex + 1));
+            current.Num("line", step.line);
+            current.Str("command", testbot::DescribeStep(step));
+            current.Num("elapsed_ms", static_cast<long long>(now - g_stepStartedMs));
+            json.Raw("step", current.Close());
+        }
+        else
+        {
+            json.Null("step");
+        }
+        json.StrOrNull("waiting_for", waiting.c_str());
+        json.Num("checks", g_checks);
+        json.Num("failures", g_failures);
+        json.StrOrNull("last_failure", g_lastFailure.c_str());
+        json.Bool("screen_detection", g_screenDetection);
+        json.StrOrNull("screen", g_screenDetection ? CurrentScreen(now) : nullptr);
+        json.Bool("world_detection", g_originalUpdate != nullptr);
+        const bool inWorld = InWorld();
+        json.Bool("in_world", inWorld);
+        json.Raw("bar_set", inWorld ? std::to_string(g_barSet) : std::string("null"));
+        int width = 0, height = 0, drawableWidth = 0, drawableHeight = 0;
+        void* window = FocusWindow();
+        if (window != nullptr && g_getWindowSize != nullptr)
+        {
+            g_getWindowSize(window, &width, &height);
+        }
+        if (window != nullptr && g_getDrawableSizeForLog != nullptr)
+        {
+            g_getDrawableSizeForLog(window, &drawableWidth, &drawableHeight);
+        }
+        json.Raw("window", JsonSize(width, height));
+        json.Raw("drawable", JsonSize(drawableWidth, drawableHeight));
         unsigned long blocked = 0;
         for (const BlockedMethod& method : g_blocked)
         {
             blocked += static_cast<unsigned long>(method.calls);
         }
-        Log("script %s after %zu/%zu steps in %llu ms: %u check(s), %u failure(s) -> %s. Achievements/stats stay blocked until the game exits (%lu call(s) blocked so far).",
-            why, g_stepIndex, g_steps.size(), NowMs() - g_startedMs, g_checks, g_failures,
-            g_failures == 0 && std::strcmp(why, "finished") == 0 ? "PASS" : "FAIL", blocked);
+        json.Num("blocked_steam_calls", blocked);
+        json.Bool("screen_capture", g_captureReady);
+        json.Num("snapshots_written", g_snapshotsWritten.load());
+        if (g_liveFrameMs != 0 && g_captureReady)
+        {
+            JsonObject live;
+            live.Str("file", Utf8(g_testBotDirectory) + "\\live.png");
+            live.Num("every_ms", static_cast<long long>(g_liveFrameMs));
+            live.Num("frames", g_liveFrames.load());
+            const unsigned long long written = g_liveWrittenMs.load();
+            live.Raw("age_ms", written != 0 ? std::to_string(now - written) : std::string("null"));
+            live.Raw("size", JsonSize(g_liveWidth.load(), g_liveHeight.load()));
+            live.Num("errors", g_liveErrors.load());
+            json.Raw("live_frame", live.Close());
+        }
+        else
+        {
+            json.Null("live_frame");
+        }
+        if (g_inbox)
+        {
+            JsonObject inbox;
+            inbox.Str("dir", Utf8(g_testBotDirectory) + "\\inbox");
+            inbox.Bool("accepting", g_ready && !g_running);
+            inbox.Num("pending", g_inboxPending);
+            inbox.Num("jobs_done", g_jobsDone);
+            inbox.StrOrNull("last_error", g_lastJobError.c_str());
+            json.Raw("inbox", inbox.Close());
+        }
+        else
+        {
+            json.Null("inbox");
+        }
+        json.Num("loop_hz", g_loopHz);
+        std::string tail = "[";
+        AcquireSRWLockExclusive(&g_resultsLock);
+        try
+        {
+            for (std::size_t i = 0; i < g_logTailCount; ++i)
+            {
+                const std::size_t index = (g_logTailNext + LogTailLines - g_logTailCount + i) % LogTailLines;
+                tail += i == 0 ? "" : ",";
+                tail += testbot::JsonQuote(g_logTail[index]);
+            }
+        }
+        catch (...)
+        {
+            ReleaseSRWLockExclusive(&g_resultsLock);
+            throw;
+        }
+        ReleaseSRWLockExclusive(&g_resultsLock);
+        tail += "]";
+        json.Raw("log_tail", tail);
+        return json.Close() + "\n";
+    }
+
+    void WriteStatus(unsigned long long now)
+    {
+        if (g_testBotDirectory[0] == L'\0')
+        {
+            return;
+        }
+        try
+        {
+            const std::string text = BuildStatus(now);
+            wchar_t temporary[MAX_PATH * 2], path[MAX_PATH * 2];
+            swprintf_s(temporary, L"%s\\status.tmp.json", g_testBotDirectory);
+            swprintf_s(path, L"%s\\status.json", g_testBotDirectory);
+            PublishFile(temporary, path, text.data(), text.size());
+        }
+        catch (...)
+        {
+        }
+        g_statusDirty.store(false);
+        g_statusForce = false;
+        g_statusWrittenMs = now;
+    }
+
+    // Once per frame: the loop rate, then a write on change (at most every
+    // 100 ms), on demand (Finish) or as the heartbeat (every second).
+    void UpdateStatus(unsigned long long now)
+    {
+        ++g_loopTicks;
+        if (now - g_loopRateMs >= LoopRateWindowMs)
+        {
+            g_loopHz = static_cast<unsigned int>(g_loopTicks * 1000 / (now - g_loopRateMs));
+            g_loopTicks = 0;
+            g_loopRateMs = now;
+        }
+        const unsigned long long since = now - g_statusWrittenMs;
+        if (g_statusForce || since >= StatusHeartbeatMs || (g_statusDirty.load() && since >= StatusMinIntervalMs))
+        {
+            WriteStatus(now);
+        }
+    }
+
+    // ===========================================================================
+    // Script runner
+    // ===========================================================================
+    void Finish(const char* why)
+    {
+        g_running = false;
+        g_captureActive.store(false);   // a snapshot series does not outlive its job
+        const bool finished = std::strcmp(why, "finished") == 0;
+        const bool stopped = std::strcmp(why, "stopped") == 0;
+        g_runState = finished ? RunState::Finished : (stopped ? RunState::Stopped : RunState::Aborted);
+        g_result = stopped ? "STOPPED" : (g_failures == 0 && finished ? "PASS" : "FAIL");
+        ++g_jobsDone;
+        g_statusForce = true;
+        unsigned long blocked = 0;
+        for (const BlockedMethod& method : g_blocked)
+        {
+            blocked += static_cast<unsigned long>(method.calls);
+        }
+        Log("script %s %s after %zu/%zu steps in %llu ms: %u check(s), %u failure(s) -> %s. Achievements/stats stay blocked until the game exits (%lu call(s) blocked so far).",
+            g_jobName.c_str(), why, g_stepIndex, g_steps.size(), NowMs() - g_startedMs, g_checks, g_failures, g_result, blocked);
     }
 
     void NextStep()
@@ -1634,7 +2104,14 @@ namespace
     void Fail(const testbot::Step& step, const char* message, bool abort)
     {
         ++g_failures;
-        Log("FAIL line %d (%s): %s", step.line, OpName(step.op), message);
+        Log("FAIL line %d (%s): %s", step.line, testbot::OpName(step.op), message);
+        try
+        {
+            g_lastFailure = "line " + std::to_string(step.line) + " (" + testbot::OpName(step.op) + "): " + message;
+        }
+        catch (...)
+        {
+        }
         if (abort || g_stopOnFailure)
         {
             Finish("aborted");
@@ -1931,9 +2408,25 @@ namespace
                 NextStep();
                 return true;
             }
-            PushText(step.text[static_cast<std::size_t>(g_counter)]);
+        {
+            // Like a real keystroke: key down + SDL_TEXTINPUT, then key up on the next frame.
+            // Text events alone lose the second of two equal characters in a row ("Freezing"
+            // arrived as "Frezing"): the game's text field wants a key release in between.
+            const char character = step.text[static_cast<std::size_t>(g_counter)];
+            const std::uint32_t keycode = static_cast<unsigned char>(
+                character >= 'A' && character <= 'Z' ? character - 'A' + 'a' : character);
+            if (g_phase == 0)
+            {
+                PushKey(keycode, true);
+                PushText(character);
+                g_phase = 1;
+                return false;
+            }
+            PushKey(keycode, false);
+            g_phase = 0;
             ++g_counter;
-            return false;   // one character per frame
+            return false;   // one character per two frames
+        }
 
         case testbot::Op::Move:
             if (!WarpTo(static_cast<int>(step.a), static_cast<int>(step.b)))
@@ -2011,50 +2504,18 @@ namespace
         return true;
     }
 
-    // Called on the game thread once per frame (after the event queue drains).
-    void Tick()
-    {
-        const unsigned long long now = NowMs();
-        UpdateCurrentScreen(now);
-        if (!g_running)
-        {
-            return;
-        }
-        for (int budget = 0; budget < 32 && g_running; ++budget)
-        {
-            if (g_stepIndex >= g_steps.size())
-            {
-                Finish("finished");
-                return;
-            }
-            if (g_announcedStep != g_stepIndex)
-            {
-                g_announcedStep = g_stepIndex;
-                char line[96];
-                _snprintf_s(line, sizeof(line), _TRUNCATE, "step %zu/%zu: line %d %s", g_stepIndex + 1, g_steps.size(),
-                    g_steps[g_stepIndex].line, OpName(g_steps[g_stepIndex].op));
-                ResultLine(line);
-            }
-            if (!RunStep(g_steps[g_stepIndex], now))
-            {
-                return;
-            }
-        }
-    }
-
-    int PollEventHook(void* event)
-    {
-        const int result = g_originalPollEvent(event);
-        if (result == 0)
-        {
-            Tick();
-        }
-        return result;
-    }
-
     // ===========================================================================
-    // Setup
+    // Jobs and the inbox (the agent -> bot channel)
+    //
+    // A job is one script: the INI script at start-up, then every *.script file
+    // dropped into <TestBot>\inbox, taken in name order whenever no job runs.
+    // A taken file is moved into the run folder (jobNN_<name>), so it runs once
+    // and the run keeps a copy. A file still open for writing is left alone
+    // until its writer closes it (writers should write a temporary name and
+    // rename). A file named `stop` in the inbox aborts the running job.
     // ===========================================================================
+    constexpr unsigned long long InboxPollMs = 500;
+
     bool ValidScriptName(const wchar_t* name)
     {
         if (name[0] == L'\0' || wcsstr(name, L"..") != nullptr)
@@ -2072,21 +2533,17 @@ namespace
         return true;
     }
 
-    bool LoadScript(const wchar_t* iniPath)
+    // Reads and parses a script file. False with `message` when it cannot run;
+    // `busy` is set when another process still has the file open for writing.
+    bool ReadScript(const wchar_t* path, std::vector<testbot::Step>& steps, char (&message)[320], bool* busy)
     {
-        wchar_t name[64]{};
-        GetPrivateProfileStringW(L"TestBot", L"Script", L"TestBot.script", name, 64, iniPath);
-        if (!ValidScriptName(name))
-        {
-            Log("Script=%S is not a plain file name in the plugin folder; bot will not run", name);
-            return false;
-        }
-        wchar_t path[MAX_PATH * 2];
-        swprintf_s(path, L"%s%s", g_extender->pluginDirectory, name);
+        *busy = false;
         HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE)
         {
-            Log("cannot open script %S (error %lu); bot will not run", path, GetLastError());
+            const DWORD error = GetLastError();
+            *busy = error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION;
+            _snprintf_s(message, sizeof(message), _TRUNCATE, "cannot open %S (error %lu)", path, error);
             return false;
         }
         LARGE_INTEGER size{};
@@ -2103,22 +2560,247 @@ namespace
         CloseHandle(file);
         if (!ok)
         {
-            Log("cannot read script %S (missing, unreadable or over 64 KiB); bot will not run", path);
+            _snprintf_s(message, sizeof(message), _TRUNCATE, "cannot read %S (unreadable or over 64 KiB)", path);
             return false;
         }
         testbot::ParseResult parsed = testbot::ParseScript(text);
         if (!parsed.ok)
         {
-            Log("script %S line %d: %s; bot will not run", path, parsed.errorLine, parsed.error.c_str());
+            _snprintf_s(message, sizeof(message), _TRUNCATE, "line %d: %s", parsed.errorLine, parsed.error.c_str());
             return false;
         }
         if (parsed.steps.empty())
         {
-            Log("script %S has no steps; bot will not run", path);
+            _snprintf_s(message, sizeof(message), _TRUNCATE, "no steps");
             return false;
         }
-        g_steps = std::move(parsed.steps);
-        Log("script %S loaded: %zu step(s)", path, g_steps.size());
+        steps = std::move(parsed.steps);
+        return true;
+    }
+
+    // Hooks a job may need, installed once, when first needed (also mid-session).
+    void EnsureScreenCapture()
+    {
+        if (!g_captureInstallTried)
+        {
+            g_captureInstallTried = true;
+            InstallScreenCapture(g_gameBase);
+        }
+    }
+
+    void EnsureScreenDetection()
+    {
+        if (!g_screenInstallTried)
+        {
+            g_screenInstallTried = true;
+            InstallScreenDetection(g_gameBase);
+        }
+    }
+
+    void BeginJob(std::vector<testbot::Step>&& steps, const char* name, const char* source)
+    {
+        g_steps = std::move(steps);
+        g_stepIndex = 0;
+        g_phase = 0;
+        g_counter = 0;
+        g_failures = 0;
+        g_checks = 0;
+        g_announcedStep = static_cast<std::size_t>(-1);
+        g_lastFailure.clear();
+        g_result = nullptr;
+        ++g_jobIndex;
+        g_jobName = name;
+        g_jobSource = source;
+        if (ScriptHasSnapshots())
+        {
+            EnsureScreenCapture();
+        }
+        if (ScriptUsesScreens())
+        {
+            EnsureScreenDetection();
+        }
+        g_startedMs = NowMs();
+        g_stepStartedMs = g_startedMs;
+        g_running = true;
+        g_runState = RunState::Running;
+        g_statusForce = true;
+        Log("job %u (%s) %s ACTIVE: %zu step(s), stop on failure=%d; achievements and stats are blocked for this session",
+            g_jobIndex, source, name, g_steps.size(), g_stopOnFailure ? 1 : 0);
+    }
+
+    void TakeInboxScript(const wchar_t* name)
+    {
+        wchar_t path[MAX_PATH * 2];
+        swprintf_s(path, L"%s\\inbox\\%s", g_testBotDirectory, name);
+        std::vector<testbot::Step> steps;
+        char message[320];
+        bool busy = false;
+        const bool ok = ReadScript(path, steps, message, &busy);
+        if (!ok && busy)
+        {
+            return;   // still being written; next poll
+        }
+        // Taken: into the run folder (a copy for the record), or gone.
+        bool consumed = false;
+        if (g_runDirectory[0] != L'\0')
+        {
+            wchar_t kept[MAX_PATH * 2];
+            swprintf_s(kept, L"%s\\job%02u_%s", g_runDirectory, g_jobIndex + 1, name);
+            consumed = MoveFileExW(path, kept, MOVEFILE_REPLACE_EXISTING) != FALSE;
+        }
+        if (!consumed)
+        {
+            consumed = DeleteFileW(path) != FALSE;
+        }
+        if (!consumed)
+        {
+            wcscpy_s(g_inboxStuck, name);   // never take it again this session
+            Log("inbox: %S could neither be moved nor deleted (error %lu); ignored from now on", name, GetLastError());
+            return;
+        }
+        if (!ok)
+        {
+            Log("inbox: %S skipped: %s", name, message);
+            try
+            {
+                g_lastJobError = Utf8(name) + ": " + message;
+            }
+            catch (...)
+            {
+            }
+            g_statusForce = true;
+            return;
+        }
+        g_lastJobError.clear();
+        BeginJob(std::move(steps), Utf8(name).c_str(), "inbox");
+    }
+
+    // Every 500 ms: the stop file, then (when idle) the next script in name order.
+    void PollInbox(unsigned long long now)
+    {
+        if (!g_inbox || !g_ready || g_testBotDirectory[0] == L'\0' || now - g_inboxCheckedMs < InboxPollMs)
+        {
+            return;
+        }
+        g_inboxCheckedMs = now;
+        wchar_t stopPath[MAX_PATH * 2];
+        swprintf_s(stopPath, L"%s\\inbox\\stop", g_testBotDirectory);
+        if (GetFileAttributesW(stopPath) != INVALID_FILE_ATTRIBUTES && DeleteFileW(stopPath))
+        {
+            if (g_running)
+            {
+                Log("inbox: stop received during step %zu/%zu", g_stepIndex + 1, g_steps.size());
+                Finish("stopped");
+            }
+            else
+            {
+                Log("inbox: stop received, nothing was running");
+            }
+        }
+        wchar_t pattern[MAX_PATH * 2];
+        swprintf_s(pattern, L"%s\\inbox\\*.script", g_testBotDirectory);
+        WIN32_FIND_DATAW data{};
+        HANDLE find = FindFirstFileW(pattern, &data);
+        unsigned int pending = 0;
+        wchar_t next[MAX_PATH] = L"";
+        if (find != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 || !ValidScriptName(data.cFileName)
+                    || wcscmp(data.cFileName, g_inboxStuck) == 0)
+                {
+                    continue;
+                }
+                ++pending;
+                if (next[0] == L'\0' || wcscmp(data.cFileName, next) < 0)
+                {
+                    wcscpy_s(next, data.cFileName);
+                }
+            } while (FindNextFileW(find, &data));
+            FindClose(find);
+        }
+        if (pending != g_inboxPending)
+        {
+            g_inboxPending = pending;
+            g_statusDirty.store(true);
+        }
+        if (!g_running && next[0] != L'\0')
+        {
+            TakeInboxScript(next);
+        }
+    }
+
+    void RunSteps(unsigned long long now)
+    {
+        for (int budget = 0; budget < 32 && g_running; ++budget)
+        {
+            if (g_stepIndex >= g_steps.size())
+            {
+                Finish("finished");
+                return;
+            }
+            if (g_announcedStep != g_stepIndex)
+            {
+                g_announcedStep = g_stepIndex;
+                g_stepStartedMs = now;
+                char line[400];
+                _snprintf_s(line, sizeof(line), _TRUNCATE, "step %zu/%zu: line %d %s", g_stepIndex + 1, g_steps.size(),
+                    g_steps[g_stepIndex].line, testbot::DescribeStep(g_steps[g_stepIndex]).c_str());
+                ResultLine(line);
+            }
+            if (!RunStep(g_steps[g_stepIndex], now))
+            {
+                return;
+            }
+        }
+    }
+
+    // Called on the game thread once per frame (after the event queue drains).
+    void Tick()
+    {
+        const unsigned long long now = NowMs();
+        UpdateCurrentScreen(now);
+        PollInbox(now);
+        if (g_running)
+        {
+            RunSteps(now);
+        }
+        UpdateStatus(now);
+    }
+
+    int PollEventHook(void* event)
+    {
+        const int result = g_originalPollEvent(event);
+        if (result == 0)
+        {
+            Tick();
+        }
+        return result;
+    }
+
+    // ===========================================================================
+    // Setup
+    // ===========================================================================
+    // The INI script (Script=, default TestBot.script, in the plugin folder).
+    bool LoadScript(const wchar_t* iniPath, std::vector<testbot::Step>& steps, wchar_t (&name)[64])
+    {
+        GetPrivateProfileStringW(L"TestBot", L"Script", L"TestBot.script", name, 64, iniPath);
+        if (!ValidScriptName(name))
+        {
+            Log("Script=%S is not a plain file name in the plugin folder; it will not run", name);
+            return false;
+        }
+        wchar_t path[MAX_PATH * 2];
+        swprintf_s(path, L"%s%s", g_extender->pluginDirectory, name);
+        char message[320];
+        bool busy = false;
+        if (!ReadScript(path, steps, message, &busy))
+        {
+            Log("script %S: %s; it will not run", path, message);
+            return false;
+        }
+        Log("script %S loaded: %zu step(s)", path, steps.size());
         return true;
     }
 
@@ -2187,6 +2869,9 @@ namespace
         g_getWindowId = reinterpret_cast<SdlGetWindowIdFn>(GetProcAddress(sdl, "SDL_GetWindowID"));
         g_warpMouse = reinterpret_cast<SdlWarpMouseInWindowFn>(GetProcAddress(sdl, "SDL_WarpMouseInWindow"));
         g_getMouseState = reinterpret_cast<SdlGetMouseStateFn>(GetProcAddress(sdl, "SDL_GetMouseState"));
+        // Optional (log_screen and status.json): window and drawable size.
+        g_getWindowSize = reinterpret_cast<SdlGetWindowSizeFn>(GetProcAddress(sdl, "SDL_GetWindowSize"));
+        g_getDrawableSizeForLog = reinterpret_cast<SdlGetWindowSizeFn>(GetProcAddress(sdl, "SDL_GL_GetDrawableSize"));
         return g_pushEvent != nullptr && g_getTicks != nullptr && g_getModState != nullptr && g_setModState != nullptr
             && g_getScancodeFromKey != nullptr && g_getKeyboardFocus != nullptr && g_getMouseFocus != nullptr
             && g_getWindowId != nullptr && g_warpMouse != nullptr && g_getMouseState != nullptr;
@@ -2206,6 +2891,9 @@ namespace
         OpenRunFolder();
         g_stopOnFailure = GetPrivateProfileIntW(L"TestBot", L"StopOnFailure", 0, iniPath) != 0;
         g_logBlockedCalls = GetPrivateProfileIntW(L"TestBot", L"LogBlockedCalls", 1, iniPath) != 0;
+        const int liveFrameMs = static_cast<int>(GetPrivateProfileIntW(L"TestBot", L"LiveFrameMs", DefaultLiveFrameMs, iniPath));
+        g_liveFrameMs = liveFrameMs <= 0 ? 0
+            : static_cast<unsigned long long>(liveFrameMs < MinLiveFrameMs ? MinLiveFrameMs : liveFrameMs);
         InitializeCriticalSection(&g_patchLock);
         InitBlockedTable();
 
@@ -2219,7 +2907,10 @@ namespace
         }
 
         // 2. Script and input.
-        const bool scriptOk = LoadScript(iniPath);
+        g_inbox = GetPrivateProfileIntW(L"TestBot", L"Inbox", 1, iniPath) != 0;
+        std::vector<testbot::Step> steps;
+        wchar_t scriptName[64]{};
+        const bool scriptOk = LoadScript(iniPath, steps, scriptName);
         if (!ResolveSdl())
         {
             Log("SDL2.dll functions not found; bot will not run (blocking stays on)");
@@ -2240,22 +2931,39 @@ namespace
             Log("patching the SDL_PollEvent import failed; bot will not run (blocking stays on)");
             return;
         }
-        if (!scriptOk)
+        g_ready = true;
+        g_gameBase = base;
+        if (g_inbox && g_testBotDirectory[0] != L'\0')
         {
-            return;
+            wchar_t inbox[MAX_PATH * 2];
+            swprintf_s(inbox, L"%s\\inbox", g_testBotDirectory);
+            CreateDirectoryW(inbox, nullptr);
+            Log("inbox open: *.script files in %S run in name order when no script runs; a file named `stop` aborts the running one",
+                inbox);
         }
-        if (ScriptHasSnapshots())
+        // Live frames do not need a script: whoever watches still sees the screen.
+        if (g_liveFrameMs != 0)
         {
-            InstallScreenCapture(base);
+            EnsureScreenCapture();
+            if (g_captureReady)
+            {
+                Log("live frame: %S\\live.png will be refreshed every %llu ms (LiveFrameMs; 0 turns it off)",
+                    g_testBotDirectory, g_liveFrameMs);
+            }
+            else
+            {
+                Log("live frame off: screen capture unavailable (LiveFrameMs=%llu ignored)", g_liveFrameMs);
+            }
         }
-        if (ScriptUsesScreens())
+        if (scriptOk)
         {
-            InstallScreenDetection(base);
+            BeginJob(std::move(steps), Utf8(scriptName).c_str(), "ini");
         }
-        g_startedMs = NowMs();
-        g_running = true;
-        Log("bot ACTIVE: %zu step(s), stop on failure=%d; achievements and stats are blocked for this session",
-            g_steps.size(), g_stopOnFailure ? 1 : 0);
+        else if (g_inbox)
+        {
+            g_runState = RunState::Idle;
+            Log("idle: waiting for a script in the inbox");
+        }
     }
 }
 
@@ -2284,6 +2992,11 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
         // Fail closed: nothing runs, and the report says why.
         soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_INACTIVE, g_startupReason.Last());
     }
+    else if (!g_running && g_ready && g_inbox)
+    {
+        soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_ACTIVE,
+            "achievements and stats blocked; idle, inbox open");
+    }
     else if (!g_running)
     {
         char detail[200];
@@ -2295,6 +3008,15 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(
     {
         soulash_plugins::ReportStatus(extender, SOULASH_PLUGIN_STATUS_ACTIVE,
             "achievements and stats blocked; script running");
+    }
+    // First status.json right away, so a watcher learns at once whether (and why not) the bot runs.
+    if (g_enabled && g_testBotDirectory[0] != L'\0')
+    {
+        if (!g_running)
+        {
+            g_notRunningReason = g_startupReason.Last();
+        }
+        WriteStatus(NowMs());
     }
     return TRUE;
 }
@@ -2317,6 +3039,26 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved)
             WriteFile(g_results, text, static_cast<DWORD>(length), &written, nullptr);
         }
         ReleaseSRWLockExclusive(&g_resultsLock);
+    }
+    // ... and a last status.json saying the game exited normally (fixed buffer, kernel32 only).
+    if (reason == DLL_PROCESS_DETACH && reserved != nullptr && g_enabled && g_testBotDirectory[0] != L'\0')
+    {
+        char stamp[40];
+        UtcNow(stamp);
+        char text[512];
+        const int length = _snprintf_s(text, sizeof(text), _TRUNCATE,
+            "{\"schema\":%d,\"updated_utc\":\"%s\",\"run_ms\":%llu,\"pid\":%lu,\"state\":\"exited\",\"script\":\"%s\","
+            "\"result\":%s%s%s,\"steps_done\":%zu,\"steps_total\":%zu,\"checks\":%u,\"failures\":%u}\n",
+            StatusSchema, stamp, GetTickCount64() - g_resultsStartMs, GetCurrentProcessId(), RunStateName(g_runState),
+            g_result != nullptr ? "\"" : "", g_result != nullptr ? g_result : "null", g_result != nullptr ? "\"" : "",
+            g_stepIndex, g_steps.size(), g_checks, g_failures);
+        if (length > 0)
+        {
+            wchar_t temporary[MAX_PATH * 2], path[MAX_PATH * 2];
+            swprintf_s(temporary, L"%s\\status.tmp.json", g_testBotDirectory);
+            swprintf_s(path, L"%s\\status.json", g_testBotDirectory);
+            PublishFile(temporary, path, text, static_cast<std::size_t>(length));
+        }
     }
     return TRUE;
 }

@@ -20,7 +20,7 @@
 //   wait_screen <Screen> [timeout_ms]  until that screen class is drawn (default 30000; timeout aborts)
 //   expect_screen <Screen>          check the screen drawn last (counted PASS/FAIL)
 //   log_screen                      log the current screen and the window size
-//   type <text>                     text input (SDL_TEXTINPUT), one character per frame; printable
+//   type <text>                     typed text (key down + SDL_TEXTINPUT, key up next frame); printable
 //                                   ASCII, no '#' (comment), leading/trailing blanks dropped
 //   move <x> <y>                    move the mouse there (hover)
 //   drag <x1> <y1> <x2> <y2> [left|right|middle]  press at 1, move in steps, release at 2
@@ -526,6 +526,205 @@ namespace soulash_plugins::testbot
         }
         result.ok = true;
         return result;
+    }
+
+    // ---- Names for log lines and the live status (the inverse of the parser) ----
+    inline const char* OpName(Op op)
+    {
+        switch (op)
+        {
+        case Op::Wait: return "wait";
+        case Op::WaitWorld: return "wait_world";
+        case Op::Key: return "key";
+        case Op::KeyDown: return "key_down";
+        case Op::KeyUp: return "key_up";
+        case Op::Mod: return "mod";
+        case Op::Wheel: return "wheel";
+        case Op::Click: return "click";
+        case Op::ExpectBarSet: return "expect_bar_set";
+        case Op::Log: return "log";
+        case Op::Snapshot: return "snapshot";
+        case Op::ModsErrors: return "mods_errors";
+        case Op::WaitScreen: return "wait_screen";
+        case Op::ExpectScreen: return "expect_screen";
+        case Op::LogScreen: return "log_screen";
+        case Op::Type: return "type";
+        case Op::Move: return "move";
+        case Op::Drag: return "drag";
+        case Op::DoubleClick: return "dclick";
+        }
+        return "?";
+    }
+
+    // The script name of an SDL keycode (ParseKeyName in reverse); unknown codes as decimal.
+    inline std::string KeyName(std::uint32_t keycode)
+    {
+        constexpr std::uint32_t Scan = 1u << 30;
+        if ((keycode >= 'a' && keycode <= 'z') || (keycode >= '0' && keycode <= '9'))
+        {
+            return std::string(1, static_cast<char>(keycode));
+        }
+        if (keycode >= (Scan | 58) && keycode <= (Scan | 69))
+        {
+            return "f" + std::to_string(keycode - (Scan | 58) + 1);
+        }
+        struct Named
+        {
+            std::uint32_t code;
+            const char* name;
+        };
+        static const Named names[] = {
+            {32, "space"}, {13, "enter"}, {27, "escape"}, {9, "tab"}, {8, "backspace"},
+            {Scan | 79, "right"}, {Scan | 80, "left"}, {Scan | 81, "down"}, {Scan | 82, "up"},
+            {Scan | 224, "lctrl"}, {Scan | 225, "lshift"}, {Scan | 226, "lalt"},
+            {Scan | 228, "rctrl"}, {Scan | 229, "rshift"}, {Scan | 230, "ralt"},
+        };
+        for (const Named& entry : names)
+        {
+            if (entry.code == keycode)
+            {
+                return entry.name;
+            }
+        }
+        return std::to_string(keycode);
+    }
+
+    inline std::string ModName(std::int64_t mask)
+    {
+        if (mask == ModNone)
+        {
+            return "none";
+        }
+        std::string out;
+        auto add = [&out](const char* name) {
+            out += out.empty() ? "" : "+";
+            out += name;
+        };
+        if ((mask & ModLCtrl) != 0)
+        {
+            add("ctrl");
+        }
+        if ((mask & ModLShift) != 0)
+        {
+            add("shift");
+        }
+        if ((mask & ModLAlt) != 0)
+        {
+            add("alt");
+        }
+        return out.empty() ? std::to_string(mask) : out;
+    }
+
+    inline const char* ButtonName(std::int64_t button)
+    {
+        return button == 1 ? "left" : (button == 2 ? "middle" : (button == 3 ? "right" : "?"));
+    }
+
+    // The step as a script line, normalised: defaults filled in, keywords in
+    // lower case. Parsing the result gives the same step back.
+    inline std::string DescribeStep(const Step& step)
+    {
+        std::string out = OpName(step.op);
+        auto num = [&out](std::int64_t value) {
+            out += ' ';
+            out += std::to_string(value);
+        };
+        auto word = [&out](const std::string& value) {
+            out += ' ';
+            out += value;
+        };
+        switch (step.op)
+        {
+        case Op::Wait:
+        case Op::WaitWorld:
+        case Op::Wheel:
+        case Op::ExpectBarSet:
+            num(step.a);
+            break;
+        case Op::Key:
+            word(KeyName(step.key));
+            num(step.b);
+            break;
+        case Op::KeyDown:
+        case Op::KeyUp:
+            word(KeyName(step.key));
+            break;
+        case Op::Mod:
+            word(ModName(step.a));
+            break;
+        case Op::Click:
+        case Op::DoubleClick:
+            num(step.a);
+            num(step.b);
+            word(ButtonName(step.c));
+            break;
+        case Op::Move:
+            num(step.a);
+            num(step.b);
+            break;
+        case Op::Drag:
+            num(step.a);
+            num(step.b);
+            num(step.c);
+            num(step.d);
+            word(ButtonName(step.e));
+            break;
+        case Op::Log:
+        case Op::Type:
+        case Op::ExpectScreen:
+            word(step.text);
+            break;
+        case Op::WaitScreen:
+            word(step.text);
+            num(step.a);
+            break;
+        case Op::Snapshot:
+            word(step.text);
+            num(step.a);
+            num(step.b);
+            break;
+        case Op::ModsErrors:
+            if (step.a >= 0)
+            {
+                num(step.a);
+            }
+            break;
+        case Op::LogScreen:
+            break;
+        }
+        return out;
+    }
+
+    // `text` as a JSON string literal, quotes included. Bytes above 0x7F pass
+    // through unchanged (the input is UTF-8); control characters become \uXXXX.
+    inline std::string JsonQuote(std::string_view text)
+    {
+        std::string out = "\"";
+        for (const char c : text)
+        {
+            const auto byte = static_cast<unsigned char>(c);
+            switch (c)
+            {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (byte < 0x20)
+                {
+                    char escaped[8];
+                    std::snprintf(escaped, sizeof(escaped), "\\u%04X", byte);
+                    out += escaped;
+                }
+                else
+                {
+                    out += c;
+                }
+            }
+        }
+        out += '"';
+        return out;
     }
 
     // steam_api64.dll's flat wrappers are `mov rax,[rcx]; jmp qword ptr [rax+d]`
