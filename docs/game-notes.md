@@ -8,8 +8,9 @@ is listed under.** Reproduce them with `tools/pe_xrefs.py`.
 
 | Build | `version.txt` | SHA-256 (first 8) | Seen in |
 | --- | --- | --- | --- |
-| newest | 0.10.5.1 | `60b72c10` | Steam update 2026-10-31; ability-bar layout re-verified (see below) |
-| previous | 0.10.4.0.1 | `924e1ef3` | game moved to `D:\games\Steam\...`; re-verified below; ability-bar probe runs |
+| newest | 0.10.6.1 | `526b6ab4` | Steam update 2026-11-06; plugins verified the ability-bar layout at load (see below) |
+| previous | 0.10.5.1 | `60b72c10` | Steam update 2026-10-31; ability-bar layout re-verified (see below) |
+| older | 0.10.4.0.1 | `924e1ef3` | game moved to `D:\games\Steam\...`; re-verified below; ability-bar probe runs |
 | older | 0.10.3.4 | `d10cec5f` | analysed in the sections below |
 | older | unknown | `7cec802f` | `proxy-crash.log` (2026-09-28), 23 crashes |
 | older | unknown | `09565e8d` | `proxy-crash.log`, 1 crash |
@@ -75,6 +76,32 @@ The BugSplat call is still the first thing `main` does after `IsDebuggerPresent`
 so the load-point conclusions above hold. Anchors found by string or RTTI name
 survived; every fixed RVA shifted by roughly 0x4000-0x4300, which is exactly
 why plugins should use the anchor API rather than addresses.
+
+## Build `526b6ab4` (0.10.6.1, 2026-11-06): extender survived the update
+
+Unlike the other sections, this is from runtime logs, not static analysis.
+The Steam update again kept the proxy (`BugSplat64.dll` still the proxy,
+`BugSplat64_original.dll` the vendor file), and `check-install.ps1` reported
+no plugin pin mismatch. In both game sessions after the update
+(`logs\proxy-crash.log`, pids 114296 and 30384) AbilityBarProbe and
+AbilityBarWheel accepted the build through their load-time layout check and
+hooked as before; one session loaded the mods twice, ten minutes apart, with
+no crash entry. RVAs derived from the logged runtime addresses (image base
+`0x7FF7CD770000` in pid 30384):
+
+| What | `60b72c10` | `526b6ab4` |
+| --- | --- | --- |
+| `DrawActionBar` vtable / `update` | `0x8D70C0` / `0x401120` | `0x8DF328` / `0x405060` |
+| player entity id global | `0xB07668` | `0xB11D6C` |
+| AbilityUser vtable | `0x8C14C8` | `0x8C9528` |
+| `SDL2.dll!SDL_PollEvent` IAT slot | not recorded | `0x8A43A8` |
+
+The struct offsets were not re-read by hand; the plugins' pattern check
+(`plugins/common/ability_bar_layout.hpp`) passing is the evidence. TestBot was
+disabled in both sessions, so its Steam-stats blocking and screen detection
+have not run on this build yet. Game changelog 0.10.6 lists no engine change
+that touches the extender; the only modding change is `required_items` on
+producers.
 
 ## Build `60b72c10` (0.10.5.1, 2026-10-31): ability bar unchanged
 
