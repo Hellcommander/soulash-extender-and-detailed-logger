@@ -437,9 +437,10 @@ void TestGameState()
     using namespace trigger_test_detail;
     FakeStorage health(gs::HealthSize), stamina(gs::StaminaSize), tags(gs::TagsSize), equipment(gs::EquipmentSize),
         skills(gs::SkillsSize), weapon(gs::WeaponSize), item(gs::ItemSize), abilityUser(gs::AbilityUserSize),
-        effects(gs::EffectsSize), party(gs::PartySize), player(gs::PlayerSize);
+        effects(gs::EffectsSize), party(gs::PartySize), player(gs::PlayerSize), name(gs::NameSize),
+        stackable(gs::StackableSize);
     const std::uint32_t holder = 4014, target = 77, sword = 100, shield = 101;   // one page: ids < 0x2000
-    const std::uint32_t companionA = 300, companionB = 301;
+    const std::uint32_t companionA = 300, companionB = 301, breadStack = 500, breadSingle = 501, nameless = 502;
     std::vector<std::unique_ptr<std::string>> keep;
 
     const std::size_t h = health.Add(holder);
@@ -467,12 +468,36 @@ void TestGameState()
     const std::size_t tt = tags.Add(target);
     tags.Set<const std::uint8_t*>(tt, gs::TagsBeginOffset, targetTagStrings.data());
     tags.Set<const std::uint8_t*>(tt, gs::TagsEndOffset, targetTagStrings.data() + 0x20);
+    std::vector<std::uint8_t> swordTagStrings(0x20);
+    PutString(swordTagStrings.data(), "artifact", keep);
+    const std::size_t st = tags.Add(sword);
+    tags.Set<const std::uint8_t*>(st, gs::TagsBeginOffset, swordTagStrings.data());
+    tags.Set<const std::uint8_t*>(st, gs::TagsEndOffset, swordTagStrings.data() + 0x20);
     tags.Finish();
 
+    // Backpack: a stack of 3 bread, one single bread, one entity without a Name.
+    std::vector<std::int32_t> backpack{static_cast<std::int32_t>(breadStack), static_cast<std::int32_t>(breadSingle),
+        static_cast<std::int32_t>(nameless)};
     const std::size_t e = equipment.Add(holder);
     equipment.Set<std::int32_t>(e, gs::EquipmentSlotsOffset + 4 * gs::SlotRightHand, static_cast<std::int32_t>(sword));
     equipment.Set<std::int32_t>(e, gs::EquipmentSlotsOffset + 4 * gs::SlotLeftHand, static_cast<std::int32_t>(shield));
+    equipment.Set<const std::int32_t*>(e, gs::EquipmentInventoryBeginOffset, backpack.data());
+    equipment.Set<const std::int32_t*>(e, gs::EquipmentInventoryEndOffset, backpack.data() + backpack.size());
     equipment.Finish();
+
+    // Name: data id at +8, display name at +0x28.
+    for (const auto& [entity, id, display] : std::vector<std::tuple<std::uint32_t, const char*, const char*>>{
+             {sword, "core_2_Ice_Rod", "Ice Rod"}, {shield, "183", "Robe"}, {breadStack, "803", "Wheat Bread"},
+             {breadSingle, "803", "Wheat Bread"}})
+    {
+        const std::size_t n = name.Add(entity);
+        PutString(name.dense.data() + n + gs::NameDataIdOffset, id, keep);
+        PutString(name.dense.data() + n + gs::NameDisplayOffset, display, keep);
+    }
+    name.Finish();
+    const std::size_t sc = stackable.Add(breadStack);
+    stackable.Set<std::int32_t>(sc, gs::StackableCountOffset, 3);
+    stackable.Finish();
 
     const std::size_t w = weapon.Add(sword);
     weapon.Set<std::int32_t>(w, gs::WeaponTypeOffset, 1);   // Sword
@@ -531,9 +556,18 @@ void TestGameState()
     access.effects = effects.Ref();
     access.party = party.Ref();
     access.player = player.Ref();
+    access.name = name.Ref();
+    access.stackable = stackable.Ref();
 
     soulash::conditions::Snapshot state;
     gs::BuildSnapshot(access, holder, target, state, clock);
+    Check(state.equipped.has && state.equipped.value.at("right_hand").item == "core_2_Ice_Rod"
+            && state.equipped.value.at("left_hand").item == "183"
+            && state.equipped.value.at("right_hand").itemTags == std::set<std::string>{"artifact"}
+            && state.equipped.value.at("left_hand").itemTags.empty(),
+        "state: equipped items carry their data id and entity tags");
+    Check(state.inventory.has && state.inventory.value.size() == 1 && state.inventory.value.at("803") == 4,
+        "state: backpack counts stacks per data id and skips nameless entities");
     Check(state.stackers.has && state.stackers.value.size() == 2 && state.stackers.value.at("flag") == 3
             && state.stackers.value.at("burn") == 2,
         "state: live stacks, expired and zero stacks left out");
@@ -564,13 +598,21 @@ void TestGameState()
     Check(state.weaponClass.has && state.weaponClass.value == "Sword", "state: weapon class from the right hand");
     Check(state.shield.has && state.shield.value, "state: shield in the left hand");
     Check(state.equipped.has && state.equipped.value.count("right_hand") == 1 && state.equipped.value.count("head_armor") == 0
-            && state.equipped.value.at("left_hand").itemType == "Shield" && state.equipped.value.at("left_hand").item.empty(),
-        "state: equipped slots carry the item type, not the data id");
+            && state.equipped.value.at("left_hand").itemType == "Shield",
+        "state: equipped slots carry the item type");
     Check(state.skills.has && state.skills.value.size() == 3 && state.skills.value.at("arendeth_runic_magic") == 5
             && state.skills.value.at("zzz_last") == 12,
         "state: skill levels read from the live std::map");
-    Check(!state.biome.has && !state.inventory.has && !state.inCombat.has && !state.inSettlement.has,
+    Check(!state.biome.has && !state.inCombat.has && !state.inSettlement.has,
         "state: predicates without a backing stay unknown");
+    {
+        gs::Access noNames = access;
+        noNames.name = gs::StorageRef{};
+        soulash::conditions::Snapshot blind;
+        gs::BuildSnapshot(noNames, holder, target, blind, clock);
+        Check(!blind.inventory.has && blind.equipped.has && blind.equipped.value.at("right_hand").item.empty(),
+            "state: without the Name storage the inventory is unknown and items keep no id");
+    }
 
     // The evaluator sees the same picture.
     const std::string document = "{\"spec\":1,\"triggers\":[{\"id\":\"t\",\"on\":{\"cast\":\"a\"},\"cast\":\"b\","
@@ -578,7 +620,9 @@ void TestGameState()
         "{\"holder_tag\":\"player\"},{\"target_tag\":[\"undead\"]},{\"skill_level\":{\"skill\":\"arendeth_runic_magic\",\"min\":5}},"
         "{\"equipped\":{\"slot\":\"left_hand\",\"item_type\":\"Shield\"}},{\"stamina_percent\":{\"min\":70}},"
         "{\"stacker\":{\"id\":\"flag\",\"min\":3}},{\"stacker\":{\"id\":\"old\",\"max\":0}},{\"party\":\"in_party\"},"
-        "{\"companions\":{\"min\":2,\"max\":2}},{\"time_of_day\":\"night\"},{\"season\":[\"winter\"]}]}}]}";
+        "{\"companions\":{\"min\":2,\"max\":2}},{\"time_of_day\":\"night\"},{\"season\":[\"winter\"]},"
+        "{\"equipped\":{\"slot\":\"right_hand\",\"item\":\"core_2_Ice_Rod\"}},{\"equipped\":{\"slot\":\"right_hand\",\"item_tag\":\"artifact\"}},"
+        "{\"inventory_count\":{\"item\":\"803\",\"min\":4,\"max\":4}},{\"inventory_count\":{\"item\":\"999\",\"max\":0}}]}}]}";
     soulash::conditions::ConditionSet set;
     std::string error;
     Check(set.Load(document, error), "state: evaluator document loads");

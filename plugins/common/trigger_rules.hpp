@@ -79,7 +79,7 @@ namespace soulash_plugins::trigger_rules
         static const std::set<std::string> backed = {
             "weapon_class", "shield", "holder_tag", "target_tag", "health_percent", "stamina_percent",
             "target_health_percent", "equipped", "skill_level", "stacker", "party", "companions", "time_of_day",
-            "season"};
+            "season", "inventory_count"};
         return backed;
     }
 

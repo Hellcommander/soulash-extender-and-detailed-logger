@@ -130,6 +130,7 @@ re-derives them from code patterns at load instead of trusting these numbers.
 | attack resolution internals: hit roll `rand/2^53` vs success rate at `0x6CB193`; miss path grants Parry XP `(ctx, attacker, defender, float)` `0x4BA1E0` (`"core_2_Parry"`); damage `[rbp+60h]` from `0x4BC2F0`, applied inline at `0x6CB928`; post-damage call `(ctx, attacker, target, damage)` at `0x6CBBD0`; final call `(system, attack*, weaponType, critical)` at `0x6CC0E2`; attack struct: attacker `+0`, target `+0x90` | `0x4BA1E0`, `0x4BC2F0`, `0x4B9FB0`, `0x6CED40` |
 | deflection check `(system, attacker, attackQueue*, r9) → bool` from `EntityAttack::update` at `0x6CA6EE`; queue data `+0x18`, capacity `+0x20`, index `+0x28`, entry target `+0x4C`; message builder (`"EntityAttack: Attack deflected."`) | `0x64B110`; `0x6CEB00` |
 | Effects component (type 20, 0x70): active effects `+0x08/+0x10` (0x1A0 each), stacks `map<string,int>` `+0x38`, stack expiry `map<string,float>` `+0x48`, last tick time `+0x6C`; Party component (type 50, 0x10, getter `0x27CC0`): companions only, `+0x0C` hold position; `ECStorage` entity-id vector `+0x20/+0x28` | |
+| Equipment `+0x70/+0x78`: `vector<int>` of backpack item entities (serialiser `0x77900` writes count + ids after the slots; `AStashItems 0x40B10` walks it); Name component (type 44, 0xF0, getter `0x27EB0`): `+0x08` data id string (`803` = core_2 Wheat Bread), `+0x28` display name; Stackable (type 64, 0x10, getter `0x27CC0`): `+0x08` count | |
 
 ## Build `60b72c10` (0.10.5.1, 2026-10-31): ability bar unchanged
 

@@ -56,9 +56,11 @@ namespace soulash_plugins::game_state
         TypeEquipment = 21,
         TypeHealth = 28,
         TypeItem = 32,
+        TypeName = 44,
         TypeParty = 50,
         TypePlayer = 52,
         TypeSkills = 63,
+        TypeStackable = 64,
         TypeStamina = 65,
         TypeTags = 68,
         TypeWeapon = 76,
@@ -68,6 +70,8 @@ namespace soulash_plugins::game_state
     constexpr std::size_t EffectsSize = 0x70;        // getter 0x92160
     constexpr std::size_t PartySize = 0x10;          // getter 0x27cc0: sar 4
     constexpr std::size_t PlayerSize = 0x130;        // getter 0x28100
+    constexpr std::size_t NameSize = 0xF0;           // getter 0x27eb0
+    constexpr std::size_t StackableSize = 0x10;      // getter 0x27cc0 (shared with Party)
     constexpr std::size_t EquipmentSize = 0x150;     // getter 0x284b0
     constexpr std::size_t HealthSize = 0x40;         // getter 0x282e0: shl 6
     constexpr std::size_t ItemSize = 0x18;           // getter 0x3b030: x3, x8
@@ -93,6 +97,19 @@ namespace soulash_plugins::game_state
     // in core_2 `eq_slot` order (serialiser 0x77900).
     constexpr std::uintptr_t EquipmentSlotsOffset = 0x08;
     constexpr unsigned int EquipmentSlotCount = 20;
+    // Equipment +0x70/+0x78: std::vector<int> of the item entities carried in
+    // the backpack (the serialiser writes their count and ids after the slots;
+    // AStashItems walks it and asks hasComponent(item, 64 = Stackable)).
+    constexpr std::uintptr_t EquipmentInventoryBeginOffset = 0x70;
+    constexpr std::uintptr_t EquipmentInventoryEndOffset = 0x78;
+    constexpr unsigned int MaximumInventoryItems = 1024;
+    // Name: +0x08 std::string data id (core_2 entity "803" = Wheat Bread,
+    // "core_2_Fancy_Flask", ...), +0x28 std::string display name (serialiser
+    // 0x7bf40: `Name;803|Wheat Bread|...`).
+    constexpr std::uintptr_t NameDataIdOffset = 0x08;
+    constexpr std::uintptr_t NameDisplayOffset = 0x28;
+    // Stackable: +0x08 int stack count (serialiser 0x1e0080).
+    constexpr std::uintptr_t StackableCountOffset = 0x08;
     // Skills: std::map<std::string,int> at +8 = skill id -> level (serialiser
     // 0x80cd0 writes id*level*potential*progress from three maps at +8/+0x18/+0x28).
     constexpr std::uintptr_t SkillsLevelMapOffset = 0x08;
@@ -186,7 +203,7 @@ namespace soulash_plugins::game_state
     struct Access
     {
         StorageRef abilityUser, equipment, health, item, skills, stamina, tags, weapon;
-        StorageRef effects, party, player;
+        StorageRef effects, party, player, name, stackable;
     };
 
     template <typename T>
@@ -517,6 +534,53 @@ namespace soulash_plugins::game_state
         return component == nullptr ? -1 : Read<std::int32_t>(component, ItemTypeOffset);
     }
 
+    // The entity's data id (its definition's `id`) from its Name component.
+    inline bool ReadDataId(const StorageRef& name, std::int32_t entity, std::string& out)
+    {
+        if (entity <= 0) return false;
+        const unsigned char* component = FindComponent(name, static_cast<std::uint32_t>(entity));
+        char text[160];
+        if (component == nullptr || !ReadMsvcString(component + NameDataIdOffset, text, sizeof(text)) || text[0] == '\0')
+        {
+            return false;
+        }
+        out = text;
+        return true;
+    }
+
+    // Stack count of an item entity: its Stackable count, 1 without the component.
+    inline int StackCount(const StorageRef& stackable, std::int32_t entity)
+    {
+        if (entity <= 0) return 0;
+        const unsigned char* component = FindComponent(stackable, static_cast<std::uint32_t>(entity));
+        if (component == nullptr) return 1;
+        const auto count = Read<std::int32_t>(component, StackableCountOffset);
+        return count > 0 ? count : 0;
+    }
+
+    // Data id -> carried count over the holder's backpack list. False when the
+    // holder has no Equipment component or the Name storage is unavailable
+    // (then the whole predicate stays unknown rather than reading zero).
+    inline bool ReadInventory(const Access& access, std::uint32_t holder, std::map<std::string, double>& out)
+    {
+        if (access.name.storage == nullptr) return false;
+        const unsigned char* equipment = FindComponent(access.equipment, holder);
+        if (equipment == nullptr) return false;
+        const auto begin = Read<const std::int32_t*>(equipment, EquipmentInventoryBeginOffset);
+        const auto end = Read<const std::int32_t*>(equipment, EquipmentInventoryEndOffset);
+        if (begin == nullptr || end < begin || static_cast<std::size_t>(end - begin) > MaximumInventoryItems)
+        {
+            return begin == end;
+        }
+        for (const std::int32_t* item = begin; item < end; ++item)
+        {
+            std::string id;
+            if (!ReadDataId(access.name, *item, id)) continue;
+            out[id] += StackCount(access.stackable, *item);
+        }
+        return true;
+    }
+
     // Fills what the registry can answer; everything else stays unknown. The
     // target (0 = none) only contributes target_* predicates; the clock (may
     // be a default-constructed GameClock) the time predicates.
@@ -532,6 +596,8 @@ namespace soulash_plugins::game_state
         if (ReadSkills(access.skills, holder, skills)) snapshot.skills = skills;
         std::map<std::string, double> stackers;
         if (ReadStackers(access.effects, holder, clock, stackers)) snapshot.stackers = stackers;
+        std::map<std::string, double> inventory;
+        if (ReadInventory(access, holder, inventory)) snapshot.inventory = inventory;
         ReadParty(access.party, access.player, holder, snapshot);
         if (clock.has && clock.dayPart >= 0) snapshot.dayPart = std::string(DayPartNames[clock.dayPart]);
         if (clock.has && clock.yearPart >= 0) snapshot.season = std::string(YearPartNames[clock.yearPart]);
@@ -551,6 +617,9 @@ namespace soulash_plugins::game_state
                 {
                     item.itemType = ItemTypeNames[type];
                 }
+                ReadDataId(access.name, entity, item.item);
+                std::set<std::string> itemTags;
+                if (ReadTags(access.tags, static_cast<std::uint32_t>(entity), itemTags)) item.itemTags = itemTags;
                 worn[EquipmentSlotNames[slot]] = item;
                 if (type == static_cast<int>(ItemTypeShield)
                     && (slot == SlotLeftHand || slot == SlotRightHand || slot == SlotSecondRight || slot == SlotSecondLeft))

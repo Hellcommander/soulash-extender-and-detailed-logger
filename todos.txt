@@ -161,6 +161,11 @@ that it has been confirmed that it can survive updates")
   events and emits nothing for them. All unit tests pass; built, deployed, pinned; STILL NOT RUN IN THE GAME.
   Still unbacked: inventory_count, biome, in_settlement, in_combat; equipped.item. The year-part clock field is
   inferred (check the "game clock:" log line on the first run).
+- 2026-11-07 (later): equipped.item / item_tag and inventory_count backed. Name component (type 44, 0xF0) +8 = data
+  id string (core_2 entity 803 = Wheat Bread; mods use string ids), +0x28 display name; Equipment +0x70/+0x78 =
+  vector<int> of backpack item entities (AStashItems walks it); Stackable (type 64, 0x10) +8 = count. Items'
+  tags from their Tags component. Still unbacked: biome / in_settlement (need the current world tile; region.sav
+  is x|y|z|regionId, biome sits in world.sav tile records) and in_combat (no runtime flag found).
 - Superseded by the bullet above (kept for history): turn/kill/damaged/dodge/block/crit events (candidates listed in docs/triggers.md 3.1/7), predicates
   party/companions/stacker/inventory_count/time_of_day/season/biome/in_combat/in_settlement, delayed casts,
   conditions that gate passives/abilities (no evaluation point hooked), entity -> data id for equipped.item.

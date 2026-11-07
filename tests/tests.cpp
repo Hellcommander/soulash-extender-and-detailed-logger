@@ -35,6 +35,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 // Global scope on purpose: its RTTI name is .?AUSyntheticPolymorphicType@@ (types in

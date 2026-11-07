@@ -80,14 +80,14 @@ file that `requires` an unbacked predicate is unavailable as a whole):
 | `holder_tag`, `target_tag` | Tags component: `vector<string>` of tag indices into core_2 `tag` ("5" = Player), mapped back to names; unknown indices match by their digits |
 | `weapon_class` | Equipment slot 9 (right hand), else 8 (left hand): the item's Weapon component `+0x08` = `weapon_type` index; no weapon = `Unarmed` |
 | `shield` | an item in slots 8, 9, 17, 18 whose Item component `+0x08` = 14 (`Shield`) |
-| `equipped` | slot filled / `item_type` by name; `item` and `item_tag` are **unknown** (the live registry does not expose an item's data id) |
+| `equipped` | slot filled / `item_type` by name; `item` = the item entity's data id from its Name component (`+0x08`, e.g. `803` for core_2 Wheat Bread, `core_2_Ice_Rod`); `item_tag` = the item entity's Tags component |
+| `inventory_count` | Equipment `+0x70/+0x78`: `vector<int>` of the item entities in the backpack (what `AStashItems` walks); each adds its Stackable `+0x08` count, or 1 without a Stackable component, under its data id. Unknown when the Name storage is unavailable. |
 | `skill_level` | Skills component: `std::map<string,int>` at `+0x08` (skill id → level) |
 | `stacker` | Effects component: `std::map<string,int>` stacks at `+0x38`, `std::map<string,float>` expiry time at `+0x48`; a stack whose expiry lies before the clock counts as 0 (the engine's own on_max_stacks code resets it then). Without a clock the entity's last tick time (`+0x6C`) stands in. |
 | `party`, `companions` | Party component (type 50, 0x10 bytes) is carried by the player's companions, not by the player (the owner's `player.sav` has no `Party;` line; `DrawParty` lists the Party storage's entity ids). Player: `in_party` while any companion exists, `companions` = their number. Companion: `in_party`, `companions` = the other members plus the player. Anyone else: `alone`, 0. |
 | `time_of_day`, `season` | the game clock struct (`0x205F0()` in 526b6ab4, located from `ProgressEffects::update`): `+0x20` day-part index (what the UI hands to the day-part translator `0x4CFEF0`), `+0x28` year-part index; `+0x14` = 1440 turns per day, `+0x18` time in turns. Names from core_2 `day_part` / `year_part`. The year-part field is inferred from its initial value and users; the first run's `game clock:` log line confirms it. |
 
-Not backed yet (unknown, fail closed): `inventory_count`, `biome`,
-`in_combat`, `in_settlement`.
+Not backed yet (unknown, fail closed): `biome`, `in_combat`, `in_settlement`.
 
 ## 3. Game facts the plugin relies on (build 526b6ab4)
 
@@ -158,9 +158,11 @@ type) = 0x678950` uses the same ids: 76 = Weapon before reading `Weapon+0x08`,
 | --- | --- | --- | --- |
 | Ability user | 1 | 0x260 (`0x92360`) | `+0x1A0` target id, `+0x230` queue, `+0x258` no-triggers flag |
 | Effects | 20 | 0x70 (`0x92160`) | `+0x08/+0x10` active effects (0x1A0 each), `+0x38` stacks map, `+0x48` stack expiry map, `+0x6C` last tick time (save `Effects;0\|\|-1.000000\|154.200012\|0\|0\|0`) |
-| Equipment | 21 | 0x150 (`0x284B0`) | `int slots[20]` at `+0x08`, `eq_slot` order, entity id or 0 |
+| Equipment | 21 | 0x150 (`0x284B0`) | `int slots[20]` at `+0x08`, `eq_slot` order, entity id or 0; `vector<int>` backpack item entities at `+0x70/+0x78` (serialised after the slots as count and ids) |
+| Name | 44 | 0xF0 (`0x27EB0`) | `+0x08` data id string, `+0x28` display name (save `Name;803\|Wheat Bread\|…`) |
 | Party | 50 | 0x10 (`0x27CC0`) | `+0x08` int, `+0x0C` hold-position flag; presence = party member (companions only) |
 | Player | 52 | 0x130 (`0x28100`) | presence = the player entity |
+| Stackable | 64 | 0x10 (`0x27CC0`) | `+0x08` stack count |
 | Health | 28 | 0x40 (`0x282E0`) | floats `+0x08` current, `+0x0C` maximum (save `Health;105\|105\|…`) |
 | Item | 32 | 0x18 (`0x3B030`) | `+0x08` `item_type` index |
 | Skills | 63 | 0x88 (`0x12DF40`) | `map<string,int>` at `+0x08` = level (`+0x18` potential, `+0x28` progress) |
@@ -226,9 +228,9 @@ pins the hash like the other plugins.
    - `game code located (RVAs): on-cast trigger 0x413E80, on-attack trigger 0x411670, ability registry 0x8B4A0, map::at 0x4249F0, operator new 0x81E020, operator delete 0x81E2E0, deque growmap 0x2BD350, ~Ability 0x6DA60` (on 526b6ab4),
    - `event code located (RVAs, 0 = not on this build): kill trigger 0x6D5E70, turn tick 0x5AFAD0, parry 0x4BA1E0, damage dealt 0x4B9FB0, attack end 0x6CED40, deflect 0x64B110, game clock 0x205F0`,
    - `active: game build 526b6ab4, mode=log, N rule(s) …; events hooked: cast attack kill turn damaged dodge block crit; delayed casts wait for the holder's turns`,
-   - on the first event: `state source … AbilityUser=ok Effects=ok Equipment=ok Health=ok Item=ok Party=ok Player=ok Skills=ok Stamina=ok Tags=ok Weapon=ok; queueing possible`,
+   - on the first event: `state source … AbilityUser=ok Effects=ok Equipment=ok Health=ok Item=ok Name=ok Party=ok Player=ok Skills=ok Stackable=ok Stamina=ok Tags=ok Weapon=ok; queueing possible`,
    - `game clock: time T turns, day part D (<name>), year part Y (<name>)`: the names must match the in-game clock,
-   - `cast event: entity P cast 'arendeth_hydromancy_water_splash' (target T): 1 rule(s) matched, 1 allowed, …; health=100 stamina=.. weapon=Unarmed shield=no tags=3 skills=11 stacks=0 party=alone companions=0 time=Morning/Spring`,
+   - `cast event: entity P cast 'arendeth_hydromancy_water_splash' (target T): 1 rule(s) matched, 1 allowed, …; health=100 stamina=.. weapon=Unarmed shield=no tags=3 skills=11 stacks=0 party=alone companions=0 time=Morning/Spring inventory=N` (N = distinct item ids in the backpack),
    - `rule <mod>/wounded_splash: would queue 'arendeth_hydromancy_spray' on entity P (Mode=log …)`,
    - `attack event: entity P attacked E (weapon entity W): …`, and after the fight `damaged event: entity E took N damage from P`, `dodge event: …`, `crit event: …`, `kill event: entity P killed E`.
    Check the state values against the character sheet (health %, stamina %,
@@ -261,14 +263,13 @@ loaded), `fault 0x… while handling a cast event; plugin disabled` (send the lo
 - The year-part field of the clock (`+0x28`) is inferred, not traced to a
   translator call like the day part; the `game clock:` line of the first run
   confirms or refutes it (Spring = 0).
-- Predicates still not backed: `inventory_count` (needs the Container → item
-  link and an entity → data id mapping), `biome` and `in_settlement` (need the
-  current region), `in_combat` (no runtime flag found; the AI's combat goals
-  would have to be read).
-- `equipped.item` needs an entity → data id mapping (not found in the
-  components read so far; the Name component carries the display name and a
-  second string that may be the id: `Name;803|Wheat Bread|…`,
-  `Name;core_2_Fancy_Flask|Fancy Flask|…` in the save).
+- Predicates still not backed: `biome` and `in_settlement` need the current
+  region's world tile (`region.sav` is `x|y|z|regionId`, the biome lives in
+  `world.sav`'s tile records and in the world object, not in the region map);
+  `in_combat` has no runtime flag found yet (the AI's combat goals would have
+  to be read).
+- `inventory_count` counts the backpack list only (Equipment `+0x70`), not
+  items in other containers or equipped slots.
 - Whether a queued cast from a rule can itself trigger rules: the engine clears
   triggers for queued casts through `AbilityUser+0x258`; the plugin inherits
   that (it only runs where the engine would run its own on-cast triggers).

@@ -144,9 +144,11 @@ namespace
         {"Equipment", gs::TypeEquipment, gs::EquipmentSize, ".?AV?$ECStorage@UEquipment@@@ASEngine@@", ".?AUEquipment@@", &g_access.equipment},
         {"Health", gs::TypeHealth, gs::HealthSize, ".?AV?$ECStorage@UHealth@@@ASEngine@@", ".?AUHealth@@", &g_access.health},
         {"Item", gs::TypeItem, gs::ItemSize, ".?AV?$ECStorage@UItem@@@ASEngine@@", ".?AUItem@@", &g_access.item},
+        {"Name", gs::TypeName, gs::NameSize, ".?AV?$ECStorage@UName@@@ASEngine@@", ".?AUName@@", &g_access.name},
         {"Party", gs::TypeParty, gs::PartySize, ".?AV?$ECStorage@UParty@@@ASEngine@@", ".?AUParty@@", &g_access.party},
         {"Player", gs::TypePlayer, gs::PlayerSize, ".?AV?$ECStorage@UPlayer@@@ASEngine@@", ".?AUPlayer@@", &g_access.player},
         {"Skills", gs::TypeSkills, gs::SkillsSize, ".?AV?$ECStorage@USkills@@@ASEngine@@", ".?AUSkills@@", &g_access.skills},
+        {"Stackable", gs::TypeStackable, gs::StackableSize, ".?AV?$ECStorage@UStackable@@@ASEngine@@", ".?AUStackable@@", &g_access.stackable},
         {"Stamina", gs::TypeStamina, gs::StaminaSize, ".?AV?$ECStorage@UStamina@@@ASEngine@@", ".?AUStamina@@", &g_access.stamina},
         {"Tags", gs::TypeTags, gs::TagsSize, ".?AV?$ECStorage@UTags@@@ASEngine@@", ".?AUTags@@", &g_access.tags},
         {"Weapon", gs::TypeWeapon, gs::WeaponSize, ".?AV?$ECStorage@UWeapon@@@ASEngine@@", ".?AUWeapon@@", &g_access.weapon},
@@ -578,7 +580,7 @@ namespace
         {
             char stateText[300];
             _snprintf_s(stateText, _TRUNCATE,
-                "health=%s%.0f stamina=%s%.0f weapon=%s shield=%s tags=%s%zu skills=%s%zu stacks=%s%zu party=%s companions=%s%.0f time=%s/%s",
+                "health=%s%.0f stamina=%s%.0f weapon=%s shield=%s tags=%s%zu skills=%s%zu stacks=%s%zu party=%s companions=%s%.0f time=%s/%s inventory=%s%zu",
                 state.healthPercent.has ? "" : "?", state.healthPercent.value,
                 state.staminaPercent.has ? "" : "?", state.staminaPercent.value,
                 state.weaponClass.has ? state.weaponClass.value.c_str() : "?",
@@ -588,7 +590,8 @@ namespace
                 state.stackers.has ? "" : "?", state.stackers.has ? state.stackers.value.size() : 0,
                 state.party.has ? state.party.value.c_str() : "?",
                 state.companions.has ? "" : "?", state.companions.value,
-                state.dayPart.has ? state.dayPart.value.c_str() : "?", state.season.has ? state.season.value.c_str() : "?");
+                state.dayPart.has ? state.dayPart.value.c_str() : "?", state.season.has ? state.season.value.c_str() : "?",
+                state.inventory.has ? "" : "?", state.inventory.has ? state.inventory.value.size() : 0);
             Log("%s: %u rule(s) matched, %u allowed, %u blocked by condition, %u by chance; %s", description,
                 outcome.matched, outcome.allowed, outcome.blockedByCondition, outcome.blockedByChance, stateText);
         }

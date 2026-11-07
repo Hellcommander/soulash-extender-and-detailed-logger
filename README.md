@@ -252,7 +252,8 @@ as described below (the build prints each SHA-256).
   eight events (ability cast, attack, kill, per-entity turn tick, damage taken,
   dodge / parry, deflected attack, critical hit), builds a state snapshot of the
   holder from the game's component registry (health, stamina, tags, equipment,
-  weapon class, shield, skills, stacks, party, game clock, target) and queues
+  weapon class, shield, equipped item ids and tags, backpack contents, skills,
+  stacks, party, game clock, target) and queues
   the abilities of the rules whose condition holds with the engine's own
   queued-ability mechanism; delayed casts wait for the holder's turns. Every
   game function and component is located and verified from the game's own code
