@@ -9,6 +9,10 @@
 #include "../plugins/common/test_bot_script.hpp"
 #include "../plugins/common/png_writer.hpp"
 #include "../plugins/common/pe_original.hpp"
+#include "../plugins/common/trigger_layout.hpp"
+#include "../plugins/common/ability_queue.hpp"
+#include "../plugins/common/game_state.hpp"
+#include "../plugins/common/trigger_rules.hpp"
 
 #include <windows.h>
 
@@ -21,11 +25,14 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -775,6 +782,7 @@ namespace
 #include "test_bot_tests.inc"
 #include "update_guard_tests.inc"
 #include "pe_original_tests.inc"
+#include "trigger_tests.inc"
 
     // Child side of the debugger fallback test. Loads the proxy but never
     // calls any BugSplat export, so only the DllMain fallback can start it.
@@ -1800,6 +1808,10 @@ int wmain(int argc, wchar_t* argv[])
         TestX64Decoder();
         TestAbilityBarLayout();
         TestOriginalImagePointer();
+        TestTriggerLayout();
+        TestAbilityQueue();
+        TestGameState();
+        TestTriggerRules();
         TestTestBotScript();
         TestTestBotCapture();
         TestTestBotStatus();

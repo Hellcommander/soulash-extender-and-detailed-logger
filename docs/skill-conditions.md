@@ -1,6 +1,6 @@
 # Skill conditions: predicate vocabulary (spec v1)
 
-Status: **specification plus an evaluator core** (conditions and conditional triggers). `src/conditions.cpp` loads these files and evaluates them against a state snapshot (tested with synthetic snapshots), but nothing feeds it real game state yet and no game hook is involved. This document, `skill-conditions.schema.json`,
+Status: **specification, evaluator core and a native executor.** `src/conditions.cpp` loads these files and evaluates them against a state snapshot; since 2026-11-06 the `Triggers` plugin (`plugins/triggers`, docs/triggers.md) feeds it the live game state and runs the `triggers` rules inside the game at the engine's own cast / attack trigger points, so conditional triggers no longer need to be compiled into passives (do not merge `generated_passives.json` for `triggers` when the plugin is installed: both would fire). The plugin is built and unit-tested but has not run in the game yet. This document, `skill-conditions.schema.json`,
 `examples/runic-magic-conditions.json` and `tools/validate_conditions.py` define
 and check the data format so mods can be written now and an evaluator (a native
 plugin, or the author's planned Lua layer) can implement it later.

@@ -103,6 +103,28 @@ have not run on this build yet. Game changelog 0.10.6 lists no engine change
 that touches the extender; the only modding change is `required_items` on
 producers.
 
+### Trigger and component anchors (static, 2026-11-06; used by the Triggers plugin)
+
+Full write-up: [triggers.md](triggers.md). All RVAs for `526b6ab4`; the plugin
+re-derives them from code patterns at load instead of trusting these numbers.
+
+| What | RVA |
+| --- | --- |
+| `UseAbility::update` (RTTI `UseAbility` slot 1; logs `"UseAbility: Entity {} is casting {}. Applying effects."`) | `0x73E690` |
+| engine on-cast passive trigger routine (effect 117), called from `0x73F80E` | `0x413E80` |
+| `EntityAttack` attack resolution (logs `"EntityAttack: Attacked entity {}"`), from `EntityAttack::update 0x6C9D10` | `0x6CAD00` |
+| engine on-attack passive trigger routine (effect 100), called from `0x6CBEAD` | `0x411670` |
+| queued-ability consumer (`"Queued Ability"`), `"Repeat Ability"` consumer | `0x744050`, `0x743D20` |
+| passive-effect name → id resolver (ids = `messages.json` `passive_effects`) | `0x5238A6` |
+| passive collector `(singleton, out, ctx, entity, effectId, 9)` | `0x2A6400` |
+| ability registry singleton (`std::map<std::string, Ability>` at `0xB0F490`), `map::at` | `0x8B4A0`, `0x4249F0` |
+| `Ability` size / copy / destructor | `0x198` / `0x77520` / `0x6DA60` |
+| game `operator new` / `operator delete(p, size)` / `std::deque<Ability*>::_Growmap` | `0x81E020` / `0x81E2E0` / `0x2BD350` |
+| `hasComponent(ctx, entity, componentTypeId)` | `0x678950` |
+| component registry: `std::vector<ECStorageBase*>` at `ctx+0x100`, index = component-type id; constructor | `0x436EC0` |
+| component getters: Ability user `0x92360` (0x260), Equipment `0x284B0` (0x150), Health `0x282E0` (0x40), Item `0x3B030` (0x18), Skills `0x12DF40` (0x88), Stamina `0x85450` (0x28), Tags `0x42E80` (0x20), Weapon `0x1838A0` (0x68), Actor `0x28690` (0x20), Effects `0x92160` (0x70), Player `0x28100` (0x130), Position `0x27AE0` (0x30) | |
+| systems registered by `0x4378D0`: `OnDeath::update` (kill passives 101/102) `0x6D0D00`, `ProgressEffects::update` `0x5AE060`, `ProgressEvents::update` `0x5B10A0`, `EntityAttack::update` `0x6C9D10`, `RangedAttack::update` `0x6EEE90` | |
+
 ## Build `60b72c10` (0.10.5.1, 2026-10-31): ability bar unchanged
 
 The Steam update kept the installed proxy (the vendor DLL was not replaced:

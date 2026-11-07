@@ -168,11 +168,12 @@ With `[Conditions] Enabled=1` in the INI (optional `Directory=`, default
 every mod folder at start-up, loads each file with the strict loader, and logs
 `conditions <mod>: N condition(s) loaded`, or `conditions <mod> rejected: <reason>`,
 plus a total. A rejected file never affects other mods. This gives mod authors
-feedback from the real environment. **Nothing evaluates the conditions in the
-game yet**: that needs a source of game state (game hooks or the Lua layer),
-so for now the files are validated and counted only. Offline, the same checks
-and a per-condition native/evaluator report are available from
-`tools/validate_conditions.py`.
+feedback from the real environment. The `triggers` rules are **executed in the
+game by the `Triggers` plugin** (see "Plugins in this repository" and
+[docs/triggers.md](docs/triggers.md)); `conditions` that gate a passive or an
+ability are still only validated and counted (no evaluation point for passive
+application is hooked yet). Offline, the same checks and a per-condition
+native/evaluator report are available from `tools/validate_conditions.py`.
 
 ## Effects files (Dredmor-style spell effects, composable)
 
@@ -244,6 +245,18 @@ as described below (the build prints each SHA-256).
   If blocking cannot be installed the bot refuses to run. **Off by default**
   (`TestBot.ini`, `Enabled=0`); scripts are not deployed by the build. See
   [docs/test-bot.md](docs/test-bot.md).
+- `Triggers.dll` (`plugins/triggers`): **conditional triggers executed by the
+  extender**. It loads every mod's `extender\conditions.json` (`triggers`) and
+  `extender\effects.json` (`triggers`), detours the two engine routines that
+  resolve passive triggers (after an ability is cast, after an attack), builds
+  a state snapshot of the holder from the game's component registry (health,
+  stamina, tags, equipment, weapon class, shield, skills, target) and queues the
+  abilities of the rules whose condition holds with the engine's own
+  queued-ability mechanism. Every game function and component is located and
+  verified from the game's own code and RTTI at load; nothing is keyed by a
+  build hash. Ships with `Triggers.ini` `Mode=log` (hooks installed, everything
+  logged, nothing queued); `Mode=active` queues. Not yet run in the game. See
+  [docs/triggers.md](docs/triggers.md).
 
 Plugin INI templates (`plugins/<name>/<Name>.ini`) are deployed next to the
 DLLs; an existing INI keeps its values and only gains options the template has

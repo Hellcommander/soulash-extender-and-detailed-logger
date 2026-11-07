@@ -111,6 +111,22 @@ int RunConditionsTests(const wchar_t* examplePath)
         "equipped without a selector is unknown");
     Check(evaluate("{\"equipped\":{\"slot\":\"right_hand\",\"empty\":true,\"item\":\"x\"}}", full) == Tri::Unknown,
         "equipped with two selectors is unknown");
+    {
+        // The live registry knows a slot is filled and the item's type, but not
+        // the item's data id: identity questions are unknown, the rest answer.
+        Snapshot live = full;
+        EquippedItem anonymous;
+        anonymous.itemType = "Shield";
+        live.equipped = std::map<std::string, EquippedItem>{{"left_hand", anonymous}};
+        Check(evaluate("{\"equipped\":{\"slot\":\"left_hand\",\"item\":\"x\"}}", live) == Tri::Unknown,
+            "equipped item id without a known id is unknown");
+        Check(evaluate("{\"equipped\":{\"slot\":\"left_hand\",\"item_tag\":\"x\"}}", live) == Tri::Unknown,
+            "equipped item tag without a known id is unknown");
+        Check(evaluate("{\"equipped\":{\"slot\":\"left_hand\",\"item_type\":\"shield\"}}", live) == Tri::True,
+            "equipped item type still answers");
+        Check(evaluate("{\"equipped\":{\"slot\":\"left_hand\",\"empty\":false}}", live) == Tri::True,
+            "equipped empty still answers");
+    }
 
     // ---- Three-valued logic ----------------------------------------------
     Snapshot partial;

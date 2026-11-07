@@ -121,6 +121,35 @@ running the bot")
 - Not done: no agent -> bot commands other than scripts and stop (no pause, no single-step, no state queries
   beyond status.json). Scripts cannot read editor fields (Tier C).
 
+SESSION 2026-11-06: TRIGGERS PLUGIN (owner: "implement true condition and trigger support into the extender now
+that it has been confirmed that it can survive updates")
+- Owner context given this session: the game only supports adding stackers (real or ability-based) as its trigger
+  mechanism, which is why the extender adds real support for multiple triggers and conditions; the in-game mod
+  editor can BOTCH abilities that have real (non-ability) stackers when a mod is loaded in it, so extender data must
+  stay in <mod>\extender\*.json which the editor never rewrites; whatever Lua the extender has built in must NOT
+  conflict with the official Lua support the game author plans for December (keep ext.* in SoulashExtender\Scripts,
+  never claim game-side script names; the trigger system is JSON data + a native plugin, no Lua).
+- RE (static, build 526b6ab4, docs/triggers.md + docs/game-notes.md): engine on-cast trigger routine 0x413E80
+  (effect 117 = trigger_ability_on_cast; passive enum == messages.json passive_effects ids), called from
+  UseAbility::update 0x73E690 at 0x73F80E when AbilityUser+0x258==0; on-attack routine 0x411670 (effect 100)
+  called from EntityAttack resolution 0x6CAD00 at 0x6CBEAD after every attack; cast primitive = Ability copy
+  (0x198 bytes, registry map::at 0x4249F0 on 0x8B4A0(), new 0x81E020) pushed on std::deque<Ability*> at
+  AbilityUser+0x230 (growmap 0x2BD350), consumed by "Queued Ability" 0x744050 at target AbilityUser+0x1A0;
+  component registry = vector<ECStorageBase*> at ctx+0x100 indexed by component_type id (hasComponent 0x678950
+  uses the same ids); layouts of Health/Stamina/Tags/Equipment/Skills/Weapon/Item from their serialisers.
+- Plugin plugins/triggers -> Triggers.dll + Triggers.ini (Enabled=1, Mode=log default). Pure, unit-tested parts in
+  plugins/common: trigger_layout.hpp (pattern anchors from the engine's log strings), game_state.hpp (snapshot from
+  component memory, RTTI-verified), ability_queue.hpp (deque push, tested against std::deque), trigger_rules.hpp
+  (rule evaluation, fail closed). Backed predicates: health/stamina/target_health percent, holder/target tags,
+  weapon_class, shield, equipped (slot/item_type; item id -> unknown), skill_level. src/conditions.cpp: equipped
+  `item`/`item_tag` with an unknown item id now evaluate to unknown. Tests: tests/trigger_tests.inc (all pass).
+- Built, deployed and pinned (Triggers=71c1587a...). NOT RUN IN THE GAME yet. First run = Mode=log (docs/triggers.md
+  section 6): check "game code located (RVAs): on-cast trigger 0x413E80, on-attack trigger 0x411670 ...",
+  "state source ... all ok; queueing possible", the cast/attack event lines and their state values; then Mode=active.
+- Not done: turn/kill/damaged/dodge/block/crit events (candidates listed in docs/triggers.md 3.1/7), predicates
+  party/companions/stacker/inventory_count/time_of_day/season/biome/in_combat/in_settlement, delayed casts,
+  conditions that gate passives/abilities (no evaluation point hooked), entity -> data id for equipped.item.
+
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.
@@ -139,6 +168,12 @@ STANDING RULES FROM THE OWNER (keep following them)
 - Do not patch game code blind. Anything touching game logic needs runtime verification first.
 - Owner's correction: conditions are for CONDITIONAL TRIGGERS (abilities fire only while a condition holds). They are
   NOT about logging and NOT about stacker counts (the stacker system is a separate native mechanism).
+- Owner (2026-11-06): the game's own trigger mechanism is stackers only (real or ability-based); the extender owns
+  multiple triggers + conditions. Keep extender data in <mod>\extender\*.json (the in-game editor can botch
+  abilities with real stackers when a mod is opened in it; it never touches extender\). The extender's built-in Lua
+  must not conflict with the game author's official Lua support planned for December: ext.* API, scripts only in
+  SoulashExtender\Scripts, no game-side names; the trigger system itself is JSON + native, no Lua.
+- New game-touching features ship with a log-only mode first (Triggers.ini Mode=log) and go live on the owner's flip.
 
 WHERE THE GAME IS
 - Current: D:\games\Steam\steamapps\common\Soulash 2   version 0.10.5.1 (2026-10-31)   exe sha256 60b72c10e3f120df...

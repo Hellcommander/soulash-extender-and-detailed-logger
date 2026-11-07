@@ -458,6 +458,10 @@ namespace soulash::conditions
                 {
                     return value.type == Json::Type::String ? Tri::False : Tri::Unknown;
                 }
+                // A state source that knows the slot is filled but not which
+                // data id fills it (the live game registry today) leaves `item`
+                // empty: identity questions are then unknown, not false.
+                if ((key == "item" || key == "item_tag") && found->second.item.empty()) return Tri::Unknown;
                 if (key == "item") return FromBool(found->second.item == value.text);
                 if (key == "item_type") return FromBool(Lower(found->second.itemType) == Lower(value.text));
                 if (key == "item_tag")
