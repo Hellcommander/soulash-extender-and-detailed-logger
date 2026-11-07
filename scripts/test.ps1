@@ -16,6 +16,71 @@ $syntheticModulePath = Join-Path $outputDirectory 'synthetic-modules\native\Synt
 & $testsPath --unit
 if ($LASTEXITCODE -ne 0) { throw 'Manifest parser tests failed.' }
 
+$oracleListing = Join-Path $outputDirectory 'native-tests.asm'
+& dumpbin.exe /nologo /disasm:nobytes $testsPath | Set-Content -LiteralPath $oracleListing -Encoding ascii
+if ($LASTEXITCODE -ne 0) { throw 'dumpbin disassembly failed.' }
+& $testsPath --decoder-oracle $testsPath $oracleListing
+if ($LASTEXITCODE -ne 0) { throw 'x64 length decoder oracle test failed.' }
+
+$python = Get-Command python -ErrorAction SilentlyContinue
+if ($python) {
+    & $python.Source -I (Join-Path $repoRoot 'tools\validate_conditions.py') --self-test
+    if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions validator self-test failed.' }
+    & $python.Source -I (Join-Path $repoRoot 'tools\validate_conditions.py') (Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json') | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions example does not validate.' }
+    & $python.Source -I (Join-Path $repoRoot 'tools\effects_compile.py') --self-test
+    if ($LASTEXITCODE -ne 0) { throw 'Effects compiler self-test failed.' }
+    $effectsEmitDirectory = Join-Path $outputDirectory ("effects-emit-" + [guid]::NewGuid().ToString('N'))
+    & $python.Source -I (Join-Path $repoRoot 'tools\effects_compile.py') (Join-Path $repoRoot 'docs\examples\runic-magic-effects.json') --emit $effectsEmitDirectory | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Effects example does not compile.' }
+    foreach ($expected in 'abilities\arendeth_runic_magic_Entropy_Surge__1_1.json', 'generated_passives.json', 'generated_milestones.json', 'generated_conditions.json', 'effects_report.json') {
+        if (-not (Test-Path -LiteralPath (Join-Path $effectsEmitDirectory $expected))) { throw "Effects compiler did not emit $expected." }
+    }
+}
+else {
+    Write-Output 'SKIP: python not found; skill-conditions validator not run.'
+}
+
+& $testsPath --conditions (Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json')
+if ($LASTEXITCODE -ne 0) { throw 'Skill-conditions evaluator test failed.' }
+
+& $testsPath --effects (Join-Path $repoRoot 'docs\examples\runic-magic-effects.json')
+if ($LASTEXITCODE -ne 0) { throw 'Effects loader/resolver test failed.' }
+
+& $testsPath --sandbox
+if ($LASTEXITCODE -ne 0) { throw 'Lua sandbox test failed.' }
+
+$modsDirectoryPath = Join-Path $outputDirectory ("mods-" + [guid]::NewGuid().ToString('N'))
+$exampleConditions = Join-Path $repoRoot 'docs\examples\runic-magic-conditions.json'
+foreach ($mod in 'ModA', 'ModB', 'ModC', 'ModD') { New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath $mod) -Force | Out-Null }
+New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModA\extender') -Force | Out-Null
+Copy-Item -LiteralPath $exampleConditions -Destination (Join-Path $modsDirectoryPath 'ModA\extender\conditions.json')
+Copy-Item -LiteralPath (Join-Path $repoRoot 'docs\examples\runic-magic-effects.json') -Destination (Join-Path $modsDirectoryPath 'ModA\extender\effects.json')
+New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModB\extender') -Force | Out-Null
+$oneCondition = '{"id":"dup","target":{"kind":"passive","id":"%s"},"when":{"in_combat":true}}'
+[System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModB\extender\conditions.json'),
+    ('{"spec":1,"conditions":[' + $oneCondition.Replace('%s', 'a') + ',' + $oneCondition.Replace('%s', 'b') + ']}'))
+New-Item -ItemType Directory -Path (Join-Path $modsDirectoryPath 'ModD\extender') -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModD\extender\conditions.json'),
+    ('{"spec":1,"conditions":[' + $oneCondition.Replace('%s', 'z') + ']}'))
+[System.IO.File]::WriteAllText((Join-Path $modsDirectoryPath 'ModD\extender\effects.json'), '{"spec":2,"mod":"ModD"}')
+$conditionsLogPath = Join-Path $outputDirectory ("conditions-" + [guid]::NewGuid().ToString('N') + '.log')
+& $testsPath --conditions-discovery $proxyPath $fakeOriginalPath $modsDirectoryPath $conditionsLogPath
+if ($LASTEXITCODE -ne 0) { throw 'Condition discovery test failed.' }
+
+$scriptDirectoryPath = Join-Path $outputDirectory 'script-dir'
+New-Item -ItemType Directory -Path $scriptDirectoryPath -Force | Out-Null
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.Hello.lua'),
+    "ext.log('top level')`nfunction on_load() ext.log('hello from on_load') end`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.Evil.lua'),
+    "local f = io.open('C:\\Windows\\win.ini')`nos.execute('calc')`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.Loop.lua'), "while true do end`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'Test.After.lua'), "after = true`n")
+[System.IO.File]::WriteAllText((Join-Path $scriptDirectoryPath 'bad name.lua'), "ext.log('must not run')`n")
+$scriptLogPath = Join-Path $outputDirectory ("scripts-" + [guid]::NewGuid().ToString('N') + '.log')
+& $testsPath --scripts $proxyPath $fakeOriginalPath $scriptDirectoryPath $scriptLogPath
+if ($LASTEXITCODE -ne 0) { throw 'Script loading test failed.' }
+
 $disabledLogPath = Join-Path $outputDirectory ("diagnostics-disabled-" + [guid]::NewGuid().ToString('N') + '.log')
 & $testsPath --proxy $proxyPath $fakeOriginalPath disabled $disabledLogPath
 if ($LASTEXITCODE -ne 0) { throw 'Default-disabled proxy forwarding test failed.' }
@@ -70,6 +135,132 @@ if ($LASTEXITCODE -ne 0) { throw 'Opt-in synthetic native module test failed.' }
 $invalidModuleManifestPath = Join-Path $outputDirectory ("missing-manifest-" + [guid]::NewGuid().ToString('N') + '.txt')
 & $testsPath --module-failure $proxyPath $fakeOriginalPath $invalidModuleManifestPath
 if ($LASTEXITCODE -ne 0) { throw 'Native module load failure-isolation test failed.' }
+
+$fallbackMarkerBase = Join-Path $outputDirectory ("debugger-fallback-" + [guid]::NewGuid().ToString('N'))
+& $testsPath --debugger-fallback $proxyPath $fakeOriginalPath $moduleManifestPath $fallbackMarkerBase
+if ($LASTEXITCODE -ne 0) { throw 'Debugger fallback test failed.' }
+
+# Build pin updater (scripts\plugin-pins.ps1) on temp copies of an INI.
+. (Join-Path $PSScriptRoot 'plugin-pins.ps1')
+$pinDirectory = Join-Path $outputDirectory ('pins-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $pinDirectory -Force | Out-Null
+try {
+    $a64 = 'a' * 64; $b64 = 'b' * 64; $c64 = 'c' * 64; $d64 = 'd' * 64
+    foreach ($newline in "`r`n", "`n") {
+        $ini = Join-Path $pinDirectory 'SoulashExtender.ini'
+        $before = @('; top comment', '[Plugins]', 'Enabled=1', 'RequireHash=1', '', '[PluginHashes]',
+            '; MyPlugin=<64 hex>', "AbilityBarProbe=$a64", "Other.Plugin=$b64", '', '[Conditions]', 'Enabled=1') -join $newline
+        [System.IO.File]::WriteAllText($ini, $before + $newline)
+        $changes = Update-PluginPins -IniPath $ini -Pins ([ordered]@{ AbilityBarProbe = $c64; TestBot = $d64 })
+        $after = [System.IO.File]::ReadAllText($ini)
+        $expected = (@('; top comment', '[Plugins]', 'Enabled=1', 'RequireHash=1', '', '[PluginHashes]',
+            '; MyPlugin=<64 hex>', "AbilityBarProbe=$c64", "Other.Plugin=$b64", "TestBot=$d64", '', '[Conditions]', 'Enabled=1') -join $newline) + $newline
+        if ($after -ne $expected) { throw "Pin update changed more than the pinned keys (newline $([int][char]$newline[-1]))." }
+        if (($changes | ForEach-Object { "$($_.Name):$($_.Action)" }) -join ',' -ne 'AbilityBarProbe:updated,TestBot:added') { throw 'Pin update reported the wrong changes.' }
+        if ([System.IO.File]::ReadAllText("$ini.bak") -ne $before + $newline) { throw 'Pin update did not keep the previous INI as .bak.' }
+        Remove-Item -LiteralPath "$ini.bak" -Force
+        $unchanged = Update-PluginPins -IniPath $ini -Pins ([ordered]@{ AbilityBarProbe = $c64 })
+        if ($unchanged.Action -ne 'unchanged' -or (Test-Path -LiteralPath "$ini.bak")) { throw 'An unchanged pin rewrote the INI.' }
+    }
+    $noSection = Join-Path $pinDirectory 'NoSection.ini'
+    [System.IO.File]::WriteAllText($noSection, "[Plugins]`r`nRequireHash=1`r`n")
+    $refused = $false
+    try { Update-PluginPins -IniPath $noSection -Pins ([ordered]@{ TestBot = $d64 }) | Out-Null } catch { $refused = $true }
+    if (-not $refused -or [System.IO.File]::ReadAllText($noSection) -ne "[Plugins]`r`nRequireHash=1`r`n") { throw 'A missing [PluginHashes] section was not refused untouched.' }
+    $missing = Join-Path $pinDirectory 'Missing.ini'
+    $refused = $false
+    try { Update-PluginPins -IniPath $missing -Pins ([ordered]@{ TestBot = $d64 }) | Out-Null } catch { $refused = $true }
+    if (-not $refused -or (Test-Path -LiteralPath $missing)) { throw 'A missing INI was not refused, or was created.' }
+    $refused = $false
+    try { Update-PluginPins -IniPath $ini -Pins ([ordered]@{ 'bad name' = $d64 }) | Out-Null } catch { $refused = $true }
+    if (-not $refused) { throw 'An invalid plugin id was accepted.' }
+}
+finally { Remove-Item -LiteralPath $pinDirectory -Recurse -Force }
+Write-Output 'PASS: build pin updater changes only the pinned keys, keeps line endings, refuses missing INI/section'
+
+# TestBot snapshots: an independent decoder (.NET / GDI+) must read our PNG,
+# with rows flipped from glReadPixels' bottom-up order.
+$pngPath = Join-Path $outputDirectory 'testbot-png-check.png'
+& $testsPath --png $pngPath
+if ($LASTEXITCODE -ne 0) { throw 'Writing the test PNG failed.' }
+Add-Type -AssemblyName System.Drawing
+$bitmap = [System.Drawing.Bitmap]::new($pngPath)
+try {
+    $expected = @(
+        @(0, 0, 255, 0, 0), @(1, 0, 0, 255, 0), @(2, 0, 10, 20, 30),
+        @(0, 1, 0, 0, 255), @(1, 1, 255, 255, 255), @(2, 1, 0, 0, 0))
+    if ($bitmap.Width -ne 3 -or $bitmap.Height -ne 2) { throw "Test PNG decodes as $($bitmap.Width)x$($bitmap.Height), expected 3x2." }
+    foreach ($e in $expected) {
+        $c = $bitmap.GetPixel($e[0], $e[1])
+        if ($c.R -ne $e[2] -or $c.G -ne $e[3] -or $c.B -ne $e[4]) { throw "Test PNG pixel ($($e[0]),$($e[1])) is $($c.R),$($c.G),$($c.B)." }
+    }
+}
+finally { $bitmap.Dispose(); Remove-Item -LiteralPath $pngPath -Force }
+Write-Output 'PASS: TestBot PNG writer output decodes correctly (GDI+), rows flipped from OpenGL order'
+
+$pluginDirectoryPath = Join-Path $outputDirectory 'plugin-dir'
+# Update guard: start the plugin-directory test from a fresh record so unclean
+# test processes from earlier runs can never put it into safe mode.
+foreach ($guardFile in 'UpdateGuard.state', 'compat-report.txt') {
+    $guardPath = Join-Path $outputDirectory "SoulashExtender\$guardFile"
+    if (Test-Path -LiteralPath $guardPath) { Remove-Item -LiteralPath $guardPath -Force }
+}
+$pluginMarkerPath = Join-Path $outputDirectory ("plugin-dir-" + [guid]::NewGuid().ToString('N') + '.txt')
+try {
+    & $testsPath --plugin-dir $proxyPath $fakeOriginalPath $pluginDirectoryPath $pluginMarkerPath
+    if ($LASTEXITCODE -ne 0) { throw 'Plugin directory discovery test failed.' }
+}
+finally {
+    if (Test-Path -LiteralPath $pluginMarkerPath) {
+        Remove-Item -LiteralPath $pluginMarkerPath -Force
+    }
+}
+
+$allowlistIniPath = Join-Path $outputDirectory 'SoulashExtender.ini'
+$allowlistMarkerPath = Join-Path $outputDirectory ("plugin-allowlist-" + [guid]::NewGuid().ToString('N') + '.txt')
+$pluginAHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $pluginDirectoryPath 'Test.PluginA.dll')).Hash.ToUpperInvariant()
+try {
+    [System.IO.File]::WriteAllText(
+        $allowlistIniPath,
+        "[Plugins]`r`nRequireHash=1`r`n[PluginHashes]`r`nTest.PluginA=$pluginAHash`r`nTest.LegacyV2=$('0' * 64)`r`n",
+        [System.Text.Encoding]::ASCII)
+    & $testsPath --plugin-allowlist $proxyPath $fakeOriginalPath $pluginDirectoryPath $allowlistMarkerPath
+    if ($LASTEXITCODE -ne 0) { throw 'Plugin allowlist test failed.' }
+}
+finally {
+    foreach ($leftover in @($allowlistIniPath, $allowlistMarkerPath)) {
+        if (Test-Path -LiteralPath $leftover) { Remove-Item -LiteralPath $leftover -Force }
+    }
+}
+
+$extenderHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $syntheticExtenderPath).Hash.ToLowerInvariant()
+& $testsPath --chain $proxyPath $fakeOriginalPath $syntheticExtenderPath $extenderHash default
+if ($LASTEXITCODE -ne 0) { throw 'Chain loading test failed.' }
+
+$chainIniPath = Join-Path $outputDirectory 'SoulashExtender.ini'
+try {
+    [System.IO.File]::WriteAllText(
+        $chainIniPath,
+        "[Plugins]`r`nRequireHash=1`r`n",
+        [System.Text.Encoding]::ASCII)
+    & $testsPath --chain $proxyPath $fakeOriginalPath $syntheticExtenderPath $extenderHash require-hash
+    if ($LASTEXITCODE -ne 0) { throw 'Chain loading RequireHash test failed.' }
+}
+finally {
+    if (Test-Path -LiteralPath $chainIniPath) { Remove-Item -LiteralPath $chainIniPath -Force }
+}
+
+$distDirectory = Join-Path $outputDirectory ("dist-" + [guid]::NewGuid().ToString('N'))
+& (Join-Path $PSScriptRoot 'package.ps1') -OutputDirectory $distDirectory | Out-Null
+foreach ($expected in 'BugSplat64.dll', 'SoulashExtender.ini', 'INSTALL.txt', 'SHA256SUMS.txt', 'THIRD_PARTY_NOTICES.txt', 'check-install.ps1', 'SoulashExtender\Plugins', 'SoulashExtender\Scripts') {
+    if (-not (Test-Path -LiteralPath (Join-Path $distDirectory $expected))) { throw "Package is missing $expected." }
+}
+$packagedIni = Get-Content -LiteralPath (Join-Path $distDirectory 'SoulashExtender.ini') -Raw
+if ($packagedIni -notmatch '(?m)^\[Plugins\]\s*\r?\nEnabled=1' -or $packagedIni -notmatch '(?m)^\[Scripts\]\s*\r?\nEnabled=1') { throw 'Packaged INI does not enable plugins and scripts.' }
+if ((Get-Content -LiteralPath (Join-Path $distDirectory 'THIRD_PARTY_NOTICES.txt') -Raw) -notmatch 'Permission is hereby granted') { throw 'Packaged notices are missing the Lua licence text.' }
+$sumLine = (Get-Content -LiteralPath (Join-Path $distDirectory 'SHA256SUMS.txt')) | Where-Object { $_ -like '*BugSplat64.dll' }
+if ($sumLine -ne ('{0} *BugSplat64.dll' -f (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $distDirectory 'BugSplat64.dll')).Hash.ToLowerInvariant())) { throw 'SHA256SUMS does not match the packaged DLL.' }
+Write-Output 'PASS: packaged folder is complete and its INI enables plugins and scripts'
 
 $missingDirectory = Join-Path $outputDirectory ("missing-original-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $missingDirectory -Force | Out-Null

@@ -1,0 +1,31 @@
+# TestBot example: Ctrl+wheel switches the ability-bar set (AbilityBarWheel).
+# Needs AbilityBarWheel Enabled=1 with Trigger=modifier, Modifier=ctrl and
+# HoldMs below 600. Load a save; every load starts on bar set 0.
+# Format: docs/test-bot.md.
+
+log start: waiting for the game world (load a save)
+wait_world 600000
+wait 2000
+expect_bar_set 0
+
+log hold Ctrl past HoldMs, one wheel notch up
+mod ctrl
+wait 600
+wheel 1
+wait 300
+expect_bar_set 1
+
+log one more notch flips back
+wheel 1
+wait 300
+expect_bar_set 0
+mod none
+
+# The game's own switch (Left Ctrl, action 65) is hidden from the game while
+# AbilityBarWheel runs with SuppressModifierKey=1, so test it only with the
+# wheel plugin off:
+#   key lctrl 30
+#   wait 300
+#   expect_bar_set 1
+
+log done

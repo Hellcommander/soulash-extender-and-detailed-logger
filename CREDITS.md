@@ -20,11 +20,19 @@ These tools and APIs are not included in this repository.
 - **Soulash 2** — the game targeted by this experimental project. Soulash 2,
   its executable, assets, documentation, and data files are not included here.
   This project is independent and is not affiliated with or endorsed by the
-  game developers.
+  game developers. The project maintainer reports that the game's author has
+  said an extender is welcome and that the maintainer may do what they want
+  with it; that is the maintainer's account, not a licence or a statement
+  from the author, and it does not cover redistributing the game or BugSplat.
 - **BugSplat** — the proxy's four exported symbol names and expected x64
   signatures were derived from the game's imports. The vendor DLL, its code,
   and its assets are not included. The original signed DLL must remain
   user-provided and unmodified; deployment instructions are in `README.md`.
+
+- **Lua 5.4** - copyright PUC-Rio, MIT licence. Downloaded by the builder from
+  <https://www.lua.org/ftp/> (see `scripts/fetch-lua.ps1`), not stored in this
+  repository, and compiled into the extender DLL for the sandboxed script tier.
+  Binary packages include its licence notice in `THIRD_PARTY_NOTICES.txt`.
 
 ## Test fixtures
 

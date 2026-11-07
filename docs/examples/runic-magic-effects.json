@@ -1,0 +1,146 @@
+{
+  "spec": 1,
+  "mod": "arendeth_runic_magic",
+  "requires": ["choose", "delay", "remove_stacks", "on_turn", "stacker", "health_percent", "weapon_class", "holder_tag"],
+  "spells": [
+    {
+      "id": "Throw_Runeword_Cinder",
+      "name": "Throw Runeword: Cinder",
+      "description": "A fully native runeword: fire burst, burn, and a Chill Mine left behind. Needs no extender at all.",
+      "image": 20,
+      "animation": "arendeth_runic_magic_throw_runeword_flame_fx",
+      "target": "fireball",
+      "radius": 3,
+      "shape": "circle",
+      "range": 7,
+      "cooldown": 1,
+      "cast_time": 0.3,
+      "cost": { "stamina": 10 },
+      "requirements": { "one_of": ["Bow", "Crossbow"] },
+      "effects": [
+        { "damage": { "amount": [14, 22], "type": "fire", "scaling": 1.1, "ignore_party": true } },
+        { "status": { "burn": 5 } },
+        { "summon": { "entity": "arendeth_runic_magic_Rune_Mine_Chill", "count": 3 } }
+      ]
+    },
+    {
+      "id": "Entropy_Surge",
+      "name": "Entropy Surge",
+      "description": "Dredmor's Entropymine done right: exactly one burst from a weighted table, instead of nine independent percent rows.",
+      "image": 62,
+      "animation": "arendeth_runic_magic_throw_runeword_entropy_fx",
+      "target": "aoe_self",
+      "radius": 2,
+      "effects": [
+        { "damage": { "amount": [6, 10], "type": "death", "scaling": 0.8, "ignore_party": true } },
+        {
+          "choose": [
+            { "weight": 3, "do": { "cast": { "spell": "arendeth_runic_magic_Mine_Volt_Burst" } } },
+            { "weight": 2, "do": { "all": [ { "damage": { "amount": [8, 14], "type": "frost", "ignore_party": true } }, { "status": { "frostbite": 3 } } ] } },
+            { "weight": 1, "do": { "summon": { "entity": "arendeth_runic_magic_Rune_Mine_Force", "count": 2 } } }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "Draw_First_Circle_Exact",
+      "name": "First Circle (exact)",
+      "description": "spawnitemfromlist. Without 'approximate' this would be an exact one-of-four for the evaluator; with it the choose compiles to native independent 25% chances (0 to 4 runes, expected one) and needs no extender.",
+      "image": 52,
+      "animation": "arendeth_runic_magic_first_circle_fx",
+      "target": "aoe_self",
+      "radius": 1,
+      "cooldown": 4,
+      "cast_time": 0.6,
+      "cost": { "stamina": 4 },
+      "effects": [
+        { "stacks": { "stacker": "arendeth_runic_magic_runic_focus", "count": 1 } },
+        {
+          "choose": [
+            { "weight": 1, "do": { "create_item": { "item": "arendeth_runic_magic_Rune_of_Strength" } } },
+            { "weight": 1, "do": { "create_item": { "item": "arendeth_runic_magic_Rune_of_Movement" } } },
+            { "weight": 1, "do": { "create_item": { "item": "arendeth_runic_magic_Rune_of_Life" } } },
+            { "weight": 1, "do": { "create_item": { "item": "arendeth_runic_magic_Rune_of_Self" } } }
+          ],
+          "approximate": true
+        }
+      ]
+    },
+    {
+      "id": "Prophecy_Sequence",
+      "name": "Prophecy",
+      "description": "Runecaster's Prophecy1: seven delayed blasts, every two turns. Delays need the evaluator; the first hit is native.",
+      "image": 61,
+      "animation": "arendeth_runic_magic_throw_runeword_prophecy_fx",
+      "target": "aoe_tile",
+      "radius": 2,
+      "range": 7,
+      "effects": [
+        { "damage": { "amount": [10, 16], "type": "holy", "scaling": 1.0, "ignore_party": true } },
+        { "status": { "stun": 1 } },
+        { "delay": 2, "do": { "cast": { "spell": "arendeth_runic_magic_Prophecy_Beacon_Ring" } } },
+        { "delay": 4, "do": { "cast": { "spell": "arendeth_runic_magic_Prophecy_Beacon_Ring" } } },
+        { "delay": 6, "do": { "cast": { "spell": "arendeth_runic_magic_Prophecy_Beacon_Ring" } } }
+      ]
+    },
+    {
+      "ability": "arendeth_runic_magic_Cascade_Discharge",
+      "description": "Attach mode: the Cascade loop on the mod's existing Cascade Discharge ability. The 35% self-trigger is native (one passive row); the healthy-only extra discharge is a gated cast.",
+      "effects": [
+        { "chance": 0.35, "do": { "cast": { "spell": "arendeth_runic_magic_Cascade_Discharge" } } },
+        { "when": { "health_percent": { "min": 75 } }, "do": { "cast": { "spell": "arendeth_runic_magic_Rune_Spark" } } }
+      ]
+    },
+    {
+      "id": "Stance_Of_Embers",
+      "name": "Stance of Embers",
+      "description": "CES-style stance as a stacker flag: entering sets the flag and clears the rival stance; the flag is state the evaluator can gate on.",
+      "image": 15,
+      "animation": "arendeth_runic_magic_cast_warding_rune_fx",
+      "target": "self",
+      "cooldown": 2,
+      "effects": [
+        { "stacks": { "stacker": "arendeth_runic_magic_attune_flame", "count": 5 } },
+        { "remove_stacks": { "stacker": "arendeth_runic_magic_attune_frost", "count": 0 } },
+        { "buff": { "duration": 10, "stats": { "intelligence": 2 }, "modifiers": { "thorns": 2, "resistance": 5 } } }
+      ]
+    },
+    {
+      "id": "Ember_Strike_Payload",
+      "name": "Ember Strike",
+      "description": "Fired by the triggers below. Native when it fires; the gate decides whether it does.",
+      "image": 16,
+      "animation": "arendeth_runic_magic_cast_ember_rune_fx",
+      "target": "aoe_self",
+      "radius": 1,
+      "effects": [
+        { "damage": { "amount": [4, 8], "type": "fire", "scaling": 0.6, "ignore_party": true } },
+        { "repeat": 2, "do": { "status": { "burn": 1 } } }
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "id": "ember_stance_strikes",
+      "on": { "attack": true },
+      "chance": 0.2,
+      "when": { "all": [ { "weapon_class": "Unarmed" }, { "stacker": { "id": "arendeth_runic_magic_attune_flame", "min": 1 } } ] },
+      "do": { "cast": { "spell": "Ember_Strike_Payload" } },
+      "note": "weapon_class hoists to restrict_weapon_type on the generated passive; the stacker check stays as a gating condition."
+    },
+    {
+      "id": "undead_slayer_charges",
+      "on": { "kill": true },
+      "when": { "holder_tag": "Player" },
+      "do": { "create_item": { "item": "arendeth_runic_magic_Rune_Charge" } },
+      "note": "on_kill_create_item with restrict_tags: fully native."
+    },
+    {
+      "id": "entropy_every_turn",
+      "on": { "turn": true },
+      "chance": 0.05,
+      "do": { "cast": { "spell": "Entropy_Surge" } },
+      "note": "No native per-turn trigger exists (trigger_ability_on_turn is not in the exe): evaluator only."
+    }
+  ]
+}

@@ -1,3 +1,12 @@
+# -GameDir: the Soulash 2 folder whose SoulashExtender\Plugins receives the real
+# plugin DLLs after every build (owner's instruction, 2026-10-24). Defaults to
+# SOULASH2_GAME_DIR, then the known Steam location. Only *.dll files from
+# .build\plugins are copied, only into that one subfolder; nothing else in the
+# game folder is read or written. Pass -GameDir '' to skip the copy.
+param(
+    [string]$GameDir = $(if ($env:SOULASH2_GAME_DIR) { $env:SOULASH2_GAME_DIR } else { 'D:\games\Steam\steamapps\common\Soulash 2' })
+)
+
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -30,10 +39,51 @@ $syntheticModuleNativeDirectory = Join-Path $syntheticModulesDirectory 'native'
 $syntheticNativeModulePath = Join-Path $syntheticModuleNativeDirectory 'SyntheticNativeModule.dll'
 New-Item -ItemType Directory -Path $syntheticModuleNativeDirectory -Force | Out-Null
 
-& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /I $includeDirectory `
+# Lua is a build-time prerequisite fetched from lua.org (not stored in this repo).
+$luaSource = Join-Path $repoRoot 'third_party\lua-5.4.9\src'
+if (-not (Test-Path -LiteralPath (Join-Path $luaSource 'lua.h'))) {
+    throw @"
+Lua 5.4.9 sources are required to build the script sandbox but were not found.
+  Official download page : https://www.lua.org/ftp/
+  Tarball                : https://www.lua.org/ftp/lua-5.4.9.tar.gz
+  Expected SHA-256       : 2335b6c582a52654f94612bf10d2f4672805d05329aa6568b1d8cd9e5c6fb8e6
+Run .\scripts\fetch-lua.ps1 (downloads and verifies it), or unpack the tarball so
+that $luaSource\lua.h exists.
+"@
+}
+
+# Only the interpreter core and the safe libraries. io, os, package (loadlib),
+# debug and the standalone programs are deliberately never compiled.
+$luaObjectDirectory = Join-Path $outputDirectory 'lua'
+New-Item -ItemType Directory -Path $luaObjectDirectory -Force | Out-Null
+$luaFiles = 'lapi','lauxlib','lbaselib','lcode','lctype','ldebug','ldo','ldump','lfunc','lgc',
+    'llex','lmathlib','lmem','lobject','lopcodes','lparser','lstate','lstring','lstrlib',
+    'ltable','ltablib','ltm','lundump','lutf8lib','lvm','lzio' | ForEach-Object { Join-Path $luaSource "$_.c" }
+& cl.exe /nologo /TC /O2 /W3 /MT /c /I $luaSource "/Fo$luaObjectDirectory\" @luaFiles | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Compiling Lua failed.' }
+$luaObjects = Get-ChildItem -LiteralPath $luaObjectDirectory -Filter *.obj | ForEach-Object { $_.FullName }
+
+$sandboxObjectPath = Join-Path $outputDirectory 'script_sandbox.obj'
+$conditionsObjectPath = Join-Path $outputDirectory 'conditions.obj'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /c /I $sourceDirectory `
+    "/Fo$conditionsObjectPath" (Join-Path $sourceDirectory 'conditions.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling the conditions evaluator failed.' }
+$effectsObjectPath = Join-Path $outputDirectory 'effects.obj'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /c /I $sourceDirectory `
+    "/Fo$effectsObjectPath" (Join-Path $sourceDirectory 'effects.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling the effects loader failed.' }
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /c /I $luaSource /I $sourceDirectory `
+    "/Fo$sandboxObjectPath" (Join-Path $sourceDirectory 'script_sandbox.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling the script sandbox failed.' }
+
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /I $includeDirectory /I $sourceDirectory `
     "/Fo$objectDirectory" `
     (Join-Path $sourceDirectory 'manifest.cpp') `
+    (Join-Path $sourceDirectory 'x64_length.cpp') `
+    (Join-Path $sourceDirectory 'conditions.cpp') `
+    (Join-Path $sourceDirectory 'effects.cpp') `
     (Join-Path $testDirectory 'tests.cpp') `
+    $sandboxObjectPath @luaObjects `
     /Fe:$testsPath
 if ($LASTEXITCODE -ne 0) { throw 'Building native-tests.exe failed.' }
 
@@ -62,7 +112,145 @@ if ($LASTEXITCODE -ne 0) { throw 'Building fake BugSplat DLL failed.' }
     /Fe:$syntheticNativeModulePath
 if ($LASTEXITCODE -ne 0) { throw 'Building synthetic native module failed.' }
 
+$pluginDirectory = Join-Path $outputDirectory 'plugin-dir'
+New-Item -ItemType Directory -Path $pluginDirectory -Force | Out-Null
+$v3PluginPath = Join-Path $pluginDirectory 'Test.PluginA.dll'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /LD /I $includeDirectory `
+    "/Fo$objectDirectory" `
+    (Join-Path $testDirectory 'synthetic_v3_plugin.cpp') `
+    /Fe:$v3PluginPath
+if ($LASTEXITCODE -ne 0) { throw 'Building synthetic v3 plugin failed.' }
+Copy-Item -LiteralPath $v3PluginPath -Destination (Join-Path $pluginDirectory 'Test.PluginB.dll') -Force
+Copy-Item -LiteralPath $syntheticNativeModulePath -Destination (Join-Path $pluginDirectory 'Test.LegacyV2.dll') -Force
+# Not a valid plugin id (space), must be skipped by discovery without failing.
+Copy-Item -LiteralPath $v3PluginPath -Destination (Join-Path $pluginDirectory 'bad name.dll') -Force
+
+# Real plugins (shipped separately, never part of the synthetic plugin-dir tests).
+$realPluginDirectory = Join-Path $outputDirectory 'plugins'
+New-Item -ItemType Directory -Path $realPluginDirectory -Force | Out-Null
+$abilityBarProbePath = Join-Path $realPluginDirectory 'AbilityBarProbe.dll'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /LD /I $includeDirectory `
+    "/Fo$objectDirectory" `
+    (Join-Path $repoRoot 'plugins\ability_bar_probe\ability_bar_probe.cpp') `
+    /Fe:$abilityBarProbePath
+if ($LASTEXITCODE -ne 0) { throw 'Building the ability-bar probe plugin failed.' }
+$probeExports = & dumpbin.exe /nologo /exports $abilityBarProbePath
+if ($LASTEXITCODE -ne 0 -or ($probeExports -join "`n") -notmatch 'SoulashExtenderPluginLoad') {
+    throw 'AbilityBarProbe.dll does not export SoulashExtenderPluginLoad.'
+}
+$abilityBarWheelPath = Join-Path $realPluginDirectory 'AbilityBarWheel.dll'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /LD /I $includeDirectory `
+    "/Fo$objectDirectory" `
+    (Join-Path $repoRoot 'plugins\ability_bar_wheel\ability_bar_wheel.cpp') `
+    /Fe:$abilityBarWheelPath
+if ($LASTEXITCODE -ne 0) { throw 'Building the ability-bar wheel plugin failed.' }
+$wheelExports = & dumpbin.exe /nologo /exports $abilityBarWheelPath
+if ($LASTEXITCODE -ne 0 -or ($wheelExports -join "`n") -notmatch 'SoulashExtenderPluginLoad') {
+    throw 'AbilityBarWheel.dll does not export SoulashExtenderPluginLoad.'
+}
+$testBotPath = Join-Path $realPluginDirectory 'TestBot.dll'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /LD /I $includeDirectory `
+    "/Fo$objectDirectory" `
+    (Join-Path $repoRoot 'plugins\test_bot\test_bot.cpp') `
+    /Fe:$testBotPath
+if ($LASTEXITCODE -ne 0) { throw 'Building the test bot plugin failed.' }
+$testBotExports = & dumpbin.exe /nologo /exports $testBotPath
+if ($LASTEXITCODE -ne 0 -or ($testBotExports -join "`n") -notmatch 'SoulashExtenderPluginLoad') {
+    throw 'TestBot.dll does not export SoulashExtenderPluginLoad.'
+}
+# INI templates ship next to the DLLs; an existing INI at the destination is kept.
+Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\ability_bar_wheel\AbilityBarWheel.ini') `
+    -Destination (Join-Path $realPluginDirectory 'AbilityBarWheel.ini') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\test_bot\TestBot.ini') `
+    -Destination (Join-Path $realPluginDirectory 'TestBot.ini') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'plugins\test_bot\TestBot.script') `
+    -Destination (Join-Path $realPluginDirectory 'TestBot.script') -Force
+
+# Deploy the real plugins into the game's SoulashExtender\Plugins folder.
+if ($GameDir) {
+    if (Test-Path -LiteralPath (Join-Path $GameDir 'Soulash 2.exe')) {
+        $gamePluginDirectory = Join-Path $GameDir 'SoulashExtender\Plugins'
+        New-Item -ItemType Directory -Path $gamePluginDirectory -Force | Out-Null
+        $pins = [ordered]@{}
+        foreach ($dll in Get-ChildItem -LiteralPath $realPluginDirectory -Filter *.dll) {
+            $deployed = Join-Path $gamePluginDirectory $dll.Name
+            Copy-Item -LiteralPath $dll.FullName -Destination $deployed -Force
+            # Pin what is actually in the game folder, and only once the copy succeeded.
+            $pins[$dll.BaseName] = (Get-FileHash -Algorithm SHA256 -LiteralPath $deployed).Hash.ToLowerInvariant()
+            Write-Output ("Deployed {0} -> {1}" -f $dll.Name, $gamePluginDirectory)
+        }
+        # Every rebuild changes the hashes; with [Plugins] RequireHash=1 the game's
+        # SoulashExtender.ini (the extender's config, in the game folder) must carry
+        # them or the plugins are refused (error=5).
+        # Owner-authorised (2026-11-05): update ONLY these keys of [PluginHashes];
+        # everything else in the INI stays as it is (previous file kept as .bak).
+        . (Join-Path $PSScriptRoot 'plugin-pins.ps1')
+        $gameIni = Join-Path $GameDir 'SoulashExtender.ini'
+        try {
+            foreach ($change in Update-PluginPins -IniPath $gameIni -Pins $pins) {
+                switch ($change.Action) {
+                    'updated' { Write-Output ("Pinned  {0}: {1} -> {2}" -f $change.Name, $change.Old.Substring(0, [Math]::Min(8, $change.Old.Length)), $change.New.Substring(0, 8)) }
+                    'added' { Write-Output ("Pinned  {0}: (new) -> {1}" -f $change.Name, $change.New.Substring(0, 8)) }
+                    default { Write-Output ("Pinned  {0}: unchanged ({1})" -f $change.Name, $change.New.Substring(0, 8)) }
+                }
+            }
+        }
+        catch {
+            Write-Warning "Could not update [PluginHashes]: $($_.Exception.Message)"
+            Write-Output 'Paste into [PluginHashes] of the game''s SoulashExtender.ini (RequireHash=1):'
+            foreach ($name in $pins.Keys) { Write-Output ("  {0}={1}" -f $name, $pins[$name]) }
+        }
+        # TestBot scripts are NOT deployed (the owner copies one in when using the bot);
+        # the example is in .build\plugins\TestBot.script.
+        foreach ($ini in Get-ChildItem -LiteralPath $realPluginDirectory -Filter *.ini) {
+            $target = Join-Path $gamePluginDirectory $ini.Name
+            if (-not (Test-Path -LiteralPath $target)) {
+                Copy-Item -LiteralPath $ini.FullName -Destination $target
+                Write-Output ("Deployed {0} (template; edit it to enable the plugin)" -f $ini.Name)
+                continue
+            }
+            # Existing INI: keep the user's values, append any key the template
+            # has gained (with its comment lines) so every option is visible.
+            $existing = Get-Content -LiteralPath $target
+            $present = @{}
+            foreach ($line in $existing) {
+                if ($line -match '^\s*([A-Za-z][A-Za-z0-9_]*)\s*=') { $present[$Matches[1].ToLowerInvariant()] = $true }
+            }
+            $pending = @()
+            $additions = @()
+            foreach ($line in Get-Content -LiteralPath $ini.FullName) {
+                if ($line -match '^\s*;') { $pending += $line; continue }
+                if ($line -match '^\s*([A-Za-z][A-Za-z0-9_]*)\s*=') {
+                    if (-not $present.ContainsKey($Matches[1].ToLowerInvariant())) { $additions += $pending + $line }
+                }
+                $pending = @()
+            }
+            if ($additions.Count -gt 0) {
+                [System.IO.File]::AppendAllLines($target, [string[]]$additions, [System.Text.Encoding]::ASCII)
+                Write-Output ("Updated {0}: added {1} new option line(s), existing values kept" -f $ini.Name, ($additions | Where-Object { $_ -match '=' }).Count)
+            }
+        }
+    }
+    else {
+        Write-Output "SKIP: no 'Soulash 2.exe' in '$GameDir'; plugins not deployed (set SOULASH2_GAME_DIR or -GameDir)."
+    }
+}
+
+$proxyPluginServicesObjectPath = Join-Path $outputDirectory 'proxy_plugin_services.obj'
+$proxyX64ObjectPath = Join-Path $outputDirectory 'proxy_x64_length.obj'
+$proxySha256ObjectPath = Join-Path $outputDirectory 'proxy_sha256.obj'
 & cl.exe /nologo /std:c++17 /EHsc /W4 /WX /c `
+    "/Fo$proxySha256ObjectPath" (Join-Path $sourceDirectory 'sha256.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling shared SHA-256 failed.' }
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /I $includeDirectory /c `
+    "/Fo$proxyX64ObjectPath" (Join-Path $sourceDirectory 'x64_length.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling x64 length decoder failed.' }
+
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /I $includeDirectory /c `
+    "/Fo$proxyPluginServicesObjectPath" (Join-Path $sourceDirectory 'plugin_services.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling plugin services failed.' }
+
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /I $includeDirectory /c `
     "/Fo$proxyObjectPath" (Join-Path $sourceDirectory 'bugsplat_proxy.cpp')
 if ($LASTEXITCODE -ne 0) { throw 'Compiling proxy thunks failed.' }
 
@@ -78,11 +266,19 @@ if ($LASTEXITCODE -ne 0) { throw 'Compiling opt-in module runtime failed.' }
     "/Fo$proxyManifestObjectPath" (Join-Path $sourceDirectory 'manifest.cpp')
 if ($LASTEXITCODE -ne 0) { throw 'Compiling proxy manifest parser failed.' }
 
+$proxyUpdateGuardObjectPath = Join-Path $outputDirectory 'proxy_update_guard.obj'
+& cl.exe /nologo /std:c++17 /EHsc /W4 /WX /I $includeDirectory /c `
+    "/Fo$proxyUpdateGuardObjectPath" (Join-Path $sourceDirectory 'update_guard.cpp')
+if ($LASTEXITCODE -ne 0) { throw 'Compiling the update guard failed.' }
+
 & link.exe /nologo /dll /machine:x64 `
     "/def:$sourceDirectory\bugsplat_proxy.def" `
     "/implib:$proxyImportLibraryPath" "/out:$proxyPath" `
     $proxyObjectPath $proxyDiagnosticsObjectPath `
-    $proxyModuleRuntimeObjectPath $proxyManifestObjectPath bcrypt.lib
+    $proxyModuleRuntimeObjectPath $proxyManifestObjectPath `
+    $proxyPluginServicesObjectPath $proxyX64ObjectPath $proxySha256ObjectPath `
+    $proxyUpdateGuardObjectPath `
+    $sandboxObjectPath $conditionsObjectPath $effectsObjectPath @luaObjects bcrypt.lib
 if ($LASTEXITCODE -ne 0) { throw 'Building BugSplat64.dll proxy failed.' }
 
 & link.exe /nologo /dll /noentry /machine:x64 /ignore:4001 `
