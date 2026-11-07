@@ -113,7 +113,7 @@ A **trigger rule** adds the missing condition:
 | Field | Required | Meaning |
 | --- | --- | --- |
 | `id` | yes | `[a-z0-9_]{1,64}`, unique across conditions and triggers in the file. |
-| `on` | yes | Exactly one event: `{"cast": "<ability id>"}` (that ability was cast) or `{"attack": true}` (the holder attacked). |
+| `on` | yes | Exactly one event: `{"cast": "<ability id>"}` (that ability was cast), `{"attack": true}` (the holder attacked), or one of `{"kill": true}`, `{"turn": true}`, `{"damaged": true}`, `{"dodge": true}`, `{"block": true}`, `{"crit": true}`. The last six have no engine passive: they fire only with the extender's `Triggers` plugin (docs/triggers.md section 2 lists the holder and target of each), and `--emit` generates nothing for them. |
 | `cast` | yes | The ability to fire. |
 | `chance` | no | Above 0, at most 1; default 1. Rolled by the engine as it is today. |
 | `when` | yes | An expression (below). A trigger with no condition needs no extender. |

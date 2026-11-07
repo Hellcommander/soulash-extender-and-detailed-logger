@@ -92,7 +92,7 @@ namespace soulash::conditions
     struct Trigger
     {
         std::string id;
-        std::string onKind;       // "cast" or "attack"
+        std::string onKind;       // cast, attack, kill, turn, damaged, dodge, block, crit
         std::string onAbility;    // for "cast"
         std::string castAbility;
         double chance = 1.0;

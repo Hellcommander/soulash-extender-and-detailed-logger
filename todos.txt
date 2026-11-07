@@ -146,7 +146,22 @@ that it has been confirmed that it can survive updates")
 - Built, deployed and pinned (Triggers=71c1587a...). NOT RUN IN THE GAME yet. First run = Mode=log (docs/triggers.md
   section 6): check "game code located (RVAs): on-cast trigger 0x413E80, on-attack trigger 0x411670 ...",
   "state source ... all ok; queueing possible", the cast/attack event lines and their state values; then Mode=active.
-- Not done: turn/kill/damaged/dodge/block/crit events (candidates listed in docs/triggers.md 3.1/7), predicates
+- 2026-11-07 (owner: "continue adding the features..."): events kill / turn / damaged / dodge / block / crit and
+  predicates stacker / party / companions / time_of_day / season added, plus delayed casts (effects.json `delay`
+  waits for turn ticks of the holder; pending list in the plugin, max 256, not saved). RE (static, 526b6ab4, in
+  docs/triggers.md 3.1 + game-notes): kill routine 0x6D5E70 from OnDeath::update ("killing an ally"; fires on the
+  effect-101 call only), turn tick 0x5AFAD0 from ProgressEffects::update (RTTI slot 1; one call per entity with
+  Effects per game turn), parry XP 0x4BA1E0 ("core_2_Parry", attack miss path) = dodge, post-damage call 0x4B9FB0
+  (ctx, attacker, target, damage) = damaged, attack end 0x6CED40 (critical flag; attack struct +0 attacker, +0x90
+  target) = crit, deflection check 0x64B110 (EntityAttack::update, "EntityAttack: Attack performed.") = block,
+  game clock 0x205F0 (+0x20 day part, +0x28 year part, +0x18 time, 1440 turns/day). Effects component holds the
+  stacks (+0x38 map<string,int>, +0x48 expiry map<string,float>); Party component (type 50, 0x10) marks companions
+  (player has none). Each hook is optional and verified by its own byte patterns; a missing one only disables that
+  event. INI: LogTurnEvents=0 (turn ticks are hundreds per turn). validate_conditions.py accepts the new `on`
+  events and emits nothing for them. All unit tests pass; built, deployed, pinned; STILL NOT RUN IN THE GAME.
+  Still unbacked: inventory_count, biome, in_settlement, in_combat; equipped.item. The year-part clock field is
+  inferred (check the "game clock:" log line on the first run).
+- Superseded by the bullet above (kept for history): turn/kill/damaged/dodge/block/crit events (candidates listed in docs/triggers.md 3.1/7), predicates
   party/companions/stacker/inventory_count/time_of_day/season/biome/in_combat/in_settlement, delayed casts,
   conditions that gate passives/abilities (no evaluation point hooked), entity -> data id for equipped.item.
 

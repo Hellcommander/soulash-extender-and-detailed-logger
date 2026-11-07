@@ -8,14 +8,21 @@
 // Facts (build 526b6ab4 / 0.10.6.1, static analysis; docs/triggers.md 3):
 //   * The game context holds a std::vector<ECStorageBase*> at ctx+0x100 whose
 //     index is the component-type id (core_2 messages.json `component_type`
-//     order: 1 Ability user, 21 Equipment, 28 Health, 32 Item, 63 Skills,
-//     65 Stamina, 68 Tags, 76 Weapon ...). The plugin verifies each storage
-//     by its RTTI vtable before use.
+//     order: 1 Ability user, 20 Effects, 21 Equipment, 28 Health, 32 Item,
+//     50 Party, 52 Player, 63 Skills, 65 Stamina, 68 Tags, 76 Weapon ...). The
+//     plugin verifies each storage by its RTTI vtable before use.
 //   * ECStorage<T>: +0x08/+0x10 pages vector (24-byte {int* begin,end,cap}
 //     entries, 0x2000 ints each: page = id >> 13, slot = id & 0x1FFF, -1 =
-//     absent), +0x38/+0x40 dense component array (stride sizeof(T)).
+//     absent), +0x20/+0x28 vector<int> of the entity ids that have the
+//     component (the dense order), +0x38/+0x40 dense component array (stride
+//     sizeof(T)).
 //   * Component layouts below come from the components' own serialisers
 //     (vtable slot 1), checked against the owner's player.sav.
+//   * The game clock is a static struct returned by a tiny getter (0x205F0 in
+//     526b6ab4; the Triggers plugin finds it from ProgressEffects::update):
+//     +0x14 int 1440 (turns per day), +0x18 float time in turns, +0x20 int
+//     day-part index (core_2 `day_part`, passed to the day-part translator by
+//     the UI), +0x28 int year-part index (core_2 `year_part`).
 #pragma once
 
 #include "conditions.hpp"
@@ -33,6 +40,8 @@ namespace soulash_plugins::game_state
     constexpr std::uintptr_t ContextRegistryEndOffset = 0x108;
     constexpr std::uintptr_t StoragePagesBeginOffset = 0x08;
     constexpr std::uintptr_t StoragePagesEndOffset = 0x10;
+    constexpr std::uintptr_t StorageIdsBeginOffset = 0x20;   // std::vector<int> entity ids
+    constexpr std::uintptr_t StorageIdsEndOffset = 0x28;
     constexpr std::uintptr_t StorageDenseBeginOffset = 0x38;
     constexpr std::uintptr_t StorageDenseEndOffset = 0x40;
     constexpr std::size_t StoragePageEntrySize = 24;
@@ -43,9 +52,12 @@ namespace soulash_plugins::game_state
     enum ComponentType : unsigned int
     {
         TypeAbilityUser = 1,
+        TypeEffects = 20,
         TypeEquipment = 21,
         TypeHealth = 28,
         TypeItem = 32,
+        TypeParty = 50,
+        TypePlayer = 52,
         TypeSkills = 63,
         TypeStamina = 65,
         TypeTags = 68,
@@ -53,6 +65,9 @@ namespace soulash_plugins::game_state
         TypeCount = 78
     };
     constexpr std::size_t AbilityUserSize = 0x260;   // getter 0x92360: imul 0x260
+    constexpr std::size_t EffectsSize = 0x70;        // getter 0x92160
+    constexpr std::size_t PartySize = 0x10;          // getter 0x27cc0: sar 4
+    constexpr std::size_t PlayerSize = 0x130;        // getter 0x28100
     constexpr std::size_t EquipmentSize = 0x150;     // getter 0x284b0
     constexpr std::size_t HealthSize = 0x40;         // getter 0x282e0: shl 6
     constexpr std::size_t ItemSize = 0x18;           // getter 0x3b030: x3, x8
@@ -98,6 +113,24 @@ namespace soulash_plugins::game_state
     constexpr std::uintptr_t AbilityUserTargetOffset = 0x1A0;
     constexpr std::uintptr_t AbilityUserQueueOffset = 0x230;
     constexpr std::uintptr_t AbilityUserNoTriggersOffset = 0x258;
+    // Effects: +0x08/+0x10 vector of active effects (0x1A0 each: an Ability
+    // plus its end time), +0x38 std::map<std::string,int> stacker id -> stacks,
+    // +0x48 std::map<std::string,float> stacker id -> expiry time (the engine's
+    // on_max_stacks code resets a stack count to 0 once time passes its
+    // expiry), +0x6C float: the time the entity's effects last ticked.
+    constexpr std::uintptr_t EffectsStacksMapOffset = 0x38;
+    constexpr std::uintptr_t EffectsStackExpiryMapOffset = 0x48;
+    constexpr std::uintptr_t EffectsLastTickOffset = 0x6C;
+    // Party: carried by the player's companions (not by the player: the owner's
+    // player.sav has no Party line). +0x08 int, +0x0C bool "hold position"
+    // (PartyActions toggles it). The party UI lists the Party storage's ids.
+    constexpr std::uintptr_t PartyHoldPositionOffset = 0x0C;
+    constexpr unsigned int MaximumPartyMembers = 64;
+    // Game clock struct (see the header comment).
+    constexpr std::uintptr_t ClockTurnsPerDayOffset = 0x14;
+    constexpr std::uintptr_t ClockTimeOffset = 0x18;
+    constexpr std::uintptr_t ClockDayPartOffset = 0x20;
+    constexpr std::uintptr_t ClockYearPartOffset = 0x28;
 
     // ---- core_2 lists (messages.json, 0.10.6.1) -------------------------------
     constexpr const char* WeaponTypeNames[] = {
@@ -125,6 +158,21 @@ namespace soulash_plugins::game_state
         "Troglodyte", "Troll", "Orc", "Fishman", "Demon", "Satyr", "Centaur", "Mutant", "Insectoid", "Dragon",
         "Skeleton", "Ghoul", "Zombie"};
     constexpr unsigned int TagCount = 23;
+    constexpr const char* DayPartNames[] = {
+        "Midnight", "After Midnight", "Small Hours", "Early Morning", "Morning", "Midday", "Afternoon",
+        "Late Afternoon", "Evening", "Late Evening", "Night", "Late Night"};
+    constexpr unsigned int DayPartCount = 12;
+    constexpr const char* YearPartNames[] = {"Spring", "Summer", "Autumn", "Winter"};
+    constexpr unsigned int YearPartCount = 4;
+
+    // What the game clock says; `has` is false when the getter was not located.
+    struct GameClock
+    {
+        bool has = false;
+        float time = 0.0f;   // turns since the start of the game
+        int dayPart = -1;    // index into DayPartNames, -1 = out of range
+        int yearPart = -1;   // index into YearPartNames
+    };
 
     // One storage the plugin has verified (vtable of the storage and of its
     // components checked against RTTI).
@@ -138,6 +186,7 @@ namespace soulash_plugins::game_state
     struct Access
     {
         StorageRef abilityUser, equipment, health, item, skills, stamina, tags, weapon;
+        StorageRef effects, party, player;
     };
 
     template <typename T>
@@ -291,8 +340,29 @@ namespace soulash_plugins::game_state
         return Percent(maximum - used, maximum, out);
     }
 
-    // In-order walk of std::map<std::string,int> (bounded; false on a malformed tree).
-    inline bool ReadStringIntMap(const unsigned char* map, std::map<std::string, double>& out)
+    inline GameClock ReadClock(const void* clock)
+    {
+        GameClock out;
+        if (clock == nullptr) return out;
+        const auto turnsPerDay = Read<std::int32_t>(clock, ClockTurnsPerDayOffset);
+        const float time = Read<float>(clock, ClockTimeOffset);
+        if (turnsPerDay <= 0 || time != time || time < 0.0f)
+        {
+            return out;   // not the struct we know
+        }
+        out.has = true;
+        out.time = time;
+        const auto dayPart = Read<std::int32_t>(clock, ClockDayPartOffset);
+        const auto yearPart = Read<std::int32_t>(clock, ClockYearPartOffset);
+        out.dayPart = dayPart >= 0 && static_cast<unsigned int>(dayPart) < DayPartCount ? dayPart : -1;
+        out.yearPart = yearPart >= 0 && static_cast<unsigned int>(yearPart) < YearPartCount ? yearPart : -1;
+        return out;
+    }
+
+    // In-order walk of std::map<std::string,V> with V an int or a float
+    // (bounded; false on a malformed tree).
+    template <typename V>
+    bool ReadStringMap(const unsigned char* map, std::map<std::string, double>& out)
     {
         const auto head = Read<const unsigned char*>(map, 0);
         if (head == nullptr)
@@ -317,9 +387,93 @@ namespace soulash_plugins::game_state
             char key[128];
             if (ReadMsvcString(node + MapNodeKey, key, sizeof(key)))
             {
-                out[key] = Read<std::int32_t>(node, MapNodeValue);
+                out[key] = static_cast<double>(Read<V>(node, MapNodeValue));
             }
             node = Read<const unsigned char*>(node, MapNodeRight);
+        }
+        return true;
+    }
+
+    inline bool ReadStringIntMap(const unsigned char* map, std::map<std::string, double>& out)
+    {
+        return ReadStringMap<std::int32_t>(map, out);
+    }
+
+    // Stacker id -> live stacks of the holder. A stack whose expiry time lies
+    // before `now` counts as 0, as in the engine's own on_max_stacks code. `now`
+    // comes from the game clock, else from the entity's last effects tick (at
+    // most one turn behind). False when the holder has no Effects component.
+    inline bool ReadStackers(const StorageRef& effects, std::uint32_t entityId, const GameClock& clock,
+        std::map<std::string, double>& out)
+    {
+        const unsigned char* component = FindComponent(effects, entityId);
+        if (component == nullptr)
+        {
+            return false;
+        }
+        std::map<std::string, double> counts;
+        std::map<std::string, double> expiry;
+        if (!ReadStringMap<std::int32_t>(component + EffectsStacksMapOffset, counts)
+            || !ReadStringMap<float>(component + EffectsStackExpiryMapOffset, expiry))
+        {
+            return false;
+        }
+        const double now = clock.has ? clock.time : Read<float>(component, EffectsLastTickOffset);
+        for (const auto& [id, count] : counts)
+        {
+            if (count <= 0) continue;
+            const auto expires = expiry.find(id);
+            if (expires != expiry.end() && expires->second < now) continue;
+            out[id] = count;
+        }
+        return true;
+    }
+
+    // Entities that currently have the component (the storage's id vector,
+    // cross-checked against the page table). -1 when the vector looks wrong.
+    inline int CountStorageEntities(const StorageRef& ref, unsigned int maximum)
+    {
+        if (ref.storage == nullptr) return -1;
+        const auto begin = Read<const std::int32_t*>(ref.storage, StorageIdsBeginOffset);
+        const auto end = Read<const std::int32_t*>(ref.storage, StorageIdsEndOffset);
+        if (begin == nullptr || end < begin || static_cast<std::size_t>(end - begin) > maximum)
+        {
+            return begin == end ? 0 : -1;
+        }
+        int count = 0;
+        for (const std::int32_t* id = begin; id < end; ++id)
+        {
+            if (*id > 0 && FindComponent(ref, static_cast<std::uint32_t>(*id)) != nullptr) ++count;
+        }
+        return count;
+    }
+
+    // party / companions for the holder. The player has no Party component;
+    // the companions do. For the player: in a party while any companion has
+    // one, companions = their number. For a companion: in a party, companions =
+    // the other members plus the player. Anyone else is alone with none.
+    inline bool ReadParty(const StorageRef& party, const StorageRef& player, std::uint32_t holder,
+        soulash::conditions::Snapshot& snapshot)
+    {
+        if (party.storage == nullptr || player.storage == nullptr) return false;
+        const int members = CountStorageEntities(party, MaximumPartyMembers);
+        if (members < 0) return false;
+        const bool holderIsMember = FindComponent(party, holder) != nullptr;
+        const bool holderIsPlayer = FindComponent(player, holder) != nullptr;
+        if (holderIsMember)
+        {
+            snapshot.party = std::string("in_party");
+            snapshot.companions = static_cast<double>(members);   // the others plus the player
+        }
+        else if (holderIsPlayer)
+        {
+            snapshot.party = std::string(members > 0 ? "in_party" : "alone");
+            snapshot.companions = static_cast<double>(members);
+        }
+        else
+        {
+            snapshot.party = std::string("alone");
+            snapshot.companions = 0.0;
         }
         return true;
     }
@@ -364,9 +518,10 @@ namespace soulash_plugins::game_state
     }
 
     // Fills what the registry can answer; everything else stays unknown. The
-    // target (0 = none) only contributes target_* predicates.
+    // target (0 = none) only contributes target_* predicates; the clock (may
+    // be a default-constructed GameClock) the time predicates.
     inline void BuildSnapshot(const Access& access, std::uint32_t holder, std::uint32_t target,
-        soulash::conditions::Snapshot& snapshot)
+        soulash::conditions::Snapshot& snapshot, const GameClock& clock = GameClock{})
     {
         double value = 0;
         if (ReadHealthPercent(access.health, holder, value)) snapshot.healthPercent = value;
@@ -375,6 +530,11 @@ namespace soulash_plugins::game_state
         if (ReadTags(access.tags, holder, tags)) snapshot.holderTags = tags;
         std::map<std::string, double> skills;
         if (ReadSkills(access.skills, holder, skills)) snapshot.skills = skills;
+        std::map<std::string, double> stackers;
+        if (ReadStackers(access.effects, holder, clock, stackers)) snapshot.stackers = stackers;
+        ReadParty(access.party, access.player, holder, snapshot);
+        if (clock.has && clock.dayPart >= 0) snapshot.dayPart = std::string(DayPartNames[clock.dayPart]);
+        if (clock.has && clock.yearPart >= 0) snapshot.season = std::string(YearPartNames[clock.yearPart]);
 
         const EquipmentView equipment = ReadEquipment(access.equipment, holder);
         if (equipment.present)

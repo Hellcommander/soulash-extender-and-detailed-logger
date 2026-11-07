@@ -124,6 +124,12 @@ re-derives them from code patterns at load instead of trusting these numbers.
 | component registry: `std::vector<ECStorageBase*>` at `ctx+0x100`, index = component-type id; constructor | `0x436EC0` |
 | component getters: Ability user `0x92360` (0x260), Equipment `0x284B0` (0x150), Health `0x282E0` (0x40), Item `0x3B030` (0x18), Skills `0x12DF40` (0x88), Stamina `0x85450` (0x28), Tags `0x42E80` (0x20), Weapon `0x1838A0` (0x68), Actor `0x28690` (0x20), Effects `0x92160` (0x70), Player `0x28100` (0x130), Position `0x27AE0` (0x30) | |
 | systems registered by `0x4378D0`: `OnDeath::update` (kill passives 101/102) `0x6D0D00`, `ProgressEffects::update` `0x5AE060`, `ProgressEvents::update` `0x5B10A0`, `EntityAttack::update` `0x6C9D10`, `RangedAttack::update` `0x6EEE90` | |
+| kill passive routine `(system, killer, victim, pos*, effectId)`, called from `OnDeath::update` at `0x6D130D` (101) / `0x6D133D` (102); the killer is Health `+0x30` of the victim | `0x6D5E70` |
+| per-entity turn tick `(system, entity)` (collects passive 63), called from `ProgressEffects::update` at `0x5AE1A0` once per turn per entity with Effects; neighbours `0x5AF4F0` / `0x5B0220` | `0x5AFAD0` |
+| game clock getter → static struct `0xB01DE8` (`+0x14` 1440 turns/day, `+0x18` time, `+0x20` day part, `+0x28` year part); day-part translator (`"Unable to find translation for day part {}."`) | `0x205F0`; `0x4CFEF0` |
+| attack resolution internals: hit roll `rand/2^53` vs success rate at `0x6CB193`; miss path grants Parry XP `(ctx, attacker, defender, float)` `0x4BA1E0` (`"core_2_Parry"`); damage `[rbp+60h]` from `0x4BC2F0`, applied inline at `0x6CB928`; post-damage call `(ctx, attacker, target, damage)` at `0x6CBBD0`; final call `(system, attack*, weaponType, critical)` at `0x6CC0E2`; attack struct: attacker `+0`, target `+0x90` | `0x4BA1E0`, `0x4BC2F0`, `0x4B9FB0`, `0x6CED40` |
+| deflection check `(system, attacker, attackQueue*, r9) → bool` from `EntityAttack::update` at `0x6CA6EE`; queue data `+0x18`, capacity `+0x20`, index `+0x28`, entry target `+0x4C`; message builder (`"EntityAttack: Attack deflected."`) | `0x64B110`; `0x6CEB00` |
+| Effects component (type 20, 0x70): active effects `+0x08/+0x10` (0x1A0 each), stacks `map<string,int>` `+0x38`, stack expiry `map<string,float>` `+0x48`, last tick time `+0x6C`; Party component (type 50, 0x10, getter `0x27CC0`): companions only, `+0x0C` hold position; `ECStorage` entity-id vector `+0x20/+0x28` | |
 
 ## Build `60b72c10` (0.10.5.1, 2026-10-31): ability bar unchanged
 

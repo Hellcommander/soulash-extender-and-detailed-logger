@@ -161,7 +161,8 @@ skill-conditions evaluator are the next steps.
 ## Skill-conditions files
 
 A mod may ship `extender\conditions.json` (format: [docs/skill-conditions.md](docs/skill-conditions.md)):
-**conditional triggers** (an ability fires on a cast or an attack only while a condition holds)
+**conditional triggers** (an ability fires on a cast, an attack, a kill, a turn, being
+damaged, a dodge, a block or a critical hit only while a condition holds)
 and conditions that gate a passive or ability.
 With `[Conditions] Enabled=1` in the INI (optional `Directory=`, default
 `<game folder>\data\mods`; or `SOULASH2_MODS_DIRECTORY`), the extender looks in
@@ -247,16 +248,18 @@ as described below (the build prints each SHA-256).
   [docs/test-bot.md](docs/test-bot.md).
 - `Triggers.dll` (`plugins/triggers`): **conditional triggers executed by the
   extender**. It loads every mod's `extender\conditions.json` (`triggers`) and
-  `extender\effects.json` (`triggers`), detours the two engine routines that
-  resolve passive triggers (after an ability is cast, after an attack), builds
-  a state snapshot of the holder from the game's component registry (health,
-  stamina, tags, equipment, weapon class, shield, skills, target) and queues the
-  abilities of the rules whose condition holds with the engine's own
-  queued-ability mechanism. Every game function and component is located and
-  verified from the game's own code and RTTI at load; nothing is keyed by a
-  build hash. Ships with `Triggers.ini` `Mode=log` (hooks installed, everything
-  logged, nothing queued); `Mode=active` queues. Not yet run in the game. See
-  [docs/triggers.md](docs/triggers.md).
+  `extender\effects.json` (`triggers`), detours the engine routines behind
+  eight events (ability cast, attack, kill, per-entity turn tick, damage taken,
+  dodge / parry, deflected attack, critical hit), builds a state snapshot of the
+  holder from the game's component registry (health, stamina, tags, equipment,
+  weapon class, shield, skills, stacks, party, game clock, target) and queues
+  the abilities of the rules whose condition holds with the engine's own
+  queued-ability mechanism; delayed casts wait for the holder's turns. Every
+  game function and component is located and verified from the game's own code
+  and RTTI at load; nothing is keyed by a build hash, and a hook that is not
+  found only disables its event. Ships with `Triggers.ini` `Mode=log` (hooks
+  installed, everything logged, nothing queued); `Mode=active` queues. Not yet
+  run in the game. See [docs/triggers.md](docs/triggers.md).
 
 Plugin INI templates (`plugins/<name>/<Name>.ini`) are deployed next to the
 DLLs; an existing INI keeps its values and only gains options the template has

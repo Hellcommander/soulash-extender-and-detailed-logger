@@ -1,28 +1,43 @@
 // Triggers: true conditional-trigger support, executed by the extender
 // (docs/triggers.md). The engine can chain abilities only through a few passive
 // effects with a flat chance and no condition, and the in-game editor exposes
-// only stackers. This plugin hooks the two places where the engine itself
-// resolves passive triggers and runs the extender's own rules there:
+// only stackers. This plugin hooks the places where the engine itself resolves
+// passive triggers (and a few neighbouring routines) and runs the extender's
+// own rules there:
 //
 //   * TriggerOnCast(ctx, caster, &abilityId)   - called by UseAbility::update
 //     right after an ability is cast (the engine's trigger_ability_on_cast);
 //   * TriggerOnAttack(ctx, attacker, target, weapon) - called after every
-//     melee / ranged attack (the engine's on_attack_cast).
+//     melee / ranged attack (the engine's on_attack_cast);
+//   * KillTrigger(system, killer, victim, ...)  - OnDeath::update, effect 101;
+//   * TurnTick(system, entity)                  - ProgressEffects::update, once
+//     per game turn for every entity with effects (the turn source);
+//   * ParryExperience(ctx, attacker, defender)  - the attack resolution's miss
+//     path (dodge);
+//   * DamageDealt(ctx, attacker, target, damage) - after an attack or ability
+//     damage lands (damaged);
+//   * AttackEnd(system, attack, weapon, critical) - the end of every attack
+//     resolution (crit);
+//   * Deflect(system, attacker, queue) -> bool  - EntityAttack::update's
+//     deflection check (block).
 //
-// Rules live in <mod>\extender\conditions.json (`triggers`: on cast A / on
-// attack, cast B, chance, when) and <mod>\extender\effects.json. For each
-// event the plugin builds a state snapshot of the holder from the game's own
-// component registry (plugins/common/game_state.hpp), evaluates the rules
+// Rules live in <mod>\extender\conditions.json (`triggers`: on <event>, cast
+// B, chance, when) and <mod>\extender\effects.json. For each event the plugin
+// builds a state snapshot of the holder from the game's own component registry
+// (plugins/common/game_state.hpp), evaluates the rules
 // (plugins/common/trigger_rules.hpp, fail closed) and queues each resulting
 // ability on the holder with the engine's own primitive: a fresh Ability copied
 // from the ability registry, pushed onto the AbilityUser's queued-ability deque,
 // which the game casts at the holder's current target on its own thread.
+// Delayed casts (effects.json `delay`) wait for that many turn ticks of the
+// holder.
 //
 // Nothing here trusts a build hash. Every game function is located from its
 // own code (plugins/common/trigger_layout.hpp, anchored by the engine's log
-// strings) and every component storage is checked against RTTI before use.
-// Mode=log (default) installs the hooks and logs what would happen; Mode=active
-// queues. Any fault inside a hook disables the plugin and leaves the game alone.
+// strings and RTTI) and every component storage is checked against RTTI before
+// use. Mode=log (default) installs the hooks and logs what would happen;
+// Mode=active queues. Any fault inside a hook disables the plugin and leaves
+// the game alone.
 #include "plugin_api.h"
 #include "../common/ability_queue.hpp"
 #include "../common/game_state.hpp"
@@ -50,9 +65,28 @@ namespace
     constexpr std::size_t MaximumConditionsFile = 64 * 1024;
     constexpr std::size_t MaximumEffectsFile = 256 * 1024;
     constexpr std::size_t MaximumMods = 512;
+    constexpr std::size_t MaximumPendingCasts = 256;
+    constexpr int KillEffectAny = 101;   // on_kill_any_create_item: the first of the two kill passes
+    // Attack struct of the attack resolution (docs/triggers.md 3.1).
+    constexpr std::size_t AttackAttackerOffset = 0x00;
+    constexpr std::size_t AttackTargetOffset = 0x90;
+    // The EntityAttack system's attack queue: data +0x18, capacity +0x20, index
+    // +0x28; the current entry's target entity id at +0x4C.
+    constexpr std::size_t QueueDataOffset = 0x18;
+    constexpr std::size_t QueueCapacityOffset = 0x20;
+    constexpr std::size_t QueueIndexOffset = 0x28;
+    constexpr std::size_t QueueEntryTargetOffset = 0x4C;
+    constexpr std::size_t SystemContextOffset = 0x08;   // every system holds the game context at +8
 
     using OnCastFn = void* (*)(void* context, unsigned int caster, const void* abilityId);
     using OnAttackFn = void* (*)(void* context, unsigned int attacker, unsigned int target, unsigned int weapon);
+    using KillFn = std::uint64_t (*)(void* system, unsigned int killer, unsigned int victim, void* position, int effectId);
+    using TurnFn = std::uint64_t (*)(void* system, unsigned int entity);
+    using ParryFn = std::uint64_t (*)(void* context, unsigned int attacker, unsigned int defender, float value);
+    using DamageFn = std::uint64_t (*)(void* context, unsigned int attacker, unsigned int target, int damage);
+    using AttackEndFn = std::uint64_t (*)(void* system, void* attack, unsigned int weaponType, unsigned char critical);
+    using DeflectFn = unsigned char (*)(void* system, unsigned int attacker, void* queue, void* fourth);
+    using ClockFn = const void* (*)();
     using RegistryFn = void* (*)();
     using MapAtFn = void* (*)(void* registry, void* out, const std::string* key);
     using NewFn = void* (*)(std::size_t);
@@ -67,6 +101,7 @@ namespace
     bool g_enabled = true;
     bool g_active = false;          // Mode=active
     bool g_logEvents = true;
+    bool g_logTurnEvents = false;
     unsigned int g_maxLogLines = 400;
     unsigned int g_maxCastsPerEvent = 8;
 
@@ -74,12 +109,20 @@ namespace
     soulash_plugins::TriggerLayout g_layout;
     OnCastFn g_onCastOriginal = nullptr;
     OnAttackFn g_onAttackOriginal = nullptr;
+    KillFn g_onKillOriginal = nullptr;
+    TurnFn g_onTurnOriginal = nullptr;
+    ParryFn g_onParryOriginal = nullptr;
+    DamageFn g_onDamageOriginal = nullptr;
+    AttackEndFn g_onAttackEndOriginal = nullptr;
+    DeflectFn g_onDeflectOriginal = nullptr;
+    ClockFn g_clock = nullptr;
     RegistryFn g_abilityRegistry = nullptr;
     MapAtFn g_abilityMapAt = nullptr;
     NewFn g_gameNew = nullptr;
     DeleteFn g_gameDelete = nullptr;
     GrowMapFn g_growMap = nullptr;
     DestructorFn g_abilityDestructor = nullptr;
+    bool g_hookInstalled[rules::EventKindCount] = {};
 
     // ---- state source ---------------------------------------------------------
     struct StorageSpec
@@ -97,9 +140,12 @@ namespace
     gs::Access g_access;
     StorageSpec g_storages[] = {
         {"AbilityUser", gs::TypeAbilityUser, gs::AbilityUserSize, ".?AV?$ECStorage@UAbilityUser@@@ASEngine@@", ".?AUAbilityUser@@", &g_access.abilityUser},
+        {"Effects", gs::TypeEffects, gs::EffectsSize, ".?AV?$ECStorage@UEffects@@@ASEngine@@", ".?AUEffects@@", &g_access.effects},
         {"Equipment", gs::TypeEquipment, gs::EquipmentSize, ".?AV?$ECStorage@UEquipment@@@ASEngine@@", ".?AUEquipment@@", &g_access.equipment},
         {"Health", gs::TypeHealth, gs::HealthSize, ".?AV?$ECStorage@UHealth@@@ASEngine@@", ".?AUHealth@@", &g_access.health},
         {"Item", gs::TypeItem, gs::ItemSize, ".?AV?$ECStorage@UItem@@@ASEngine@@", ".?AUItem@@", &g_access.item},
+        {"Party", gs::TypeParty, gs::PartySize, ".?AV?$ECStorage@UParty@@@ASEngine@@", ".?AUParty@@", &g_access.party},
+        {"Player", gs::TypePlayer, gs::PlayerSize, ".?AV?$ECStorage@UPlayer@@@ASEngine@@", ".?AUPlayer@@", &g_access.player},
         {"Skills", gs::TypeSkills, gs::SkillsSize, ".?AV?$ECStorage@USkills@@@ASEngine@@", ".?AUSkills@@", &g_access.skills},
         {"Stamina", gs::TypeStamina, gs::StaminaSize, ".?AV?$ECStorage@UStamina@@@ASEngine@@", ".?AUStamina@@", &g_access.stamina},
         {"Tags", gs::TypeTags, gs::TagsSize, ".?AV?$ECStorage@UTags@@@ASEngine@@", ".?AUTags@@", &g_access.tags},
@@ -113,15 +159,25 @@ namespace
     unsigned int g_ruleCount = 0;
     unsigned int g_modCount = 0;
 
+    // A cast waiting for turn ticks of its holder (effects.json `delay`).
+    struct PendingCast
+    {
+        std::uint32_t holder = 0;
+        std::string abilityId;
+        std::string rule;
+        unsigned int turnsLeft = 0;
+    };
+    std::vector<PendingCast>* g_pending = nullptr;
+
     // ---- runtime --------------------------------------------------------------
     std::mt19937_64* g_rng = nullptr;
     bool g_disabled = false;          // after a fault
     unsigned int g_logLines = 0;
-    unsigned long long g_castEvents = 0;
-    unsigned long long g_attackEvents = 0;
+    unsigned long long g_eventCounts[rules::EventKindCount] = {};
     unsigned long long g_queued = 0;
     unsigned long long g_wouldQueue = 0;
     unsigned int g_badIdLogs = 0;
+    bool g_clockLogged = false;
 
     void Log(const char* format, ...)
     {
@@ -169,6 +225,7 @@ namespace
         GetPrivateProfileStringW(L"Triggers", L"Mode", L"log", mode, 32, iniPath);
         g_active = _wcsicmp(mode, L"active") == 0;
         g_logEvents = GetPrivateProfileIntW(L"Triggers", L"LogEvents", 1, iniPath) != 0;
+        g_logTurnEvents = GetPrivateProfileIntW(L"Triggers", L"LogTurnEvents", 0, iniPath) != 0;
         g_maxLogLines = GetPrivateProfileIntW(L"Triggers", L"MaxLogLines", 400, iniPath);
         g_maxCastsPerEvent = GetPrivateProfileIntW(L"Triggers", L"MaxCastsPerEvent", 8, iniPath);
         if (g_maxCastsPerEvent == 0) g_maxCastsPerEvent = 1;
@@ -208,6 +265,7 @@ namespace
     void LoadModRules()
     {
         g_mods = new std::vector<rules::ModRules>();
+        g_pending = new std::vector<PendingCast>();
         std::wstring root = std::wstring(g_extender->gameDirectory) + L"data\\mods\\";
         WIN32_FIND_DATAW entry{};
         HANDLE find = FindFirstFileW((root + L"*").c_str(), &entry);
@@ -279,7 +337,7 @@ namespace
     void ResolveStorages(const void* context)
     {
         g_storagesResolved = true;
-        char summary[400] = "";
+        char summary[600] = "";
         for (StorageSpec& spec : g_storages)
         {
             const unsigned char* storage = gs::RegistryStorage(context, spec.index);
@@ -301,6 +359,27 @@ namespace
             && g_abilityMapAt != nullptr && g_growMap != nullptr;
         Log("state source (registry at ctx+0x100, indices = component_type ids): %s; queueing %s", summary,
             g_queueUsable ? "possible" : "NOT possible (AbilityUser storage or game functions missing)");
+    }
+
+    gs::GameClock ReadGameClock()
+    {
+        if (g_clock == nullptr) return gs::GameClock{};
+        const gs::GameClock clock = gs::ReadClock(g_clock());
+        if (!g_clockLogged)
+        {
+            g_clockLogged = true;
+            if (clock.has)
+            {
+                Log("game clock: time %.1f turns, day part %d (%s), year part %d (%s)", clock.time, clock.dayPart,
+                    clock.dayPart >= 0 ? gs::DayPartNames[clock.dayPart] : "?", clock.yearPart,
+                    clock.yearPart >= 0 ? gs::YearPartNames[clock.yearPart] : "?");
+            }
+            else
+            {
+                Log("game clock: the clock struct does not look as expected; time_of_day and season stay unknown");
+            }
+        }
+        return clock;
     }
 
     // ---- the cast primitive ---------------------------------------------------
@@ -364,26 +443,106 @@ namespace
         return true;
     }
 
+    // Queue (or, in log mode, report) one cast for a holder.
+    void FireCast(const void* context, std::uint32_t holder, std::uint32_t target, const std::string& abilityId,
+        const std::string& rule, const char* why)
+    {
+        if (!g_active)
+        {
+            ++g_wouldQueue;
+            Log("rule %s: would queue '%s' on entity %u%s (Mode=log; set Mode=active to queue)", rule.c_str(),
+                abilityId.c_str(), holder, why);
+            return;
+        }
+        if (!g_queueUsable)
+        {
+            Log("rule %s: cannot queue '%s' (queue not usable on this build)", rule.c_str(), abilityId.c_str());
+            return;
+        }
+        if (QueueAbility(context, holder, abilityId, rule.c_str()))
+        {
+            Log("rule %s: queued '%s' on entity %u (target %u)%s", rule.c_str(), abilityId.c_str(), holder, target, why);
+        }
+    }
+
+    // Delayed casts of this holder: one turn closer; fire the due ones.
+    void TickPending(const void* context, std::uint32_t holder, std::uint32_t target)
+    {
+        for (std::size_t i = 0; i < g_pending->size();)
+        {
+            PendingCast& pending = (*g_pending)[i];
+            if (pending.holder != holder)
+            {
+                ++i;
+                continue;
+            }
+            if (--pending.turnsLeft > 0)
+            {
+                ++i;
+                continue;
+            }
+            const PendingCast due = pending;
+            g_pending->erase(g_pending->begin() + static_cast<std::ptrdiff_t>(i));
+            FireCast(context, holder, target, due.abilityId, due.rule, " (delayed cast due)");
+        }
+    }
+
     // ---- event handling (game thread) -----------------------------------------
+    // `extra` is the weapon entity (attack) or the damage (damaged).
+    void DescribeEvent(rules::EventKind kind, std::uint32_t holder, std::uint32_t target, std::uint32_t extra,
+        const char* abilityId, char* out, std::size_t size)
+    {
+        switch (kind)
+        {
+        case rules::EventKind::Cast:
+            _snprintf_s(out, size, _TRUNCATE, "cast event: entity %u cast '%s' (target %u)", holder, abilityId, target);
+            break;
+        case rules::EventKind::Attack:
+            _snprintf_s(out, size, _TRUNCATE, "attack event: entity %u attacked %u (weapon entity %u)", holder, target, extra);
+            break;
+        case rules::EventKind::Kill:
+            _snprintf_s(out, size, _TRUNCATE, "kill event: entity %u killed %u", holder, target);
+            break;
+        case rules::EventKind::Turn:
+            _snprintf_s(out, size, _TRUNCATE, "turn event: entity %u (target %u)", holder, target);
+            break;
+        case rules::EventKind::Damaged:
+            _snprintf_s(out, size, _TRUNCATE, "damaged event: entity %u took %u damage from %u", holder, extra, target);
+            break;
+        case rules::EventKind::Dodge:
+            _snprintf_s(out, size, _TRUNCATE, "dodge event: entity %u parried an attack by %u", holder, target);
+            break;
+        case rules::EventKind::Block:
+            _snprintf_s(out, size, _TRUNCATE, "block event: entity %u deflected an attack by %u", holder, target);
+            break;
+        case rules::EventKind::Crit:
+            _snprintf_s(out, size, _TRUNCATE, "crit event: entity %u critically hit %u", holder, target);
+            break;
+        }
+    }
+
     void HandleEvent(const void* context, rules::EventKind kind, std::uint32_t holder, std::uint32_t target,
-        std::uint32_t weapon, const void* abilityIdString)
+        std::uint32_t extra, const void* abilityIdString)
     {
         if (!g_storagesResolved)
         {
             ResolveStorages(context);
         }
+        ++g_eventCounts[static_cast<unsigned int>(kind)];
         rules::Event event;
         event.kind = kind;
         char abilityId[160] = "";
         if (kind == rules::EventKind::Cast)
         {
-            ++g_castEvents;
             if (abilityIdString == nullptr || !soulash_plugins::ReadMsvcString(abilityIdString, abilityId, sizeof(abilityId)))
             {
                 if (g_logEvents && EventLogBudget()) Log("cast event: entity %u, ability id unreadable", holder);
                 return;
             }
             event.abilityId = abilityId;
+        }
+        if (kind == rules::EventKind::Cast || kind == rules::EventKind::Turn)
+        {
             const unsigned char* abilityUser = gs::FindComponent(g_access.abilityUser, holder);
             if (abilityUser != nullptr)
             {
@@ -391,47 +550,47 @@ namespace
                 target = current > 0 ? static_cast<std::uint32_t>(current) : 0;
             }
         }
-        else
+        const bool turn = kind == rules::EventKind::Turn;
+        if (turn && !g_pending->empty())
         {
-            ++g_attackEvents;
+            TickPending(context, holder, target);
         }
+        const bool logThis = g_logEvents && (!turn || g_logTurnEvents);
 
+        char description[240];
+        DescribeEvent(kind, holder, target, extra, abilityId, description, sizeof(description));
         const bool anyRule = rules::AnyRuleFor(*g_mods, event);
         if (!anyRule)
         {
-            if (g_logEvents && EventLogBudget())
-            {
-                if (kind == rules::EventKind::Cast)
-                    Log("cast event: entity %u cast '%s' (target %u); no rules", holder, abilityId, target);
-                else
-                    Log("attack event: entity %u attacked %u (weapon entity %u); no rules", holder, target, weapon);
-            }
+            // Turn ticks without a rule are never logged: hundreds per turn.
+            if (logThis && !turn && EventLogBudget()) Log("%s; no rules", description);
             return;
         }
 
+        const gs::GameClock clock = ReadGameClock();
         soulash::conditions::Snapshot state;
-        gs::BuildSnapshot(g_access, holder, target, state);
+        gs::BuildSnapshot(g_access, holder, target, state, clock);
         const rules::Outcome outcome = rules::Evaluate(*g_mods, event, state,
-            [] { return std::uniform_real_distribution<double>(0.0, 1.0)(*g_rng); }, g_maxCastsPerEvent);
+            [] { return std::uniform_real_distribution<double>(0.0, 1.0)(*g_rng); }, g_maxCastsPerEvent,
+            g_onTurnOriginal != nullptr);
 
-        if (g_logEvents && EventLogBudget())
+        if (logThis && EventLogBudget())
         {
-            char stateText[200];
-            _snprintf_s(stateText, _TRUNCATE, "health=%s%.0f stamina=%s%.0f weapon=%s shield=%s tags=%s%zu skills=%s%zu",
+            char stateText[300];
+            _snprintf_s(stateText, _TRUNCATE,
+                "health=%s%.0f stamina=%s%.0f weapon=%s shield=%s tags=%s%zu skills=%s%zu stacks=%s%zu party=%s companions=%s%.0f time=%s/%s",
                 state.healthPercent.has ? "" : "?", state.healthPercent.value,
                 state.staminaPercent.has ? "" : "?", state.staminaPercent.value,
                 state.weaponClass.has ? state.weaponClass.value.c_str() : "?",
                 state.shield.has ? (state.shield.value ? "yes" : "no") : "?",
                 state.holderTags.has ? "" : "?", state.holderTags.has ? state.holderTags.value.size() : 0,
-                state.skills.has ? "" : "?", state.skills.has ? state.skills.value.size() : 0);
-            if (kind == rules::EventKind::Cast)
-                Log("cast event: entity %u cast '%s' (target %u): %u rule(s) matched, %u allowed, %u blocked by condition, %u by chance; %s",
-                    holder, abilityId, target, outcome.matched, outcome.allowed, outcome.blockedByCondition,
-                    outcome.blockedByChance, stateText);
-            else
-                Log("attack event: entity %u attacked %u (weapon entity %u): %u rule(s) matched, %u allowed, %u blocked by condition, %u by chance; %s",
-                    holder, target, weapon, outcome.matched, outcome.allowed, outcome.blockedByCondition,
-                    outcome.blockedByChance, stateText);
+                state.skills.has ? "" : "?", state.skills.has ? state.skills.value.size() : 0,
+                state.stackers.has ? "" : "?", state.stackers.has ? state.stackers.value.size() : 0,
+                state.party.has ? state.party.value.c_str() : "?",
+                state.companions.has ? "" : "?", state.companions.value,
+                state.dayPart.has ? state.dayPart.value.c_str() : "?", state.season.has ? state.season.value.c_str() : "?");
+            Log("%s: %u rule(s) matched, %u allowed, %u blocked by condition, %u by chance; %s", description,
+                outcome.matched, outcome.allowed, outcome.blockedByCondition, outcome.blockedByChance, stateText);
         }
         for (const std::string& note : outcome.notes)
         {
@@ -439,41 +598,82 @@ namespace
         }
         for (const rules::Cast& cast : outcome.casts)
         {
+            FireCast(context, holder, target, cast.abilityId, cast.mod + "/" + cast.rule, "");
+        }
+        for (const rules::Cast& cast : outcome.delayed)
+        {
             const std::string rule = cast.mod + "/" + cast.rule;
-            if (!g_active)
+            if (g_pending->size() >= MaximumPendingCasts)
             {
-                ++g_wouldQueue;
-                Log("rule %s: would queue '%s' on entity %u (Mode=log; set Mode=active to queue)", rule.c_str(),
-                    cast.abilityId.c_str(), holder);
+                Log("rule %s: delayed cast of '%s' dropped (%zu casts already pending)", rule.c_str(),
+                    cast.abilityId.c_str(), g_pending->size());
                 continue;
             }
-            if (!g_queueUsable)
+            g_pending->push_back({holder, cast.abilityId, rule, cast.delayTurns});
+            if (EventLogBudget())
             {
-                Log("rule %s: cannot queue '%s' (queue not usable on this build)", rule.c_str(), cast.abilityId.c_str());
-                continue;
-            }
-            if (QueueAbility(context, holder, cast.abilityId, rule.c_str()))
-            {
-                Log("rule %s: queued '%s' on entity %u (target %u)", rule.c_str(), cast.abilityId.c_str(), holder, target);
+                Log("rule %s: '%s' scheduled for entity %u in %u turn(s)", rule.c_str(), cast.abilityId.c_str(), holder,
+                    cast.delayTurns);
             }
         }
     }
 
-    // Plain body for __try (no C++ objects with destructors in this frame).
-    void GuardedHandleEvent(const void* context, rules::EventKind kind, std::uint32_t holder, std::uint32_t target,
-        std::uint32_t weapon, const void* abilityIdString)
+    // Plain bodies for __try (no C++ objects with destructors in these frames).
+    // `base` is the game context, or the system that holds it at +8.
+    void GuardedHandleEvent(void* base, bool baseIsSystem, rules::EventKind kind, std::uint32_t holder,
+        std::uint32_t target, std::uint32_t extra, const void* abilityIdString)
     {
         __try
         {
-            HandleEvent(context, kind, holder, target, weapon, abilityIdString);
+            const void* context = baseIsSystem ? gs::Read<const void*>(base, SystemContextOffset) : base;
+            if (context != nullptr)
+            {
+                HandleEvent(context, kind, holder, target, extra, abilityIdString);
+            }
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             g_disabled = true;
             Log("fault 0x%08lX while handling a %s event; plugin disabled for this session, game unaffected",
-                GetExceptionCode(), kind == rules::EventKind::Cast ? "cast" : "attack");
+                GetExceptionCode(), rules::EventName(kind));
             soulash_plugins::ReportStatus(g_extender, SOULASH_PLUGIN_STATUS_DEGRADED,
                 "memory fault while handling an event; triggers stopped (game unaffected)");
+        }
+    }
+
+    bool GuardedReadU32(const void* base, std::size_t offset, std::uint32_t* out)
+    {
+        __try
+        {
+            if (base == nullptr) return false;
+            *out = gs::Read<std::uint32_t>(base, offset);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    // The target of the attack the deflection check is about: the queue's
+    // current entry, read exactly as the engine does right after.
+    bool GuardedDeflectTarget(const void* queue, std::uint32_t* out)
+    {
+        __try
+        {
+            if (queue == nullptr) return false;
+            const auto data = gs::Read<const unsigned char* const*>(queue, QueueDataOffset);
+            const auto capacity = gs::Read<std::size_t>(queue, QueueCapacityOffset);
+            const auto index = gs::Read<std::size_t>(queue, QueueIndexOffset);
+            if (data == nullptr || capacity == 0 || capacity > 0x100000) return false;
+            const unsigned char* entry = data[(capacity - 1) & index];
+            if (entry == nullptr) return false;
+            *out = gs::Read<std::uint32_t>(entry, QueueEntryTargetOffset);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
         }
     }
 
@@ -482,7 +682,7 @@ namespace
         void* result = g_onCastOriginal(context, caster, abilityId);
         if (!g_disabled && context != nullptr)
         {
-            GuardedHandleEvent(context, rules::EventKind::Cast, caster, 0, 0, abilityId);
+            GuardedHandleEvent(context, false, rules::EventKind::Cast, caster, 0, 0, abilityId);
         }
         return result;
     }
@@ -492,7 +692,76 @@ namespace
         void* result = g_onAttackOriginal(context, attacker, target, weapon);
         if (!g_disabled && context != nullptr)
         {
-            GuardedHandleEvent(context, rules::EventKind::Attack, attacker, target, weapon, nullptr);
+            GuardedHandleEvent(context, false, rules::EventKind::Attack, attacker, target, weapon, nullptr);
+        }
+        return result;
+    }
+
+    std::uint64_t OnKillDetour(void* system, unsigned int killer, unsigned int victim, void* position, int effectId)
+    {
+        const std::uint64_t result = g_onKillOriginal(system, killer, victim, position, effectId);
+        // The engine runs this twice per death (effects 101 and 102); fire once.
+        if (!g_disabled && system != nullptr && effectId == KillEffectAny && killer != 0)
+        {
+            GuardedHandleEvent(system, true, rules::EventKind::Kill, killer, victim, 0, nullptr);
+        }
+        return result;
+    }
+
+    std::uint64_t OnTurnDetour(void* system, unsigned int entity)
+    {
+        const std::uint64_t result = g_onTurnOriginal(system, entity);
+        if (!g_disabled && system != nullptr && entity != 0)
+        {
+            GuardedHandleEvent(system, true, rules::EventKind::Turn, entity, 0, 0, nullptr);
+        }
+        return result;
+    }
+
+    std::uint64_t OnParryDetour(void* context, unsigned int attacker, unsigned int defender, float value)
+    {
+        const std::uint64_t result = g_onParryOriginal(context, attacker, defender, value);
+        if (!g_disabled && context != nullptr && defender != 0)
+        {
+            GuardedHandleEvent(context, false, rules::EventKind::Dodge, defender, attacker, 0, nullptr);
+        }
+        return result;
+    }
+
+    std::uint64_t OnDamageDetour(void* context, unsigned int attacker, unsigned int target, int damage)
+    {
+        const std::uint64_t result = g_onDamageOriginal(context, attacker, target, damage);
+        if (!g_disabled && context != nullptr && target != 0 && damage > 0)
+        {
+            GuardedHandleEvent(context, false, rules::EventKind::Damaged, target, attacker,
+                static_cast<std::uint32_t>(damage), nullptr);
+        }
+        return result;
+    }
+
+    std::uint64_t OnAttackEndDetour(void* system, void* attack, unsigned int weaponType, unsigned char critical)
+    {
+        const std::uint64_t result = g_onAttackEndOriginal(system, attack, weaponType, critical);
+        if (!g_disabled && system != nullptr && critical != 0)
+        {
+            std::uint32_t attacker = 0, target = 0;
+            if (GuardedReadU32(attack, AttackAttackerOffset, &attacker) && GuardedReadU32(attack, AttackTargetOffset, &target)
+                && attacker != 0)
+            {
+                GuardedHandleEvent(system, true, rules::EventKind::Crit, attacker, target, weaponType, nullptr);
+            }
+        }
+        return result;
+    }
+
+    unsigned char OnDeflectDetour(void* system, unsigned int attacker, void* queue, void* fourth)
+    {
+        std::uint32_t target = 0;
+        const bool haveTarget = !g_disabled && GuardedDeflectTarget(queue, &target);
+        const unsigned char result = g_onDeflectOriginal(system, attacker, queue, fourth);
+        if (!g_disabled && system != nullptr && result != 0 && haveTarget && target != 0)
+        {
+            GuardedHandleEvent(system, true, rules::EventKind::Block, target, attacker, 0, nullptr);
         }
         return result;
     }
@@ -513,15 +782,34 @@ namespace
         return static_cast<const unsigned char*>(results[0]);
     }
 
-    soulash_plugins::TriggerLayout GuardedLocate(const unsigned char* useAbility, const unsigned char* attack,
-        const unsigned char* queued)
+    // Virtual function `slot` of the class with that RTTI name (the systems'
+    // update is slot 1), or null.
+    const unsigned char* RttiMethod(const char* rttiName, unsigned int slot)
+    {
+        void* vtable = nullptr;
+        if (!g_extender->findRttiVtable(g_extender->pluginHandle, rttiName, &vtable) || vtable == nullptr)
+        {
+            return nullptr;
+        }
+        const unsigned char* method = nullptr;
+        __try
+        {
+            method = static_cast<const unsigned char* const*>(vtable)[slot];
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            method = nullptr;
+        }
+        return method;
+    }
+
+    soulash_plugins::TriggerLayout GuardedLocate(const soulash_plugins::TriggerAnchors& anchors)
     {
         soulash_plugins::TriggerLayout layout;
         __try
         {
             const auto* image = static_cast<const unsigned char*>(g_extender->gameBase);
-            layout = soulash_plugins::LocateTriggerLayout(image, soulash_plugins::MappedImageSize(image),
-                useAbility, attack, queued);
+            layout = soulash_plugins::LocateTriggerLayout(image, soulash_plugins::MappedImageSize(image), anchors);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -554,17 +842,55 @@ namespace
         }
     }
 
+    // Detours one optional routine; records the trampoline in `original`.
+    template <typename Fn>
+    bool InstallOptional(rules::EventKind kind, const unsigned char* routine, void* detour, Fn& original, const char* what)
+    {
+        if (routine == nullptr)
+        {
+            return false;
+        }
+        void* trampoline = nullptr;
+        if (!g_extender->installDetourAuto(g_extender->pluginHandle, const_cast<unsigned char*>(routine), detour, &trampoline))
+        {
+            Log("detour on the %s routine refused; %s rules will not fire", what, rules::EventName(kind));
+            return false;
+        }
+        original = reinterpret_cast<Fn>(trampoline);
+        g_hookInstalled[static_cast<unsigned int>(kind)] = true;
+        return true;
+    }
+
+    void HookSummary(char* out, std::size_t size)
+    {
+        char installed[160] = "";
+        char missing[160] = "";
+        for (unsigned int kind = 0; kind < rules::EventKindCount; ++kind)
+        {
+            char* list = g_hookInstalled[kind] ? installed : missing;
+            if (list[0] != '\0') strncat_s(list, 160, " ", _TRUNCATE);
+            strncat_s(list, 160, rules::EventName(static_cast<rules::EventKind>(kind)), _TRUNCATE);
+        }
+        _snprintf_s(out, size, _TRUNCATE, "events hooked: %s%s%s", installed[0] ? installed : "none",
+            missing[0] ? "; not available: " : "", missing);
+    }
+
     bool Install()
     {
-        const unsigned char* useAbility = FirstFunctionReferencing("UseAbility: Entity {} is casting {}. Applying effects.");
-        const unsigned char* attack = FirstFunctionReferencing("EntityAttack: Attacked entity {}");
-        const unsigned char* queued = FirstFunctionReferencing("Queued Ability");
-        if (useAbility == nullptr)
+        soulash_plugins::TriggerAnchors anchors;
+        anchors.useAbilityUpdate = FirstFunctionReferencing("UseAbility: Entity {} is casting {}. Applying effects.");
+        anchors.entityAttack = FirstFunctionReferencing("EntityAttack: Attacked entity {}");
+        anchors.queuedAbility = FirstFunctionReferencing("Queued Ability");
+        anchors.onDeathUpdate = FirstFunctionReferencing("killing an ally");
+        anchors.entityAttackUpdate = FirstFunctionReferencing("EntityAttack: Attack performed.");
+        anchors.parryExperience = FirstFunctionReferencing("core_2_Parry");
+        anchors.progressEffectsUpdate = RttiMethod(".?AVProgressEffects@@", 1);
+        if (anchors.useAbilityUpdate == nullptr)
         {
             Log("inactive: the UseAbility cast log string is not in this game build; no hooks installed");
             return false;
         }
-        g_layout = GuardedLocate(useAbility, attack, queued);
+        g_layout = GuardedLocate(anchors);
         if (!g_layout.verified)
         {
             Log("inactive: game build %.8s does not match the verified trigger code (%s); no hooks installed",
@@ -578,6 +904,7 @@ namespace
         g_gameDelete = reinterpret_cast<DeleteFn>(const_cast<unsigned char*>(g_layout.gameDelete));
         g_growMap = reinterpret_cast<GrowMapFn>(const_cast<unsigned char*>(g_layout.dequeGrowMap));
         g_abilityDestructor = reinterpret_cast<DestructorFn>(const_cast<unsigned char*>(g_layout.abilityDestructor));
+        g_clock = reinterpret_cast<ClockFn>(const_cast<unsigned char*>(g_layout.gameClock));
         Log("game code located (RVAs): on-cast trigger 0x%llX, on-attack trigger 0x%llX, ability registry 0x%llX, "
             "map::at 0x%llX, operator new 0x%llX, operator delete 0x%llX, deque growmap 0x%llX, ~Ability 0x%llX%s%s",
             static_cast<unsigned long long>(Rva(g_layout.onCastTrigger)),
@@ -589,6 +916,15 @@ namespace
             static_cast<unsigned long long>(Rva(g_layout.dequeGrowMap)),
             static_cast<unsigned long long>(Rva(g_layout.abilityDestructor)),
             g_layout.failure[0] == '\0' ? "" : "; note: ", g_layout.failure);
+        Log("event code located (RVAs, 0 = not on this build): kill trigger 0x%llX, turn tick 0x%llX, parry 0x%llX, "
+            "damage dealt 0x%llX, attack end 0x%llX, deflect 0x%llX, game clock 0x%llX",
+            static_cast<unsigned long long>(Rva(g_layout.onKillTrigger)),
+            static_cast<unsigned long long>(Rva(g_layout.onTurnTick)),
+            static_cast<unsigned long long>(Rva(g_layout.onParry)),
+            static_cast<unsigned long long>(Rva(g_layout.onDamageDealt)),
+            static_cast<unsigned long long>(Rva(g_layout.onAttackEnd)),
+            static_cast<unsigned long long>(Rva(g_layout.onDeflect)),
+            static_cast<unsigned long long>(Rva(g_layout.gameClock)));
         ResolveRtti();
 
         void* trampoline = nullptr;
@@ -599,24 +935,27 @@ namespace
             return false;
         }
         g_onCastOriginal = reinterpret_cast<OnCastFn>(trampoline);
-        bool attackHooked = false;
-        if (g_layout.onAttackTrigger != nullptr)
-        {
-            trampoline = nullptr;
-            if (g_extender->installDetourAuto(g_extender->pluginHandle,
-                    const_cast<unsigned char*>(g_layout.onAttackTrigger), reinterpret_cast<void*>(&OnAttackDetour), &trampoline))
-            {
-                g_onAttackOriginal = reinterpret_cast<OnAttackFn>(trampoline);
-                attackHooked = true;
-            }
-            else
-            {
-                Log("detour on the on-attack trigger routine refused; attack rules will not fire");
-            }
-        }
-        Log("active: game build %.8s, mode=%s, %u rule(s) from %u mod(s), cast hook installed, attack hook %s",
+        g_hookInstalled[static_cast<unsigned int>(rules::EventKind::Cast)] = true;
+        InstallOptional(rules::EventKind::Attack, g_layout.onAttackTrigger, reinterpret_cast<void*>(&OnAttackDetour),
+            g_onAttackOriginal, "on-attack trigger");
+        InstallOptional(rules::EventKind::Kill, g_layout.onKillTrigger, reinterpret_cast<void*>(&OnKillDetour),
+            g_onKillOriginal, "kill trigger");
+        InstallOptional(rules::EventKind::Turn, g_layout.onTurnTick, reinterpret_cast<void*>(&OnTurnDetour),
+            g_onTurnOriginal, "turn tick");
+        InstallOptional(rules::EventKind::Dodge, g_layout.onParry, reinterpret_cast<void*>(&OnParryDetour),
+            g_onParryOriginal, "parry");
+        InstallOptional(rules::EventKind::Damaged, g_layout.onDamageDealt, reinterpret_cast<void*>(&OnDamageDetour),
+            g_onDamageOriginal, "damage dealt");
+        InstallOptional(rules::EventKind::Crit, g_layout.onAttackEnd, reinterpret_cast<void*>(&OnAttackEndDetour),
+            g_onAttackEndOriginal, "attack end");
+        InstallOptional(rules::EventKind::Block, g_layout.onDeflect, reinterpret_cast<void*>(&OnDeflectDetour),
+            g_onDeflectOriginal, "deflection");
+        char hooks[400];
+        HookSummary(hooks, sizeof(hooks));
+        Log("active: game build %.8s, mode=%s, %u rule(s) from %u mod(s); %s; delayed casts %s",
             g_extender->gameExecutableSha256[0] == '\0' ? "unknown " : g_extender->gameExecutableSha256,
-            g_active ? "active" : "log", g_ruleCount, g_modCount, attackHooked ? "installed" : "NOT installed");
+            g_active ? "active" : "log", g_ruleCount, g_modCount, hooks,
+            g_onTurnOriginal != nullptr ? "wait for the holder's turns" : "are dropped (no turn tick on this build)");
         return true;
     }
 }
@@ -646,9 +985,11 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(const Sou
     LoadModRules();
     const bool active = Install();
     g_startupReason.End();
-    char detail[200];
-    _snprintf_s(detail, _TRUNCATE, "mode=%s; %u rule(s) from %u mod(s); attack hook %s",
-        g_active ? "active" : "log", g_ruleCount, g_modCount, g_onAttackOriginal != nullptr ? "ok" : "missing");
+    char hooks[400];
+    HookSummary(hooks, sizeof(hooks));
+    char detail[480];
+    _snprintf_s(detail, _TRUNCATE, "mode=%s; %u rule(s) from %u mod(s); %s",
+        g_active ? "active" : "log", g_ruleCount, g_modCount, hooks);
     soulash_plugins::ReportStatus(extender,
         active ? (g_layout.failure[0] == '\0' ? SOULASH_PLUGIN_STATUS_ACTIVE : SOULASH_PLUGIN_STATUS_DEGRADED)
                : SOULASH_PLUGIN_STATUS_INACTIVE,

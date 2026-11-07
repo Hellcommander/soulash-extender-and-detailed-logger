@@ -4,11 +4,14 @@
   python -I tools/validate_conditions.py --self-test
 
 Conditions gate a passive or ability; triggers are conditional triggers (an
-ability fires on a cast or an attack only while a condition holds). --emit
-writes generated_passives.json (one passive per trigger, with the engine's own
-trigger effect and any native restrict_* keys the condition allows) and
-generated_conditions.json (the remaining gating conditions, spec 1) into the
-folder, ready to merge into the mod.
+ability fires on a cast, an attack, a kill, a turn, being damaged, a dodge, a
+block or a critical hit only while a condition holds). --emit writes
+generated_passives.json (one passive per cast / attack trigger, with the
+engine's own trigger effect and any native restrict_* keys the condition
+allows) and generated_conditions.json (the remaining gating conditions, spec 1)
+into the folder, ready to merge into the mod. The other events have no engine
+passive: they fire only through the extender's Triggers plugin
+(docs/triggers.md) and are skipped by --emit.
 
 Checks structure, predicate names and arguments, names against the game's own
 lists, size limits and `requires`. With --mod it also checks that each target
@@ -279,6 +282,10 @@ def used_predicates(expr, acc):
 
 
 TRIGGER_KEYS = {"id", "on", "cast", "chance", "when", "on_unavailable", "note"}
+# Events a trigger may listen to. cast / attack compile to engine passives; the
+# rest exist only through the extender's Triggers plugin (docs/triggers.md).
+TRIGGER_EVENTS = ["cast", "attack", "kill", "turn", "damaged", "dodge", "block", "crit"]
+NATIVE_EVENTS = ("cast", "attack")
 
 
 def trigger_passive_id(trigger_id):
@@ -315,9 +322,12 @@ def native_keys_for_passive(expr):
 
 
 def compile_trigger(trigger):
-    """Returns (passive, condition-or-None) for a validated trigger."""
+    """Returns (passive, condition-or-None) for a validated trigger; (None, None)
+    for an event only the extender's Triggers plugin can deliver."""
     chance = trigger.get("chance", 1)
     on = trigger["on"]
+    if next(iter(on)) not in NATIVE_EVENTS:
+        return None, None
     if "cast" in on:
         effect = {"effect": "trigger_ability_on_cast", "value": on["cast"],
                   "secondary_value": trigger["cast"], "third_value": chance}
@@ -357,17 +367,22 @@ def validate_trigger(trigger, where, report, seen_ids, known_targets, used):
 
     on = trigger.get("on")
     if (not isinstance(on, dict) or len(on) != 1
-            or next(iter(on)) not in ("cast", "attack")):
-        report.error(where, "on must be {cast: <ability id>} or {attack: true}")
+            or next(iter(on)) not in TRIGGER_EVENTS):
+        report.error(where, "on must be {cast: <ability id>} or {<event>: true} with event one of "
+                     + ", ".join(TRIGGER_EVENTS[1:]))
         return None
-    if "cast" in on:
+    event = next(iter(on))
+    if event == "cast":
         if not id_string(on["cast"], where, report, "on.cast"):
             return None
         if known_targets is not None and on["cast"] not in known_targets["ability"]:
             report.warn(where, "on.cast %r is not an ability of this mod (fine if it is another mod's)" % on["cast"])
-    elif on["attack"] is not True:
-        report.error(where, "on.attack must be true")
+    elif on[event] is not True:
+        report.error(where, "on.%s must be true" % event)
         return None
+    elif event not in NATIVE_EVENTS:
+        report.warn(where, "on.%s fires only with the extender's Triggers plugin (no engine passive exists); "
+                    "--emit generates nothing for it" % event)
     if not id_string(trigger.get("cast"), where, report, "cast"):
         return None
     if known_targets is not None and trigger["cast"] not in known_targets["ability"]:
@@ -502,6 +517,13 @@ def validate(document, report, mod_folder=None):
                                    known_targets, used)
         if checked is not None and not report.errors:
             passive, condition = compile_trigger(checked)
+            if passive is None:
+                leaves = []
+                walk(checked["when"], "x", 1, {"nodes": 0}, Report(), leaves)
+                summary.append({"id": checked["id"], "kind": "trigger", "native": [],
+                                "needs_evaluator": [name for name, _ in leaves], "fully_native": False,
+                                "event": next(iter(checked["on"])), "plugin_only": True})
+                continue
             evaluated = []
             if condition is not None:
                 leaves = []
@@ -522,6 +544,8 @@ def emit(document, folder):
     passives, conditions = [], list(document.get("conditions", []))
     for trigger in document.get("triggers", []):
         passive, condition = compile_trigger(trigger)
+        if passive is None:
+            continue   # plugin-only event: nothing the engine could run
         passives.append(passive)
         if condition is not None:
             conditions.append(condition)
@@ -654,7 +678,9 @@ def self_test():
         check("valid attack trigger", tdoc(on={"attack": True}), False),
         check("trigger without when", tdoc(when=None) if False else
               {"spec": 1, "triggers": [{"id": "t", "on": {"cast": "A"}, "cast": "B"}]}, True, "missing 'when'"),
-        check("trigger bad on", tdoc(on={"kill": True}), True, "on must be"),
+        check("trigger bad on", tdoc(on={"explode": True}), True, "on must be"),
+        check("trigger plugin-only event", tdoc(on={"kill": True}), False),
+        check("trigger plugin-only event not true", tdoc(on={"turn": 1}), True, "must be true"),
         check("trigger two on keys", tdoc(on={"cast": "A", "attack": True}), True, "on must be"),
         check("trigger attack false", tdoc(on={"attack": False}), True, "must be true"),
         check("trigger chance zero", tdoc(chance=0), True, "chance"),
@@ -695,6 +721,19 @@ def self_test():
     if not any_ok:
         print("FAIL: any must not be hoisted -> %s %s" % (passive, condition))
     results.append(any_ok)
+    passive, condition = compile_trigger({"id": "t4", "on": {"damaged": True}, "cast": "B",
+                                          "when": {"health_percent": {"max": 50}}})
+    plugin_only_ok = passive is None and condition is None
+    if not plugin_only_ok:
+        print("FAIL: plugin-only event must compile to nothing -> %s %s" % (passive, condition))
+    results.append(plugin_only_ok)
+    report = Report()
+    summary = validate(tdoc(on={"turn": True}), report)
+    turn_ok = (not report.errors and summary and summary[0].get("plugin_only") is True
+               and summary[0]["event"] == "turn" and summary[0]["needs_evaluator"] == ["health_percent"])
+    if not turn_ok:
+        print("FAIL: plugin-only trigger summary -> %s %s" % (summary, report.errors))
+    results.append(bool(turn_ok))
 
     passed = all(results)
     print("PASS: skill-conditions validator self-test (%d checks)" % len(results) if passed

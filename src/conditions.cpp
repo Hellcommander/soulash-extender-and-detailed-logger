@@ -689,13 +689,17 @@ namespace soulash::conditions
                 trigger.onKind = "cast";
                 trigger.onAbility = onValue.text;
             }
-            else if (onKey == "attack" && onValue.type == Json::Type::Bool && onValue.boolean)
+            else if ((onKey == "attack" || onKey == "kill" || onKey == "turn" || onKey == "damaged" || onKey == "dodge"
+                         || onKey == "block" || onKey == "crit")
+                && onValue.type == Json::Type::Bool && onValue.boolean)
             {
-                trigger.onKind = "attack";
+                // attack compiles to the engine's on_attack_cast; the other
+                // events exist only with the extender's Triggers plugin.
+                trigger.onKind = onKey;
             }
             else
             {
-                error = "trigger 'on' must be {cast: <ability id>} or {attack: true}";
+                error = "trigger 'on' must be {cast: <ability id>} or one of attack/kill/turn/damaged/dodge/block/crit: true";
                 return false;
             }
             trigger.castAbility = cast->text;

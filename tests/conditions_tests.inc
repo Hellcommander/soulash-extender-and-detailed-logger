@@ -237,8 +237,24 @@ int RunConditionsTests(const wchar_t* examplePath)
                 "a trigger that opted into on_unavailable=active fires without state");
         }
         const std::string head = "{\"spec\":1,\"triggers\":[";
-        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"kill\":true},\"cast\":\"C\",\"when\":{\"in_combat\":true}}]}",
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"explode\":true},\"cast\":\"C\",\"when\":{\"in_combat\":true}}]}",
             "'on' must be"), "unsupported trigger event");
+        Check(rejects(head + "{\"id\":\"a\",\"on\":{\"turn\":1},\"cast\":\"C\",\"when\":{\"in_combat\":true}}]}",
+            "'on' must be"), "plugin-only trigger event must be true");
+        {
+            ConditionSet events;
+            std::string eventsError;
+            Check(events.Load(head + "{\"id\":\"a\",\"on\":{\"kill\":true},\"cast\":\"C\",\"when\":{\"in_combat\":true}},"
+                                  "{\"id\":\"b\",\"on\":{\"turn\":true},\"cast\":\"D\",\"when\":{\"in_combat\":true}},"
+                                  "{\"id\":\"c\",\"on\":{\"damaged\":true},\"cast\":\"E\",\"when\":{\"in_combat\":true}},"
+                                  "{\"id\":\"d\",\"on\":{\"dodge\":true},\"cast\":\"F\",\"when\":{\"in_combat\":true}},"
+                                  "{\"id\":\"e\",\"on\":{\"block\":true},\"cast\":\"G\",\"when\":{\"in_combat\":true}},"
+                                  "{\"id\":\"f\",\"on\":{\"crit\":true},\"cast\":\"H\",\"when\":{\"in_combat\":true}}]}",
+                      eventsError)
+                    && events.Triggers().size() == 6 && events.Triggers()[0].onKind == "kill"
+                    && events.Triggers()[1].onKind == "turn" && events.Triggers()[5].onKind == "crit",
+                "plugin-only trigger events load with their kind");
+        }
         Check(rejects(head + "{\"id\":\"a\",\"on\":{\"attack\":true},\"when\":{\"in_combat\":true}}]}",
             "needs id, on, cast and when"), "trigger without a cast");
         Check(rejects(head + "{\"id\":\"a\",\"on\":{\"attack\":true},\"cast\":\"C\"}]}",

@@ -1,6 +1,6 @@
 # Effects: a composable, data-driven effect system (spec v1)
 
-Status: **specification + compiler + evaluator core; cast / attack triggers executed by the `Triggers` plugin** (docs/triggers.md: `ResolveEvent` runs in the game for `on: cast` / `on: attack` with a live snapshot; delayed casts are still dropped for want of a turn source). `tools/effects_compile.py`
+Status: **specification + compiler + evaluator core; triggers executed by the `Triggers` plugin** (docs/triggers.md: `ResolveEvent` runs in the game for every `on` event, cast / attack / kill / turn / damaged / dodge / block / crit, with a live snapshot; a `delay` waits for that many turns of the holder through the plugin's turn hook). `tools/effects_compile.py`
 validates an `extender/effects.json` file and compiles it to ordinary Soulash 2
 ability, passive, milestone and conditions fragments. `src/effects.cpp` is the
 strict loader and the resolver for the parts the engine cannot express, tested

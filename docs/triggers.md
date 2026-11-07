@@ -1,9 +1,10 @@
 # Triggers: conditional triggers executed by the extender
 
 Status: **implemented as the `Triggers` plugin (`plugins/triggers`), unit-tested
-against synthetic memory and byte patterns, NOT YET RUN IN THE GAME.** Every
-game fact below is static analysis of build `526b6ab4` (0.10.6.1, 2026-11-06)
-unless marked otherwise. The plugin ships with `Mode=log`, which installs the
+against synthetic memory and byte patterns, NOT YET RUN IN THE GAME.** Events:
+cast, attack, kill, turn, damaged, dodge, block, crit; delayed casts wait for
+the holder's turns. Every game fact below is static analysis of build
+`526b6ab4` (0.10.6.1, 2026-11-06/07) unless marked otherwise. The plugin ships with `Mode=log`, which installs the
 hooks and logs what would happen without queueing anything; the owner flips
 `Mode=active` after the first run looks right (section 6).
 
@@ -43,14 +44,31 @@ Per mod, the plugin loads at start-up:
 
 | File | What is used | Semantics |
 | --- | --- | --- |
-| `<mod>\extender\conditions.json` | `triggers[]`: `{id, on: {cast: A} \| {attack: true}, cast: B, chance, when, on_unavailable}` | On the event, if `when` holds (three-valued; unknown fails closed unless `on_unavailable: active`) and the chance rolls, queue `B` on the holder. |
-| `<mod>\extender\effects.json` | `triggers[]` with `on: {cast}` or `{attack}` | `effects::ResolveEvent`: the evaluator-owned parts (choose / delay / repeat-every / non-native `when`) resolve to generated group abilities, which are queued. Delayed casts are dropped and logged (no turn source yet). |
+| `<mod>\extender\conditions.json` | `triggers[]`: `{id, on: {cast: A} \| {<event>: true}, cast: B, chance, when, on_unavailable}` | On the event, if `when` holds (three-valued; unknown fails closed unless `on_unavailable: active`) and the chance rolls, queue `B` on the holder. |
+| `<mod>\extender\effects.json` | `triggers[]` with any `on` event | `effects::ResolveEvent`: the evaluator-owned parts (choose / delay / repeat-every / non-native `when`) resolve to generated group abilities, which are queued. A cast with a `delay` waits for that many **turn ticks of the holder** (section 3.1), then is queued. |
+
+Events, with the holder (whose state `when` sees and who casts `B`) and the
+target (`target_*` predicates; also the entity the queued ability is aimed at
+when the holder's own target is that entity):
+
+| `on` | Fires when | Holder | Target |
+| --- | --- | --- | --- |
+| `{cast: A}` | the holder cast ability `A` | caster | the caster's current target (`AbilityUser+0x1A0`) |
+| `{attack: true}` | after every melee / ranged attack, hit or miss | attacker | attacked entity |
+| `{kill: true}` | an entity died with a last attacker recorded | killer | victim |
+| `{turn: true}` | once per game turn for every entity with an Effects component (every creature) | that entity | its current target |
+| `{damaged: true}` | an attack or ability did `> 0` damage | damaged entity | attacker |
+| `{dodge: true}` | an attack missed / was parried (the engine grants Parry skill experience) | defender | attacker |
+| `{block: true}` | the defender's deflection passive stopped an attack before it was resolved | defender | attacker |
+| `{crit: true}` | an attack resolution ended with at least one critical hit | attacker | defender |
 
 Several rules may listen to the same ability or event (that is the point:
 "multiple triggers"); each is evaluated and rolled independently, up to
-`MaxCastsPerEvent` casts per event. Rules are evaluated for **every** entity that
-casts or attacks, not only the player: a rule on an NPC's ability fires for the
-NPC.
+`MaxCastsPerEvent` casts per event. Rules are evaluated for **every** entity
+the event happens to, not only the player: a rule on an NPC's ability fires for
+the NPC, and a `turn` rule is evaluated for every creature every turn. Scope
+such rules with `holder_tag: Player`, a `stacker` or an `equipped` test; the
+evaluation itself is cheap (a few component reads per entity).
 
 Predicates the live state source can answer today (anything else is unknown; a
 file that `requires` an unbacked predicate is unavailable as a whole):
@@ -64,12 +82,12 @@ file that `requires` an unbacked predicate is unavailable as a whole):
 | `shield` | an item in slots 8, 9, 17, 18 whose Item component `+0x08` = 14 (`Shield`) |
 | `equipped` | slot filled / `item_type` by name; `item` and `item_tag` are **unknown** (the live registry does not expose an item's data id) |
 | `skill_level` | Skills component: `std::map<string,int>` at `+0x08` (skill id → level) |
+| `stacker` | Effects component: `std::map<string,int>` stacks at `+0x38`, `std::map<string,float>` expiry time at `+0x48`; a stack whose expiry lies before the clock counts as 0 (the engine's own on_max_stacks code resets it then). Without a clock the entity's last tick time (`+0x6C`) stands in. |
+| `party`, `companions` | Party component (type 50, 0x10 bytes) is carried by the player's companions, not by the player (the owner's `player.sav` has no `Party;` line; `DrawParty` lists the Party storage's entity ids). Player: `in_party` while any companion exists, `companions` = their number. Companion: `in_party`, `companions` = the other members plus the player. Anyone else: `alone`, 0. |
+| `time_of_day`, `season` | the game clock struct (`0x205F0()` in 526b6ab4, located from `ProgressEffects::update`): `+0x20` day-part index (what the UI hands to the day-part translator `0x4CFEF0`), `+0x28` year-part index; `+0x14` = 1440 turns per day, `+0x18` time in turns. Names from core_2 `day_part` / `year_part`. The year-part field is inferred from its initial value and users; the first run's `game clock:` log line confirms it. |
 
-Not backed yet (unknown, fail closed): `party`, `companions`, `stacker`,
-`inventory_count`, `time_of_day`, `season`, `biome`, `in_combat`,
-`in_settlement`. The `target` of a cast event is `AbilityUser+0x1A0` (the
-entity the game would also cast a queued ability at); of an attack event it is
-the attacked entity.
+Not backed yet (unknown, fail closed): `inventory_count`, `biome`,
+`in_combat`, `in_settlement`.
 
 ## 3. Game facts the plugin relies on (build 526b6ab4)
 
@@ -87,9 +105,25 @@ never uses them directly (section 4).
 | "Queued Ability" consumer | `0x744050` | pops `AbilityUser+0x230`, destroys the Ability (`~Ability 0x6DA60`, `operator delete 0x81E2E0` with size `0x198`), casts at the position deque `+0x188` or the target `+0x1A0` |
 | passive effect name → id | `0x5238A6` | the resolver's table equals core_2 `messages.json` `passive_effects` ids (117 `trigger_ability_on_cast`, 100 `on_attack_cast`, 101 `on_kill_create_item`, …) |
 
-Other collectors found on the way (not hooked yet): `OnDeath::update
-0x6D0D00` collects 101/102 (kill events), `0x411C30` 97 (`on_max_stacks`),
-`0x6CAD00` 98 (`on_attack_stack`), `0x33D140` 124 (`heal_on_damage_type`).
+The other events (each located and hooked on its own; a missing one only
+disables that event):
+
+| Event | Hooked routine | RVA | Evidence |
+| --- | --- | --- | --- |
+| `kill` | **KillTrigger(system, killerId, victimId, position*, effectId)** | `0x6D5E70` | `OnDeath::update 0x6D0D00` (RTTI `OnDeath` slot 1; the only user of `"killing an ally"`) walks dead entities (Health `+0x08 <= 0`), takes the killer from Health `+0x30`, and calls it at `0x6D130D` with effect 101 (`on_kill_any_create_item`) and at `0x6D133D` with 102 when the victim has component 51 (Persona). The routine checks `hasComponent(killer, 44 Name)` / `(killer, 21 Equipment)` and collects the passives. The plugin fires on the 101 call only. |
+| `turn` | **TurnTick(system, entityId)** | `0x5AFAD0` | `ProgressEffects::update 0x5AE060` (RTTI `ProgressEffects` slot 1, registered by `0x4378D0`) loops the Effects storage's entity ids; per entity, when the clock (`0x205F0()`, `+0x18`) has passed `Effects+0x6C + 1.0`, it calls `0x5AF4F0(system, entity, effects)`, `0x5AFAD0(system, entity)` (collects passive 63), `0x5B0220(system, entity, effects)` and adds 1.0 to `+0x6C`: one tick per entity per game turn. |
+| `dodge` | **ParryExperience(ctx, attackerId, defenderId, float)** | `0x4BA1E0` | the only user of `"core_2_Parry"`; called from the attack resolution only on the miss path (`0x6CB401`, after the roll `rand/2^53 > success rate` at `0x6CB193`), grants the defender Parry skill experience. |
+| `damaged` | **DamageDealt(ctx, attackerId, targetId, int damage)** | `0x4B9FB0` | called at `0x6CBBD0` right after hit and miss paths converge (`0x6CBBA8`) with the damage the resolution just subtracted from the target's Health (`[rbp+60h]`, computed by `0x4BC2F0`); also called by the ability-damage code (`0x33D140`, `0x33B670`, `0x34ECA0`, `0x8E420`). The plugin fires when `damage > 0`. |
+| `crit` | **AttackEnd(system, attack*, weaponType, bool critical)** | `0x6CED40` | the last call of the attack resolution (`0x6CC0E2`): `cmp [rbp+64h],0; setg r9b` passes "at least one critical hit"; the attack struct holds the attacker at `+0` and the target at `+0x90` (`r13 = rsi+0x90`). Collects passives 30 and 112. |
+| `block` | **Deflect(system, attackerId, attackQueue*, r9) → bool** | `0x64B110` | `EntityAttack::update 0x6C9D10` (the only user of `"EntityAttack: Attack performed."`) calls it at `0x6CA6EE` before resolving an attack; it reads the current queue entry `queue.data[(queue.capacity-1) & queue.index]`, the target at entry `+0x4C`, and rolls the target's deflection passive (42) from its Effects. A true result ends in `"EntityAttack: Attack deflected."` (`0x6CEB00`) and no attack. |
+| clock | **GameClock() → const struct*** | `0x205F0` | thread-safe static init of the struct at `0xB01DE8`: `+0x14 = 1440`, `+0x18` time (float turns), `+0x1C = 100.0`, `+0x20 = 4` (Morning) at start, `+0x28 = 0` (Spring). |
+
+Other collectors found on the way (not hooked): `0x411C30` 97
+(`on_max_stacks`), `0x6CAD00` 98 (`on_attack_stack`), `0x33D140` 124
+(`heal_on_damage_type`). Melee damage is applied inline by the attack
+resolution (`Health+0x08 -= damage` at `0x6CB928`), ability damage by
+`0x33D140`, damage over time by `0x5AE760`; there is no single damage function,
+which is why `damaged` hooks the shared post-damage call instead.
 
 ### 3.2 The cast primitive
 
@@ -123,7 +157,10 @@ type) = 0x678950` uses the same ids: 76 = Weapon before reading `Weapon+0x08`,
 | Type | Index | Stride (getter) | Fields used |
 | --- | --- | --- | --- |
 | Ability user | 1 | 0x260 (`0x92360`) | `+0x1A0` target id, `+0x230` queue, `+0x258` no-triggers flag |
+| Effects | 20 | 0x70 (`0x92160`) | `+0x08/+0x10` active effects (0x1A0 each), `+0x38` stacks map, `+0x48` stack expiry map, `+0x6C` last tick time (save `Effects;0\|\|-1.000000\|154.200012\|0\|0\|0`) |
 | Equipment | 21 | 0x150 (`0x284B0`) | `int slots[20]` at `+0x08`, `eq_slot` order, entity id or 0 |
+| Party | 50 | 0x10 (`0x27CC0`) | `+0x08` int, `+0x0C` hold-position flag; presence = party member (companions only) |
+| Player | 52 | 0x130 (`0x28100`) | presence = the player entity |
 | Health | 28 | 0x40 (`0x282E0`) | floats `+0x08` current, `+0x0C` maximum (save `Health;105\|105\|…`) |
 | Item | 32 | 0x18 (`0x3B030`) | `+0x08` `item_type` index |
 | Skills | 63 | 0x88 (`0x12DF40`) | `map<string,int>` at `+0x08` = level (`+0x18` potential, `+0x28` progress) |
@@ -132,8 +169,9 @@ type) = 0x678950` uses the same ids: 76 = Weapon before reading `Weapon+0x08`,
 | Weapon | 76 | 0x68 (`0x1838A0`) | `+0x08` `weapon_type` index |
 
 `ECStorage<T>` itself: pages vector `+0x08/+0x10` (24-byte entries, 0x2000
-ints each, `-1` = absent), dense array `+0x38/+0x40`; the same page-table walk
-the ability-bar plugins already use.
+ints each, `-1` = absent), entity-id vector `+0x20/+0x28` (the dense order;
+`ProgressEffects::update` and `DrawParty` iterate it), dense array
+`+0x38/+0x40`; the same page-table walk the ability-bar plugins already use.
 
 ## 4. How the plugin survives game updates
 
@@ -168,7 +206,8 @@ Nothing is keyed by exe hash:
 | --- | --- | --- |
 | `Enabled` | 1 | 0 = load nothing, hook nothing |
 | `Mode` | `log` | `log`: hooks installed, events and would-be casts logged, nothing queued. `active`: queue. |
-| `LogEvents` | 1 | one line per cast / attack event the hooks see (capped by `MaxLogLines` per session); firings and problems always log |
+| `LogEvents` | 1 | one line per cast / attack / kill / damaged / dodge / block / crit event the hooks see (capped by `MaxLogLines` per session); firings and problems always log |
+| `LogTurnEvents` | 0 | turn ticks happen for every creature every turn; with 1 they are logged too, but only when a turn rule matched the creature |
 | `MaxLogLines` | 400 | |
 | `MaxCastsPerEvent` | 8 | upper bound on queued abilities per event, all rules together |
 
@@ -185,13 +224,18 @@ pins the hash like the other plugins.
 2. Start the game (Mode=log), load a save, cast that ability a few times and
    make one melee attack. Expected `Triggers:` lines in `logs\proxy-crash.log`:
    - `game code located (RVAs): on-cast trigger 0x413E80, on-attack trigger 0x411670, ability registry 0x8B4A0, map::at 0x4249F0, operator new 0x81E020, operator delete 0x81E2E0, deque growmap 0x2BD350, ~Ability 0x6DA60` (on 526b6ab4),
-   - `active: game build 526b6ab4, mode=log, N rule(s) …, cast hook installed, attack hook installed`,
-   - on the first event: `state source … AbilityUser=ok Equipment=ok Health=ok Item=ok Skills=ok Stamina=ok Tags=ok Weapon=ok; queueing possible`,
-   - `cast event: entity P cast 'arendeth_hydromancy_water_splash' (target T): 1 rule(s) matched, 1 allowed, …; health=100 stamina=.. weapon=Unarmed shield=no tags=3 skills=11`,
+   - `event code located (RVAs, 0 = not on this build): kill trigger 0x6D5E70, turn tick 0x5AFAD0, parry 0x4BA1E0, damage dealt 0x4B9FB0, attack end 0x6CED40, deflect 0x64B110, game clock 0x205F0`,
+   - `active: game build 526b6ab4, mode=log, N rule(s) …; events hooked: cast attack kill turn damaged dodge block crit; delayed casts wait for the holder's turns`,
+   - on the first event: `state source … AbilityUser=ok Effects=ok Equipment=ok Health=ok Item=ok Party=ok Player=ok Skills=ok Stamina=ok Tags=ok Weapon=ok; queueing possible`,
+   - `game clock: time T turns, day part D (<name>), year part Y (<name>)`: the names must match the in-game clock,
+   - `cast event: entity P cast 'arendeth_hydromancy_water_splash' (target T): 1 rule(s) matched, 1 allowed, …; health=100 stamina=.. weapon=Unarmed shield=no tags=3 skills=11 stacks=0 party=alone companions=0 time=Morning/Spring`,
    - `rule <mod>/wounded_splash: would queue 'arendeth_hydromancy_spray' on entity P (Mode=log …)`,
-   - `attack event: entity P attacked E (weapon entity W): …`.
+   - `attack event: entity P attacked E (weapon entity W): …`, and after the fight `damaged event: entity E took N damage from P`, `dodge event: …`, `crit event: …`, `kill event: entity P killed E`.
    Check the state values against the character sheet (health %, stamina %,
-   weapon class, tag count 3 for the player, skill count).
+   weapon class, tag count 3 for the player, skill count, stacks on the status
+   bar, party size, day part and season on the clock). To see turn ticks, add a
+   rule with `"on": {"turn": true}` and `"when": {"holder_tag": "Player"}` and
+   set `LogTurnEvents=1`: exactly one `turn event: entity P` line per turn.
 3. If that all matches, set `Mode=active`, restart, cast again: expect
    `rule …: queued 'arendeth_hydromancy_spray' on entity P (target T)` and the
    spray going off right after the splash. The engine's own log
@@ -207,16 +251,26 @@ loaded), `fault 0x… while handling a cast event; plugin disabled` (send the lo
 
 ## 7. Open points
 
-- `target` for cast events is the AbilityUser's current target (`+0x1A0`), not
-  the tile the ability was aimed at; `target_*` predicates are unknown when it is 0.
-- No turn / kill / damaged / dodge / block / crit events yet. Candidates are in
-  section 3.1 (`OnDeath::update` for kills, `ProgressEffects::update 0x5AE060`
-  for turns); each needs the same anchor-and-verify treatment.
-- Predicates listed as not backed in section 2. `stacker` needs the stack
-  storage (probably the Effects component, type 20, stride 0x70, or the
-  `ability_stackers` runtime object) located first.
+- `target` for cast and turn events is the AbilityUser's current target
+  (`+0x1A0`), not the tile the ability was aimed at; `target_*` predicates are
+  unknown when it is 0.
+- `damaged` covers melee / ranged hits and ability damage through the shared
+  post-damage call; damage over time (`0x5AE760`) and movement damage do not go
+  through it. `block` is the deflection passive (there is no shield block in
+  Soulash 2's attack code); `dodge` is the engine's miss / parry outcome.
+- The year-part field of the clock (`+0x28`) is inferred, not traced to a
+  translator call like the day part; the `game clock:` line of the first run
+  confirms or refutes it (Spring = 0).
+- Predicates still not backed: `inventory_count` (needs the Container → item
+  link and an entity → data id mapping), `biome` and `in_settlement` (need the
+  current region), `in_combat` (no runtime flag found; the AI's combat goals
+  would have to be read).
 - `equipped.item` needs an entity → data id mapping (not found in the
-  components read so far).
+  components read so far; the Name component carries the display name and a
+  second string that may be the id: `Name;803|Wheat Bread|…`,
+  `Name;core_2_Fancy_Flask|Fancy Flask|…` in the save).
 - Whether a queued cast from a rule can itself trigger rules: the engine clears
   triggers for queued casts through `AbilityUser+0x258`; the plugin inherits
   that (it only runs where the engine would run its own on-cast triggers).
+- Delayed casts are pending-list entries in the plugin (up to 256), not saved:
+  they are lost when the game is closed.

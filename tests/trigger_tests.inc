@@ -20,6 +20,17 @@ struct TriggerImage
     static constexpr std::size_t GrowMap = 0x3300;
     static constexpr std::size_t Dtor = 0x3400;
     static constexpr std::size_t Delete = 0x3500;
+    // Event hook anchors and targets.
+    static constexpr std::size_t OnDeath = 0x3600;
+    static constexpr std::size_t Kill = 0x3700;
+    static constexpr std::size_t Progress = 0x3800;
+    static constexpr std::size_t Tick = 0x3900;
+    static constexpr std::size_t Clock = 0x3980;
+    static constexpr std::size_t Parry = 0x3A00;
+    static constexpr std::size_t Damage = 0x3A80;
+    static constexpr std::size_t AttackEnd = 0x3B00;
+    static constexpr std::size_t AttackUpdate = 0x3B80;
+    static constexpr std::size_t Deflect = 0x3C00;
     std::vector<std::uint8_t> bytes = std::vector<std::uint8_t>(Size, 0xCC);
 
     std::size_t Put(std::size_t at, std::initializer_list<std::uint8_t> code)
@@ -72,10 +83,78 @@ struct TriggerImage
         at = Put(at, {0x4E, 0x89, 0x24, 0xF1, 0x48, 0xFF, 0x86, 0x50, 0x02, 0x00, 0x00});
         Put(at, {0xC3});
 
-        // EntityAttack: mov r9d,[rsi+60h]; mov r8d,[r13]; mov edx,[rsi]; mov rcx,[r15+8]; call OnAttack
+        // EntityAttack (attack resolution): the parry-experience call on the miss
+        // path, the damage-dealt call, the on-attack trigger call, the final call.
+        at = Attack + 0x20;
+        at = Put(at, {0x45, 0x8B, 0x45, 0x00, 0x8B, 0x16, 0x49, 0x8B, 0x4F, 0x08, 0xE8});
+        at = Rel(at, Parry);
+        Put(at, {0xC3});
+        at = Attack + 0x40;
+        at = Put(at, {0x44, 0x8B, 0x4D, 0x60, 0x45, 0x8B, 0x45, 0x00, 0x8B, 0x16, 0x49, 0x8B, 0x4F, 0x08, 0xE8});
+        at = Rel(at, Damage);
+        Put(at, {0xC3});
+        // mov r9d,[rsi+60h]; mov r8d,[r13]; mov edx,[rsi]; mov rcx,[r15+8]; call OnAttack
         at = Attack + 0x60;
         at = Put(at, {0x44, 0x8B, 0x4E, 0x60, 0x45, 0x8B, 0x45, 0x00, 0x8B, 0x16, 0x49, 0x8B, 0x4F, 0x08, 0xE8});
         at = Rel(at, OnAttack);
+        Put(at, {0xC3});
+        at = Attack + 0x80;
+        at = Put(at, {0x83, 0x7D, 0x64, 0x00, 0x41, 0x0F, 0x9F, 0xC1, 0x44, 0x8B, 0xC7, 0x48, 0x8B, 0xD6, 0x49, 0x8B, 0xCF, 0xE8});
+        at = Rel(at, AttackEnd);
+        Put(at, {0xC3});
+
+        // OnDeath::update: the kill passives, effect 101 then 102, same routine.
+        at = OnDeath + 0x20;
+        at = Put(at, {0xC7, 0x44, 0x24, 0x20, 0x65, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x4D, 0xD8, 0x45, 0x8B, 0xC6, 0x41, 0x8B, 0xD7,
+            0x48, 0x8B, 0xCE, 0xE8});
+        at = Rel(at, Kill);
+        at = Put(at, {0x41, 0xB8, 0x33, 0x00, 0x00, 0x00});
+        at = Put(at, {0xC7, 0x44, 0x24, 0x20, 0x66, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x4D, 0xD8, 0x45, 0x8B, 0xC6, 0x41, 0x8B, 0xD7,
+            0x48, 0x8B, 0xCE, 0xE8});
+        at = Rel(at, Kill);
+        Put(at, {0xC3});
+        at = Kill;
+        at = Put(at, {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x20, 0x41, 0xB8, 0x2C, 0x00, 0x00, 0x00, 0x41, 0xB8, 0x15, 0x00, 0x00, 0x00});
+        Put(at, {0xC3});
+
+        // ProgressEffects::update: clock read, then the three per-turn calls.
+        at = Progress + 0x10;
+        at = Put(at, {0xE8});
+        at = Rel(at, Clock);
+        at = Put(at, {0xF3, 0x0F, 0x10, 0x40, 0x18, 0xF3, 0x0F, 0x5C, 0xC7, 0xF3, 0x0F, 0x5F, 0x45, 0x6C});
+        at = Put(at, {0x4C, 0x8B, 0xC5, 0x41, 0x8B, 0xD7, 0x49, 0x8B, 0xCD, 0xE8});
+        at = Rel(at, Dtor);
+        at = Put(at, {0x41, 0x8B, 0xD7, 0x49, 0x8B, 0xCD, 0xE8});
+        at = Rel(at, Tick);
+        at = Put(at, {0x4C, 0x8B, 0xC5, 0x41, 0x8B, 0xD7, 0x49, 0x8B, 0xCD, 0xE8});
+        at = Rel(at, Dtor);
+        Put(at, {0xC3});
+        at = Tick;
+        at = Put(at, {0x48, 0x8B, 0xC4, 0x48, 0x89, 0x58, 0x18, 0xC7, 0x44, 0x24, 0x28, 0x09, 0x00, 0x00, 0x00,
+            0xC7, 0x44, 0x24, 0x20, 0x3F, 0x00, 0x00, 0x00});
+        Put(at, {0xC3});
+        Put(Clock, {0x48, 0x83, 0xEC, 0x28, 0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00, 0xC3});
+
+        // Parry experience and damage dealt both start with hasComponent(target, 3).
+        at = Parry;
+        at = Put(at, {0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x8B, 0xD3, 0xE8});
+        at = Rel(at, Delete);
+        Put(at, {0xC3});
+        at = Damage;
+        at = Put(at, {0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x41, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x8B, 0xD3, 0xE8});
+        at = Rel(at, Delete);
+        Put(at, {0xC3});
+        Put(AttackEnd, {0x48, 0x89, 0x5C, 0x24, 0x20, 0x41, 0xB9, 0x1E, 0x00, 0x00, 0x00, 0xC3});
+
+        // EntityAttack::update: call Deflect; movzx ebx,al; test al,al; je; lea rdx,[rbp+...]
+        at = AttackUpdate + 0x10;
+        at = Put(at, {0xE8});
+        at = Rel(at, Deflect);
+        at = Put(at, {0x0F, 0xB6, 0xD8, 0x84, 0xC0, 0x74, 0x54, 0x48, 0x8D, 0x95});
+        Put(at, {0xC3});
+        at = Deflect;
+        at = Put(at, {0x48, 0x8B, 0xC4, 0x53, 0x55, 0x56, 0x57, 0x49, 0x8B, 0x48, 0x20, 0x48, 0xFF, 0xC9, 0x49, 0x23, 0x48, 0x28,
+            0x49, 0x8B, 0x40, 0x18, 0x48, 0x8B, 0x0C, 0xC8, 0x8B, 0x59, 0x4C});
         Put(at, {0xC3});
         at = OnAttack;
         at = Put(at, {0x48, 0x8B, 0xC4, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57});
@@ -103,6 +182,24 @@ struct TriggerImage
     {
         return soulash_plugins::LocateTriggerLayout(bytes.data(), bytes.size(), At(UseAbility),
             withAttack ? At(Attack) : nullptr, withQueued ? At(Queued) : nullptr);
+    }
+
+    soulash_plugins::TriggerAnchors Anchors() const
+    {
+        soulash_plugins::TriggerAnchors anchors;
+        anchors.useAbilityUpdate = At(UseAbility);
+        anchors.entityAttack = At(Attack);
+        anchors.queuedAbility = At(Queued);
+        anchors.onDeathUpdate = At(OnDeath);
+        anchors.entityAttackUpdate = At(AttackUpdate);
+        anchors.parryExperience = At(Parry);
+        anchors.progressEffectsUpdate = At(Progress);
+        return anchors;
+    }
+
+    soulash_plugins::TriggerLayout LocateAll() const
+    {
+        return soulash_plugins::LocateTriggerLayout(bytes.data(), bytes.size(), Anchors());
     }
 };
 
@@ -151,6 +248,45 @@ void TestTriggerLayout()
         TriggerImage image;
         Check(!soulash_plugins::LocateTriggerLayout(image.bytes.data(), image.bytes.size(), nullptr, nullptr, nullptr).verified,
             "trigger layout: no UseAbility function -> not verified");
+    }
+    // ---- event hooks ----------------------------------------------------------
+    {
+        TriggerImage image;
+        const auto layout = image.LocateAll();
+        Check(layout.verified && layout.failure[0] == '\0', "event hooks: the full anchor set still verifies");
+        Check(layout.onKillTrigger == image.At(TriggerImage::Kill), "event hooks: kill routine from OnDeath::update");
+        Check(layout.onTurnTick == image.At(TriggerImage::Tick), "event hooks: turn tick from ProgressEffects::update");
+        Check(layout.gameClock == image.At(TriggerImage::Clock), "event hooks: game clock getter");
+        Check(layout.onParry == image.At(TriggerImage::Parry), "event hooks: parry routine (dodge)");
+        Check(layout.onDamageDealt == image.At(TriggerImage::Damage), "event hooks: damage-dealt routine");
+        Check(layout.onAttackEnd == image.At(TriggerImage::AttackEnd), "event hooks: attack-end routine (crit)");
+        Check(layout.onDeflect == image.At(TriggerImage::Deflect), "event hooks: deflection routine (block)");
+        const auto core = image.Locate();
+        Check(core.onKillTrigger == nullptr && core.onTurnTick == nullptr && core.onParry == nullptr
+                && core.onDeflect == nullptr && core.gameClock == nullptr,
+            "event hooks: without their anchors the fields stay null");
+    }
+    {
+        TriggerImage image;
+        image.Rel(TriggerImage::OnDeath + 0x20 + 22 + 4 + 6 + 22, TriggerImage::Dtor);   // 102 site calls elsewhere
+        Check(image.LocateAll().onKillTrigger == nullptr, "event hooks: the two kill sites must agree");
+    }
+    {
+        TriggerImage image;
+        image.bytes[TriggerImage::Tick + 0x13] = 0x40;   // effect 63 -> 64
+        const auto layout = image.LocateAll();
+        Check(layout.onTurnTick == nullptr && layout.gameClock == image.At(TriggerImage::Clock),
+            "event hooks: a tick routine with another effect id is rejected, the clock is independent");
+    }
+    {
+        TriggerImage image;
+        image.bytes[TriggerImage::Parry + 7] = 0x04;   // hasComponent(target, 4)
+        Check(image.LocateAll().onParry == nullptr, "event hooks: parry anchor without the Actor check is rejected");
+    }
+    {
+        TriggerImage image;
+        image.bytes[TriggerImage::Deflect + 7 + 20] = 0x48;   // entry.target offset 0x4C -> 0x48
+        Check(image.LocateAll().onDeflect == nullptr, "event hooks: deflection with another entry layout is rejected");
     }
 }
 
@@ -231,6 +367,7 @@ namespace trigger_test_detail
         std::vector<std::int32_t> page = std::vector<std::int32_t>(0x2000, -1);
         std::vector<std::uint8_t> pageEntry = std::vector<std::uint8_t>(24, 0);
         std::vector<std::uint8_t> dense;
+        std::vector<std::int32_t> ids;
         std::size_t stride;
         std::uint8_t vtable[8]{};
 
@@ -254,6 +391,7 @@ namespace trigger_test_detail
             dense.resize(dense.size() + stride, 0);
             const void* vt = vtable;
             std::memcpy(dense.data() + dense.size() - stride, &vt, 8);
+            ids.push_back(static_cast<std::int32_t>(id));
             return dense.size() - stride;
         }
 
@@ -263,6 +401,10 @@ namespace trigger_test_detail
             const std::uint8_t* de = dense.data() + dense.size();
             std::memcpy(object.data() + gs::StorageDenseBeginOffset, &db, 8);
             std::memcpy(object.data() + gs::StorageDenseEndOffset, &de, 8);
+            const std::int32_t* ib = ids.data();
+            const std::int32_t* ie = ids.data() + ids.size();
+            std::memcpy(object.data() + gs::StorageIdsBeginOffset, &ib, 8);
+            std::memcpy(object.data() + gs::StorageIdsEndOffset, &ie, 8);
         }
 
         gs::StorageRef Ref() const
@@ -294,8 +436,10 @@ void TestGameState()
 {
     using namespace trigger_test_detail;
     FakeStorage health(gs::HealthSize), stamina(gs::StaminaSize), tags(gs::TagsSize), equipment(gs::EquipmentSize),
-        skills(gs::SkillsSize), weapon(gs::WeaponSize), item(gs::ItemSize), abilityUser(gs::AbilityUserSize);
+        skills(gs::SkillsSize), weapon(gs::WeaponSize), item(gs::ItemSize), abilityUser(gs::AbilityUserSize),
+        effects(gs::EffectsSize), party(gs::PartySize), player(gs::PlayerSize);
     const std::uint32_t holder = 4014, target = 77, sword = 100, shield = 101;   // one page: ids < 0x2000
+    const std::uint32_t companionA = 300, companionB = 301;
     std::vector<std::unique_ptr<std::string>> keep;
 
     const std::size_t h = health.Add(holder);
@@ -349,6 +493,32 @@ void TestGameState()
     abilityUser.Set<std::int32_t>(au, gs::AbilityUserTargetOffset, static_cast<std::int32_t>(target));
     abilityUser.Finish();
 
+    // Effects: stacks {flag 3, burn 2, old 5, none 0}, expiry {burn 50, old 10}; the clock says 20.
+    std::map<std::string, int> stacks{{"flag", 3}, {"burn", 2}, {"old", 5}, {"none", 0}};
+    std::map<std::string, float> expiry{{"burn", 50.0f}, {"old", 10.0f}};
+    const std::size_t ef = effects.Add(holder);
+    std::memcpy(effects.dense.data() + ef + gs::EffectsStacksMapOffset, &stacks, sizeof(stacks));
+    std::memcpy(effects.dense.data() + ef + gs::EffectsStackExpiryMapOffset, &expiry, sizeof(expiry));
+    effects.Set<float>(ef, gs::EffectsLastTickOffset, 20.0f);
+    effects.Finish();
+
+    // Party: two companions carry the component; the holder is the player.
+    party.Add(companionA);
+    party.Add(companionB);
+    party.Finish();
+    player.Add(holder);
+    player.Finish();
+
+    std::vector<std::uint8_t> clockBytes(0x30, 0);
+    const std::int32_t turnsPerDay = 1440, dayPart = 10, yearPart = 3;
+    const float now = 20.0f;
+    std::memcpy(clockBytes.data() + gs::ClockTurnsPerDayOffset, &turnsPerDay, 4);
+    std::memcpy(clockBytes.data() + gs::ClockTimeOffset, &now, 4);
+    std::memcpy(clockBytes.data() + gs::ClockDayPartOffset, &dayPart, 4);
+    std::memcpy(clockBytes.data() + gs::ClockYearPartOffset, &yearPart, 4);
+    const gs::GameClock clock = gs::ReadClock(clockBytes.data());
+    Check(clock.has && clock.time == 20.0f && clock.dayPart == 10 && clock.yearPart == 3, "state: clock struct read");
+
     gs::Access access;
     access.health = health.Ref();
     access.stamina = stamina.Ref();
@@ -358,9 +528,33 @@ void TestGameState()
     access.weapon = weapon.Ref();
     access.item = item.Ref();
     access.abilityUser = abilityUser.Ref();
+    access.effects = effects.Ref();
+    access.party = party.Ref();
+    access.player = player.Ref();
 
     soulash::conditions::Snapshot state;
-    gs::BuildSnapshot(access, holder, target, state);
+    gs::BuildSnapshot(access, holder, target, state, clock);
+    Check(state.stackers.has && state.stackers.value.size() == 2 && state.stackers.value.at("flag") == 3
+            && state.stackers.value.at("burn") == 2,
+        "state: live stacks, expired and zero stacks left out");
+    Check(state.party.has && state.party.value == "in_party" && state.companions.has && state.companions.value == 2,
+        "state: the player with two Party-component companions is in a party of two");
+    Check(state.dayPart.has && state.dayPart.value == "Night" && state.season.has && state.season.value == "Winter",
+        "state: day part and season names from the clock indices");
+    {
+        soulash::conditions::Snapshot companion;
+        gs::BuildSnapshot(access, companionA, 0, companion, clock);
+        Check(companion.party.has && companion.party.value == "in_party" && companion.companions.value == 2,
+            "state: a companion is in the party with the other member and the player");
+        soulash::conditions::Snapshot stranger;
+        gs::BuildSnapshot(access, target, 0, stranger, clock);
+        Check(stranger.party.has && stranger.party.value == "alone" && stranger.companions.value == 0,
+            "state: an entity outside the party is alone");
+        soulash::conditions::Snapshot noClock;
+        gs::BuildSnapshot(access, holder, target, noClock);
+        Check(!noClock.dayPart.has && !noClock.season.has && noClock.stackers.has && noClock.stackers.value.size() == 2,
+            "state: without a clock the time predicates stay unknown and stacks use the last tick time");
+    }
     Check(state.healthPercent.has && state.healthPercent.value == 50.0, "state: health percent");
     Check(state.staminaPercent.has && state.staminaPercent.value == 75.0, "state: stamina = (max - used) / max");
     Check(state.holderTags.has && state.holderTags.value == std::set<std::string>{"Player", "Human", "custom"},
@@ -375,14 +569,16 @@ void TestGameState()
     Check(state.skills.has && state.skills.value.size() == 3 && state.skills.value.at("arendeth_runic_magic") == 5
             && state.skills.value.at("zzz_last") == 12,
         "state: skill levels read from the live std::map");
-    Check(!state.party.has && !state.dayPart.has && !state.stackers.has && !state.inCombat.has,
+    Check(!state.biome.has && !state.inventory.has && !state.inCombat.has && !state.inSettlement.has,
         "state: predicates without a backing stay unknown");
 
     // The evaluator sees the same picture.
     const std::string document = "{\"spec\":1,\"triggers\":[{\"id\":\"t\",\"on\":{\"cast\":\"a\"},\"cast\":\"b\","
         "\"when\":{\"all\":[{\"health_percent\":{\"max\":50}},{\"weapon_class\":\"sword\"},{\"shield\":true},"
         "{\"holder_tag\":\"player\"},{\"target_tag\":[\"undead\"]},{\"skill_level\":{\"skill\":\"arendeth_runic_magic\",\"min\":5}},"
-        "{\"equipped\":{\"slot\":\"left_hand\",\"item_type\":\"Shield\"}},{\"stamina_percent\":{\"min\":70}}]}}]}";
+        "{\"equipped\":{\"slot\":\"left_hand\",\"item_type\":\"Shield\"}},{\"stamina_percent\":{\"min\":70}},"
+        "{\"stacker\":{\"id\":\"flag\",\"min\":3}},{\"stacker\":{\"id\":\"old\",\"max\":0}},{\"party\":\"in_party\"},"
+        "{\"companions\":{\"min\":2,\"max\":2}},{\"time_of_day\":\"night\"},{\"season\":[\"winter\"]}]}}]}";
     soulash::conditions::ConditionSet set;
     std::string error;
     Check(set.Load(document, error), "state: evaluator document loads");
@@ -412,7 +608,10 @@ void TestTriggerRules()
               "{\"id\":\"wounded\",\"on\":{\"cast\":\"A\"},\"cast\":\"B\",\"when\":{\"health_percent\":{\"max\":50}}},"
               "{\"id\":\"lucky\",\"on\":{\"cast\":\"A\"},\"cast\":\"C\",\"chance\":0.5,\"when\":{\"holder_tag\":\"Player\"}},"
               "{\"id\":\"always\",\"on\":{\"cast\":\"A\"},\"cast\":\"D\",\"when\":{\"time_of_day\":\"Night\"},\"on_unavailable\":\"active\"},"
-              "{\"id\":\"swing\",\"on\":{\"attack\":true},\"cast\":\"E\",\"when\":{\"weapon_class\":\"Axe\"}}]}",
+              "{\"id\":\"swing\",\"on\":{\"attack\":true},\"cast\":\"E\",\"when\":{\"weapon_class\":\"Axe\"}},"
+              "{\"id\":\"vengeful\",\"on\":{\"damaged\":true},\"cast\":\"F\",\"when\":{\"health_percent\":{\"max\":50}}},"
+              "{\"id\":\"reaper\",\"on\":{\"kill\":true},\"cast\":\"G\",\"when\":{\"holder_tag\":\"Player\"}},"
+              "{\"id\":\"tick\",\"on\":{\"turn\":true},\"cast\":\"H\",\"when\":{\"stacker\":{\"id\":\"flag\",\"min\":1}}}]}",
               error),
         "rules: document loads");
     mods[0].hasConditions = true;
@@ -453,10 +652,51 @@ void TestTriggerRules()
     out = rules::Evaluate(mods, attack, state, low, 8);
     Check(out.matched == 1 && out.casts.empty(), "rules: attack rule blocked by weapon class");
 
+    // The other events: each rule listens to exactly its own kind.
+    rules::Event damaged{rules::EventKind::Damaged, ""};
+    rules::Event kill{rules::EventKind::Kill, ""};
+    rules::Event turn{rules::EventKind::Turn, ""};
+    rules::Event dodge{rules::EventKind::Dodge, ""};
+    Check(rules::AnyRuleFor(mods, damaged) && rules::AnyRuleFor(mods, kill) && rules::AnyRuleFor(mods, turn)
+            && !rules::AnyRuleFor(mods, dodge),
+        "rules: pre-check knows the new event kinds");
+    state.healthPercent = 30.0;
+    out = rules::Evaluate(mods, damaged, state, low, 8);
+    Check(out.matched == 1 && out.casts.size() == 1 && out.casts[0].abilityId == "F", "rules: damaged rule fires");
+    out = rules::Evaluate(mods, kill, state, low, 8);
+    Check(out.matched == 1 && out.casts.size() == 1 && out.casts[0].abilityId == "G", "rules: kill rule fires");
+    out = rules::Evaluate(mods, turn, state, low, 8);
+    Check(out.matched == 1 && out.blockedByCondition == 1 && out.casts.empty(), "rules: turn rule unknown stacks -> fails closed");
+    state.stackers = std::map<std::string, double>{{"flag", 2.0}};
+    out = rules::Evaluate(mods, turn, state, low, 8);
+    Check(out.casts.size() == 1 && out.casts[0].abilityId == "H", "rules: turn rule fires on live stacks");
+    Check(std::string(rules::EventName(rules::EventKind::Crit)) == "crit"
+            && std::string(rules::EventName(rules::EventKind::Block)) == "block",
+        "rules: event names");
+
+    // Effects triggers: a delayed cast needs a turn source.
+    rules::ModRules fx;
+    fx.mod = "m";
+    Check(fx.effects.Load("{\"spec\":1,\"mod\":\"m\",\"requires\":[\"delay\",\"on_kill\"],\"triggers\":["
+                          "{\"id\":\"later\",\"on\":{\"kill\":true},\"do\":{\"delay\":2,\"do\":{\"cast\":{\"spell\":\"X\"}}}},"
+                          "{\"id\":\"now\",\"on\":{\"kill\":true},\"do\":{\"cast\":{\"spell\":\"Y\"}}}]}", error),
+        "rules: effects document loads");
+    fx.hasEffects = true;
+    std::vector<rules::ModRules> fxMods;
+    fxMods.push_back(std::move(fx));
+    out = rules::Evaluate(fxMods, kill, state, low, 8);
+    Check(out.matched == 2 && out.casts.size() == 1 && out.delayed.empty() && out.notes.size() == 1
+            && out.notes[0].find("dropped") != std::string::npos,
+        "rules: without a turn source the delayed cast is dropped and noted");
+    out = rules::Evaluate(fxMods, kill, state, low, 8, true);
+    Check(out.casts.size() == 1 && out.delayed.size() == 1 && out.delayed[0].delayTurns == 2
+            && out.delayed[0].abilityId.find("X") != std::string::npos && out.delayed[0].rule == "later" && out.notes.empty(),
+        "rules: with a turn source the delayed cast is returned with its delay");
+
     // A file requiring an unbacked predicate is unavailable as a whole.
     rules::ModRules strict;
     strict.mod = "s";
-    Check(strict.conditions.Load("{\"spec\":1,\"requires\":[\"season\"],\"triggers\":[{\"id\":\"x\",\"on\":{\"cast\":\"A\"},"
+    Check(strict.conditions.Load("{\"spec\":1,\"requires\":[\"biome\"],\"triggers\":[{\"id\":\"x\",\"on\":{\"cast\":\"A\"},"
                                   "\"cast\":\"Y\",\"when\":{\"health_percent\":{\"max\":50}}}]}", error),
         "rules: strict document loads");
     strict.hasConditions = true;
