@@ -1001,6 +1001,13 @@ namespace
                 ReportFailure("skipping directory plugin that duplicates the manifest plugin id");
                 continue;
             }
+            // The interface table holds MaximumDirectoryPlugins records in all,
+            // manifest plugin included.
+            if (plugins.size() >= MaximumDirectoryPlugins)
+            {
+                ReportFailure("plugin directory has more plugins than the supported maximum");
+                break;
+            }
             plugins.push_back(std::move(entry));
         }
 

@@ -18,8 +18,8 @@ if (-not (Test-Path -LiteralPath $original)) {
     throw "No BugSplat64_original.dll in $GameDir: nothing to roll back (the vendor file is in place if check-install.ps1 says EXTENDER NOT INSTALLED)."
 }
 $signature = Get-AuthenticodeSignature -LiteralPath $original
-if ($signature.Status -ne 'Valid') {
-    throw "BugSplat64_original.dll is not a validly signed vendor file (status $($signature.Status)); stopping. Resolve by hand."
+if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'BugSplat') {
+    throw "BugSplat64_original.dll is not a validly BugSplat-signed vendor file (status $($signature.Status), signer $($signature.SignerCertificate.Subject)); stopping. Resolve by hand."
 }
 if (Test-Path -LiteralPath $proxy) {
     $proxySignature = Get-AuthenticodeSignature -LiteralPath $proxy

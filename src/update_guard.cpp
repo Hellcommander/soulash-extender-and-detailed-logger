@@ -246,7 +246,11 @@ namespace soulash::update_guard
         Config config;
         if (iniPath != nullptr)
         {
-            config.safeModeAfterUncleanExits = GetPrivateProfileIntW(L"UpdateGuard", L"SafeModeAfterUncleanExits", 2, iniPath);
+            // GetPrivateProfileIntW returns -1 as 0xFFFFFFFF; a negative value
+            // would never be reached, so fall back to the default.
+            const int threshold = static_cast<int>(
+                GetPrivateProfileIntW(L"UpdateGuard", L"SafeModeAfterUncleanExits", 2, iniPath));
+            config.safeModeAfterUncleanExits = threshold < 0 ? 2u : static_cast<unsigned>(threshold);
             config.forceSafeMode = GetPrivateProfileIntW(L"UpdateGuard", L"ForceSafeMode", 0, iniPath) == 1;
         }
 

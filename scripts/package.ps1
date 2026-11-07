@@ -24,7 +24,8 @@ if (-not $OutputDirectory) { $OutputDirectory = Join-Path $buildDirectory 'dist'
 
 $proxySource = Join-Path $buildDirectory 'BugSplat64.dll'
 if (-not (Test-Path -LiteralPath $proxySource)) {
-    & (Join-Path $PSScriptRoot 'build.ps1')
+    # -GameDir '' : build only; packaging never deploys to or edits the game folder.
+    & (Join-Path $PSScriptRoot 'build.ps1') -GameDir ''
     if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
 }
 

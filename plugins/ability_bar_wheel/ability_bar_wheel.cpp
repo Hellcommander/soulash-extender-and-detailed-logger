@@ -233,7 +233,9 @@ namespace
         {
             return false;
         }
-        InterlockedAdd(&g_pendingSteps, wheelY > 0 ? 1 : -1);
+        // SDL's y is a notch count; sum notches (clamped) so parity is right.
+        const LONG notches = wheelY > 64 ? 64 : (wheelY < -64 ? -64 : static_cast<LONG>(wheelY));
+        InterlockedAdd(&g_pendingSteps, notches);
         return true;
     }
 
@@ -631,9 +633,15 @@ namespace
         {
             // Undo the update hook so the plugin is either fully on or fully off.
             void* restore = reinterpret_cast<void*>(g_originalUpdate);
-            g_extender->patchMemory(g_extender->pluginHandle, updateSlot, &restore, sizeof(restore));
-            g_originalUpdate = nullptr;
             g_originalPollEvent = nullptr;
+            if (!g_extender->patchMemory(g_extender->pluginHandle, updateSlot, &restore, sizeof(restore)))
+            {
+                // UpdateHook stays installed and still chains to g_originalUpdate,
+                // so keep it; without the event hook it only passes through.
+                Log("patching the SDL_PollEvent IAT slot failed and the update hook could not be removed; passing through");
+                return false;
+            }
+            g_originalUpdate = nullptr;
             Log("patching the SDL_PollEvent IAT slot failed; inactive");
             return false;
         }

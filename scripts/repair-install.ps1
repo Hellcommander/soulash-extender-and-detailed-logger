@@ -53,11 +53,54 @@ function Test-VendorSigned([string]$path) {
     return $signature.Status -eq 'Valid' -and $signature.SignerCertificate.Subject -match 'BugSplat'
 }
 
-# Export names live in the PE export name table as plain ASCII; a byte search is
-# enough to notice an SDK that renamed or dropped one of them.
+# Reads the names in the PE export directory (not just any string in the file),
+# so a DLL that merely contains the text without exporting it is caught.
+function Get-ExportNames([string]$path) {
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    try {
+        $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+        if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { return @() }
+        $coff = $pe + 4
+        $sectionCount = [BitConverter]::ToUInt16($bytes, $coff + 2)
+        $optionalSize = [BitConverter]::ToUInt16($bytes, $coff + 16)
+        $optional = $coff + 20
+        $dataDirectories = if ([BitConverter]::ToUInt16($bytes, $optional) -eq 0x20B) { $optional + 112 } else { $optional + 96 }
+        $exportRva = [BitConverter]::ToUInt32($bytes, $dataDirectories)
+        if ($exportRva -eq 0) { return @() }
+        $sectionTable = $optional + $optionalSize
+        $toOffset = {
+            param([uint32]$rva)
+            for ($i = 0; $i -lt $sectionCount; $i++) {
+                $section = $sectionTable + 40 * $i
+                $virtualSize = [BitConverter]::ToUInt32($bytes, $section + 8)
+                $virtualAddress = [BitConverter]::ToUInt32($bytes, $section + 12)
+                $rawSize = [BitConverter]::ToUInt32($bytes, $section + 16)
+                $rawPointer = [BitConverter]::ToUInt32($bytes, $section + 20)
+                $size = [Math]::Max($virtualSize, $rawSize)
+                if ($rva -ge $virtualAddress -and $rva -lt $virtualAddress + $size) {
+                    return [int64]($rva - $virtualAddress + $rawPointer)
+                }
+            }
+            throw "RVA 0x$('{0:X}' -f $rva) is outside every section"
+        }
+        $directory = & $toOffset $exportRva
+        $nameCount = [BitConverter]::ToUInt32($bytes, $directory + 24)
+        $nameTable = & $toOffset ([BitConverter]::ToUInt32($bytes, $directory + 32))
+        $names = for ($i = 0; $i -lt $nameCount; $i++) {
+            $start = & $toOffset ([BitConverter]::ToUInt32($bytes, $nameTable + 4 * $i))
+            $end = [Array]::IndexOf($bytes, [byte]0, [int]$start)
+            [System.Text.Encoding]::ASCII.GetString($bytes, $start, $end - $start)
+        }
+        return @($names)
+    }
+    catch {
+        return @()
+    }
+}
+
 function Get-MissingExports([string]$path) {
-    $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($path))
-    return @($exports | Where-Object { -not $text.Contains([string]$_ + [char]0) })
+    $names = Get-ExportNames $path
+    return @($exports | Where-Object { $names -notcontains $_ })
 }
 
 if (Get-Process | Where-Object { $_.ProcessName -like 'Soulash*' }) {

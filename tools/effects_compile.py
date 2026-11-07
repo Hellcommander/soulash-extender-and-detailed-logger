@@ -569,6 +569,15 @@ class Group:
         self.self_target = self.self_target and leaf in SELF_LEAVES
 
 
+RESERVED_FILE_CHARACTERS = '/:*?<>|"' + chr(92) + chr(0)   # chr(92) is the backslash
+
+
+def safe_file_id(value):
+    """Generated ability ids name files under abilities/: no separators or
+    reserved characters, and no leading '.' (so never '.' or '..')."""
+    return bool(value) and not value.startswith(".") and not any(c in value for c in RESERVED_FILE_CHARACTERS)
+
+
 class SpellCompiler:
     def __init__(self, document, spell, index, report, local_spells):
         self.document = document
@@ -833,6 +842,8 @@ def compile_trigger(document, trigger, index, report, local_spells, node):
     event_name = next(iter(event))
     pseudo = {"ability": "%s_ext_trigger_%s" % (document["mod"], trigger["id"]),
               "name": "Trigger %s" % trigger["id"], "target": "self", "__event": event}
+    if "level" in trigger:
+        pseudo["level"] = trigger["level"]   # milestone skill level of the generated passives
     compiler = SpellCompiler(document, pseudo, index, report, local_spells)
     compiler.where = "triggers[%d](%s)" % (index, trigger["id"])
     compiler.root_id = pseudo["ability"]
@@ -908,6 +919,10 @@ def validate_spell(spell, index, report, seen_ids, known_targets):
     else:
         if not cond.id_string(spell["ability"], where, report, "ability"):
             return None
+        if not safe_file_id(spell["ability"]):
+            report.error(where, "ability %r cannot be used in a file name (no path separators, no leading '.')"
+                         % spell["ability"])
+            return None
         if known_targets is not None and spell["ability"] not in known_targets["ability"]:
             report.error(where, "no ability %r in the mod to attach to" % spell["ability"])
         where = "%s(%s)" % (where, spell["ability"])
@@ -968,7 +983,8 @@ def validate_trigger(trigger, index, report, seen_ids, known_targets):
     if not isinstance(tid, str) or not re.fullmatch(ID_PATTERN, tid):
         report.error(where, "id must match %s" % ID_PATTERN)
         return None
-    if tid in seen_ids:
+    # Case-insensitive: condition ids are lower-cased (ext_trigger_<id>).
+    if any(tid.lower() == seen.lower() for seen in seen_ids):
         report.error(where, "duplicate id %r" % tid)
         return None
     seen_ids.add(tid)
@@ -1074,6 +1090,15 @@ def validate(document, report, mod_folder=None):
         summary.append({"id": "trigger " + trigger["id"], "kind": "trigger", "nodes": compiler.report_rows})
     for compiler in compilers:
         report.warnings.extend(compiler.warnings)
+    # Generated ids name files (case-insensitive on Windows): a sub-ability such
+    # as m_A__0_0 must not collide with a spell named A__0_0.
+    owners = {}
+    for compiler in compilers:
+        for ability in compiler.abilities:
+            owner = owners.setdefault(ability["id"].lower(), compiler.root_id)
+            if owner != compiler.root_id:
+                report.error("file", "generated ability id %r of %s collides with one generated for %s"
+                             % (ability["id"], compiler.root_id, owner))
     missing = sorted(needed - set(requires))
     if missing:
         report.warn("file", "capabilities/predicates used but not listed in requires: %s" % missing)
@@ -1087,6 +1112,9 @@ def emit(document, compilers, folder):
     count = 0
     for compiler in compilers:
         for ability in compiler.abilities:
+            # Ids become file names: never let one leave the output folder.
+            if not safe_file_id(ability["id"]):
+                raise ValueError("ability id %r cannot be used as a file name" % ability["id"])
             with open(os.path.join(abilities_folder, ability["id"] + ".json"), "w", encoding="utf-8") as handle:
                 json.dump(ability, handle, indent="\t")
                 handle.write("\n")

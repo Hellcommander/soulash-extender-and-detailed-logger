@@ -269,6 +269,7 @@ namespace soulash::x64
         Cursor cursor{code, available};
         bool operandSize16 = false;
         bool addressSize32 = false;
+        bool repne = false;
         bool rexW = false;
 
         // Legacy prefixes, then at most one REX.
@@ -276,6 +277,7 @@ namespace soulash::x64
         {
             operandSize16 = operandSize16 || code[cursor.position] == 0x66;
             addressSize32 = addressSize32 || code[cursor.position] == 0x67;
+            repne = repne || code[cursor.position] == 0xF2;
             ++cursor.position;
         }
         if (cursor.Has(1) && (code[cursor.position] & 0xF0) == 0x40)
@@ -336,7 +338,10 @@ namespace soulash::x64
                 const OpInfo info = TwoByte(second);
                 if (!info.valid) return false;
                 if (info.modrm && !ConsumeModrm(cursor, decoded, reg)) return false;
-                if (!ConsumeImmediate(cursor, info.imm, operandSize16, rexW, addressSize32, decoded))
+                // SSE4a EXTRQ (66 0F 78 /0 ib ib) and INSERTQ (F2 0F 78 /r ib ib)
+                // carry two immediate bytes; plain 0F 78 is VMREAD (ModRM only).
+                const Imm imm = (second == 0x78 && (operandSize16 || repne)) ? Imm::Word : info.imm;
+                if (!ConsumeImmediate(cursor, imm, operandSize16, rexW, addressSize32, decoded))
                 {
                     return false;
                 }
@@ -409,6 +414,12 @@ namespace soulash::x64
         }
 
         if (cursor.position > 15)
+        {
+            return false;
+        }
+        // With 67h, mod=00 r/m=101 is EIP-relative ([eip+disp32], 32-bit
+        // truncated); rebasing it as RIP-relative would change the target.
+        if (decoded.ripRelative && addressSize32)
         {
             return false;
         }

@@ -206,8 +206,10 @@ namespace
             {
                 return false;
             }
+            // Detour targets are also read (copied into the trampoline), so
+            // execute-only PAGE_EXECUTE does not qualify.
             if (requireExecutable
-                && (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ
+                && (info.Protect & (PAGE_EXECUTE_READ
                     | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0)
             {
                 return false;
@@ -223,14 +225,51 @@ namespace
 
     bool WriteProtected(void* address, const void* bytes, std::size_t size)
     {
-        DWORD previous = 0;
-        if (!VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &previous))
+        // VirtualProtect reports only the first page's old protection, so
+        // change and restore region by region (a patch is at most 4 KiB, so
+        // it spans at most two pages / regions).
+        struct Span { BYTE* base; std::size_t size; DWORD previous; };
+        Span spans[2]{};
+        std::size_t count = 0;
+        auto* cursor = static_cast<BYTE*>(address);
+        std::size_t remaining = size;
+        bool ok = true;
+        while (remaining != 0)
         {
+            MEMORY_BASIC_INFORMATION info{};
+            if (count == 2 || VirtualQuery(cursor, &info, sizeof(info)) == 0)
+            {
+                ok = false;
+                break;
+            }
+            const auto regionEnd = static_cast<BYTE*>(info.BaseAddress) + info.RegionSize;
+            const std::size_t available = static_cast<std::size_t>(regionEnd - cursor);
+            const std::size_t step = available < remaining ? available : remaining;
+            DWORD previous = 0;
+            if (!VirtualProtect(cursor, step, PAGE_EXECUTE_READWRITE, &previous))
+            {
+                ok = false;
+                break;
+            }
+            spans[count++] = {cursor, step, previous};
+            cursor += step;
+            remaining -= step;
+        }
+        const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+        if (ok)
+        {
+            std::memcpy(address, bytes, size);
+        }
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            DWORD ignored = 0;
+            VirtualProtect(spans[index].base, spans[index].size, spans[index].previous, &ignored);
+        }
+        if (!ok)
+        {
+            SetLastError(error != ERROR_SUCCESS ? error : ERROR_INVALID_PARAMETER);
             return false;
         }
-        std::memcpy(address, bytes, size);
-        DWORD ignored = 0;
-        VirtualProtect(address, size, previous, &ignored);
         FlushInstructionCache(GetCurrentProcess(), address, size);
         return true;
     }

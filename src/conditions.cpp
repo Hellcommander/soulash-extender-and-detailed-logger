@@ -397,14 +397,22 @@ namespace soulash::conditions
             hi = INFINITY;
             if (range.type != Json::Type::Object) return false;
             bool bounded = false;
+            bool hasMin = false;
+            bool hasMax = false;
             for (const auto& [key, value] : range.members)
             {
-                if ((key == "min" || key == "max") && value.type == Json::Type::Number)
+                if (key == "min" || key == "max")
                 {
+                    // A malformed bound is unknown, not silently ignored.
+                    if (value.type != Json::Type::Number) return false;
                     (key == "min" ? lo : hi) = value.number;
+                    (key == "min" ? hasMin : hasMax) = true;
                     bounded = true;
                 }
             }
+            // An explicitly inverted range is malformed (a default minimum
+            // above a lone max is the caller's to resolve).
+            if (hasMin && hasMax && lo > hi) return false;
             return !requireBound || bounded;
         }
 
@@ -454,10 +462,9 @@ namespace soulash::conditions
                 {
                     return FromBool(empty == value.boolean);
                 }
-                if (empty || value.type != Json::Type::String)
-                {
-                    return value.type == Json::Type::String ? Tri::False : Tri::Unknown;
-                }
+                const bool knownSelector = key == "item" || key == "item_type" || key == "item_tag";
+                if (!knownSelector || value.type != Json::Type::String) return Tri::Unknown;
+                if (empty) return Tri::False;
                 // A state source that knows the slot is filled but not which
                 // data id fills it (the live game registry today) leaves `item`
                 // empty: identity questions are then unknown, not false.
@@ -466,9 +473,10 @@ namespace soulash::conditions
                 if (key == "item_type") return FromBool(Lower(found->second.itemType) == Lower(value.text));
                 if (key == "item_tag")
                 {
+                    const std::string wanted = Lower(value.text);
                     for (const std::string& tag : found->second.itemTags)
                     {
-                        if (tag == value.text) return Tri::True;
+                        if (Lower(tag) == wanted) return Tri::True;
                     }
                     return Tri::False;
                 }

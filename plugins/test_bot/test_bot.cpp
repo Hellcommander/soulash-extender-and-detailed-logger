@@ -147,6 +147,10 @@ namespace
     unsigned long long g_liveFrameMs = 0;     // LiveFrameMs: refresh <TestBot>\live.png this often (0 = off)
     bool g_inbox = true;                      // Inbox: run *.script files dropped into <TestBot>\inbox
     bool g_ready = false;                     // blocking, SDL and the poll hook are in place: scripts can run
+    // Set last in Start (release) and read by the poll hook (acquire): the game
+    // thread does not tick until the loader thread has finished setting up the
+    // first job, so inbox jobs cannot race the configured one.
+    std::atomic<bool> g_tickEnabled{false};
     unsigned char* g_gameBase = nullptr;
 
     // Steam blocking
@@ -2165,9 +2169,14 @@ namespace
             return false;
 
         case testbot::Op::Key:
+            // A rejected SDL_PushEvent fails the step: the input never reached the game.
             if (g_phase == 0)
             {
-                PushKey(step.key, true);
+                if (!PushKey(step.key, true))
+                {
+                    Fail(step, "SDL_PushEvent rejected the key down", false);
+                    return true;
+                }
                 g_deadline = now + static_cast<unsigned long long>(step.b);
                 g_phase = 1;
                 return false;
@@ -2176,13 +2185,21 @@ namespace
             {
                 return false;
             }
-            PushKey(step.key, false);
+            if (!PushKey(step.key, false))
+            {
+                Fail(step, "SDL_PushEvent rejected the key up", false);
+                return true;
+            }
             NextStep();
             return false;
 
         case testbot::Op::KeyDown:
         case testbot::Op::KeyUp:
-            PushKey(step.key, step.op == testbot::Op::KeyDown);
+            if (!PushKey(step.key, step.op == testbot::Op::KeyDown))
+            {
+                Fail(step, "SDL_PushEvent rejected the key event", false);
+                return true;
+            }
             NextStep();
             return false;
 
@@ -2194,7 +2211,11 @@ namespace
         case testbot::Op::Wheel:
         {
             const int direction = step.a > 0 ? 1 : -1;
-            PushWheel(direction);
+            if (!PushWheel(direction))
+            {
+                Fail(step, "SDL_PushEvent rejected the wheel event", false);
+                return true;
+            }
             if (++g_counter >= (step.a > 0 ? step.a : -step.a))
             {
                 NextStep();
@@ -2217,11 +2238,19 @@ namespace
             }
             if (g_phase == 1)
             {
-                PushButton(static_cast<int>(step.c), static_cast<int>(step.a), static_cast<int>(step.b), true);
+                if (!PushButton(static_cast<int>(step.c), static_cast<int>(step.a), static_cast<int>(step.b), true))
+                {
+                    Fail(step, "SDL_PushEvent rejected the mouse down", false);
+                    return true;
+                }
                 g_phase = 2;
                 return false;
             }
-            PushButton(static_cast<int>(step.c), static_cast<int>(step.a), static_cast<int>(step.b), false);
+            if (!PushButton(static_cast<int>(step.c), static_cast<int>(step.a), static_cast<int>(step.b), false))
+            {
+                Fail(step, "SDL_PushEvent rejected the mouse up", false);
+                return true;
+            }
             NextStep();
             return false;
 
@@ -2417,12 +2446,20 @@ namespace
                 character >= 'A' && character <= 'Z' ? character - 'A' + 'a' : character);
             if (g_phase == 0)
             {
-                PushKey(keycode, true);
-                PushText(character);
+                if (!PushKey(keycode, true) || !PushText(character))
+                {
+                    PushKey(keycode, false);
+                    Fail(step, "SDL_PushEvent rejected a typed character", false);
+                    return true;
+                }
                 g_phase = 1;
                 return false;
             }
-            PushKey(keycode, false);
+            if (!PushKey(keycode, false))
+            {
+                Fail(step, "SDL_PushEvent rejected a key up while typing", false);
+                return true;
+            }
             g_phase = 0;
             ++g_counter;
             return false;   // one character per two frames
@@ -2761,6 +2798,12 @@ namespace
     {
         const unsigned long long now = NowMs();
         UpdateCurrentScreen(now);
+        // Patch the stats object as soon as the world is up, not only when a
+        // script reaches wait_world (one attempt; it returns at once after).
+        if (InWorld())
+        {
+            EnsureStatsObjectPatched();
+        }
         PollInbox(now);
         if (g_running)
         {
@@ -2772,7 +2815,7 @@ namespace
     int PollEventHook(void* event)
     {
         const int result = g_originalPollEvent(event);
-        if (result == 0)
+        if (result == 0 && g_tickEnabled.load(std::memory_order_acquire))
         {
             Tick();
         }
@@ -2964,6 +3007,7 @@ namespace
             g_runState = RunState::Idle;
             Log("idle: waiting for a script in the inbox");
         }
+        g_tickEnabled.store(true, std::memory_order_release);
     }
 }
 

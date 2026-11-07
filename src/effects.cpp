@@ -319,9 +319,11 @@ namespace soulash::effects
                         {
                             if (key == "weight")
                             {
-                                if (member.type != Json::Type::Number || member.number <= 0.0)
+                                // Bounded so the sum of options cannot overflow to infinity.
+                                if (member.type != Json::Type::Number || !(member.number > 0.0)
+                                    || member.number > 1e9)
                                 {
-                                    return Fail(optionWhere, "weight must be a positive number");
+                                    return Fail(optionWhere, "weight must be a positive number up to 1e9");
                                 }
                                 weight = member.number;
                             }

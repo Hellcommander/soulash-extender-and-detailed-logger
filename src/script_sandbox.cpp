@@ -260,14 +260,14 @@ namespace soulash::script
             const lua_Integer count = luaL_checkinteger(L, 2);
             std::size_t separatorLength = 0;
             const char* separator = luaL_optlstring(L, 3, "", &separatorLength);
-            if (count <= 0)
+            const std::size_t unit = length + separatorLength;
+            if (count <= 0 || unit == 0)
             {
                 lua_pushliteral(L, "");
                 return 1;
             }
-            const unsigned long long total =
-                static_cast<unsigned long long>(count) * (length + separatorLength);
-            if (length + separatorLength != 0 && total > StateOf(L)->stringLimit)
+            // Divide instead of multiplying so a huge count cannot wrap.
+            if (static_cast<unsigned long long>(count) > StateOf(L)->stringLimit / unit)
             {
                 return luaL_error(L, "resulting string too large");
             }
@@ -314,8 +314,17 @@ namespace soulash::script
                 lua_pushinteger(L, init - 1);
                 return 2;
             }
+            // A full compare at each offset is quadratic for long near-matches,
+            // and the Lua hook cannot interrupt native code: charge the work.
+            unsigned long long work = 0;
             for (std::size_t offset = 0; offset + needleLength <= remaining; ++offset)
             {
+                work += needleLength;
+                if (work >= BytesPerUnit * 1024)
+                {
+                    Charge(L, work / BytesPerUnit);
+                    work %= BytesPerUnit;
+                }
                 if (std::memcmp(start + offset, needle, needleLength) == 0)
                 {
                     lua_pushinteger(L, init + static_cast<lua_Integer>(offset));
