@@ -263,8 +263,11 @@ as described below (the build prints each SHA-256).
   log-mode runs in the game on 2026-11-07: all eight hooks fire, crit and block
   still unobserved, `Mode=active` untried. It also logs every first-chance C++
   exception in the process with its type, `what()` and stack, which named the
-  game's own `fmt::format_error` behind a crash. See
-  [docs/triggers.md](docs/triggers.md).
+  game's own `fmt::format_error` behind a crash. A third rule file,
+  `extender\throws.json`, reacts to the player's **real item throw**: the
+  item's abilities are cast at the tile where it landed and the item is used up
+  (Arendeth's Runic Magic uses it for its throwing runes; not run in the game
+  yet). See [docs/triggers.md](docs/triggers.md).
 - `Variants.dll` (`plugins/variants`): **one version of a skill for the plain
   game, a deeper one with the extender**. A mod keeps its plain-game files where
   they are and puts the extender version of any file at the same relative path

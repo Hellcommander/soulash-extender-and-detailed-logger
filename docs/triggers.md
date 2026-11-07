@@ -94,6 +94,10 @@ file that `requires` an unbacked predicate is unavailable as a whole):
 
 Not backed yet (unknown, fail closed): `biome`, `in_combat`, `in_settlement`.
 
+A third rule file, `<mod>\extender\throws.json`, reacts to the player's
+**real item throw** (the game's Throw command) instead of an ability; see
+section 8.
+
 ## 3. Game facts the plugin relies on (build 526b6ab4)
 
 All RVAs reproduce with `tools/asm_fn.py` / `tools/pe_xrefs.py`; the plugin
@@ -219,6 +223,8 @@ Nothing is keyed by exe hash:
 | `LogExceptions` | 1 | log every first-chance C++ exception in the process: type, `what()`, a short stack (`game+0xRVA`), whether a Triggers detour was on the stack. The game's own crash path turns an unhandled one into a deliberate null write (`0x6F3A10`: `xor eax,eax; mov [rax],0Dh`) that says nothing about the throw; this line does |
 | `MaxExceptionLines` | 40 | cap for those lines per session |
 | `MaxCastsPerEvent` | 8 | upper bound on queued abilities per event, all rules together |
+| `Throws` | 1 | 0 = do not hook the item throw (`throws.json` rules never fire). Nothing is hooked for throws while no mod has `throws.json` rules. |
+| `ThrowConsumeDelayMs` | 2000 | how long after landing a thrown item is used up (its flight animation still shows the item; capped at 60000) |
 
 The build deploys `Triggers.dll` and the INI template (existing INI kept) and
 pins the hash like the other plugins.
@@ -302,3 +308,113 @@ loaded), `fault 0x… while handling a cast event; plugin disabled` (send the lo
   that (it only runs where the engine would run its own on-cast triggers).
 - Delayed casts are pending-list entries in the plugin (up to 256), not saved:
   they are lost when the game is closed.
+- Throws (section 8) are static analysis only, not run yet: whether
+  `Throw::update` runs every frame (the deferred use-up of thrown items runs
+  at its top), whether the queued spell honours its own `range` from the
+  thrower to the landing tile, and whether the game throws one item or the
+  whole stack.
+
+## 8. Real item throws (`throws.json`)
+
+Status: **implemented and unit-tested; static analysis of build 526b6ab4;
+located against the real executable offline; NOT RUN IN THE GAME YET.**
+
+A mod can make an item do something when the player **really throws it** with
+the game's Throw command (not an item ability that imitates a throw): the
+item's abilities are cast by the thrower **at the tile where it landed**, and
+the item is used up. Together with a Variants override of the item that drops
+its `usable` ability (docs/variants.md), a throwing item works as an item
+ability in the plain game and as a real throw with the extender. Arendeth's
+Runic Magic does exactly that for its 62 throwing runes
+(`<mod>\extender\make_throw_variants.py`).
+
+```json
+{
+  "throws": [
+    { "id": "fire_rune", "item": "mymod_Rune_of_Fire", "cast": "mymod_Fire_Burst" },
+    { "item": ["mymod_Runeword_A", "mymod_Runeword_B"], "cast": ["mymod_Part_1", "mymod_Part_2"],
+      "chance": 0.5, "consume": false, "note": "free text" }
+  ]
+}
+```
+
+| Key | | |
+| --- | --- | --- |
+| `item` | required | the thrown item's data id (its Name component, as in `equipped.item`), or a list; an item may appear in one rule per file, and the first mod (folder order) with a rule for it wins |
+| `cast` | required | 1-8 ability ids, cast in order by the thrower, each aimed at the landing tile (`MaxCastsPerEvent` still applies) |
+| `id` | optional | name in the log; defaults to the first item |
+| `chance` | optional, 0-1 | one roll for the whole rule (default 1) |
+| `consume` | optional | default `true`: the item is used up `ThrowConsumeDelayMs` after it landed |
+| `note` | optional | ignored |
+
+Strict like the other files: an unknown key, a wrong type, an empty id or an
+item listed twice rejects the whole file (`<mod>: throws.json rejected: ...`).
+
+Only the **player's** throws exist in the game code (the Throw system reads
+the player's action queue). The casts are the engine's queued casts, which the
+engine marks "no triggers" (`AbilityUser+0x258`, section 7): they do not fire
+`on: {cast: ...}` rules, so a multi-part spell lists all its parts in `cast`.
+Abilities whose target is `aoe_tile` (or `aoe_target`) use the tile as the
+centre of their area; that is what throwing items should use.
+
+### 8.1 Game facts (build 526b6ab4, static analysis)
+
+| What | RVA | Notes |
+| --- | --- | --- |
+| `Throw::update` | `0x8D7B0` | RTTI `Throw` slot 1. Returns 1 when it threw. Reads the player id global (`0xB11D6C`), the player's Actor component (registry 3, stride 0x60), the front of its action deque at `+0x10` (one action per block) and requires action type `0x28`; thrown item `+0x4C`, path `vector<{int x,y,z}>` `+0x88/+0x90`, landing = last point. Removes the item from its old tile, adds it to the landing tile, writes its Position2D (registry 53, stride 0x30, `x,y,z` at `+0x18`), deals throw damage to a creature there, starts the flight animation and pops the action. |
+| world map, z-level layer | `0x7C4930`, `0x7BD010` | static world map; 0x42 entries `{0, 0, z}` at `+0x74` (stride 12) select the layer at `+0x390 + i*8`, else `+0x5A0`; bounds `x < layer+8`, `y < layer+0xC` |
+| RemoveFromTile(layer, entity, const int xy[2]) | `0x6BB3D0` | erases the entity from the tile's 0x68-byte entries and from the layer's entity set `+0x80` (the exact inverse of the add `0x6B9FA0`) |
+| DestroyEntity(ctx, entity) | `0x7CBD50` | FNV-1a lookup in the context's entity map, removes every component; BaseAttack (`"BaseAttack {}: Deleted entity {}"`) uses it for spent ammo |
+| queued-ability consumer | `0x744050` | pops `AbilityUser+0x230`, aims at the **last point of `AbilityUser+0x188`** (`vector<{x,y,z}>`, begin/end/capacity) when non-empty, else at the target entity's position; for `aoe_tile` (target enum 9 at `Ability+0xB8`) / `aoe_target` (7) it computes the area around that point (`0x410910`) and stores it back into `+0x188`; sets `+0x258` (no triggers) |
+
+### 8.2 What the plugin does
+
+1. **Before** `Throw::update` runs (every call, cheap): read the player's front
+   action; if it is a throw, remember the item and the landing tile.
+2. **After** it returned 1: if the item's Position2D is the landing tile, the
+   throw happened. Read the item's data id, find its rule, roll the chance.
+3. For each `cast`: copy the ability from the registry and push it on the
+   player's queue (the same primitive as the other rules), and remember
+   (Ability pointer -> tile) for up to 10 s.
+4. The consumer is hooked: **before** it pops, if the front Ability is one of
+   those, `AbilityUser+0x188` is set to exactly that tile (in place when it has
+   room, else a 12-byte buffer from the game's `operator new`, the old one freed
+   with the game's `operator delete(p, size)`, as the vector itself would). The
+   consumer then aims there.
+5. **Use up** (`consume`), `ThrowConsumeDelayMs` later, at the top of a later
+   `Throw::update` call (a system update: nothing holds component pointers):
+   only if the item is still at the tile with the same data id. A stack of
+   more than one loses one (`Stackable +0x08`); otherwise the item is removed
+   from its tile and destroyed with the game's own two routines.
+
+Everything is located from the code (`plugins/common/throw_layout.hpp`, 15
+byte checks, unit-tested on synthetic code and checked against the real
+executable); any mismatch leaves throws unavailable (`throws: unavailable on
+this build (...)`) and every other event working. Without BaseAttack's delete
+call, throws still cast but only stacks can be used up.
+
+### 8.3 First run (owner)
+
+1. `Triggers.ini`: `Mode=log` first. `Variants.ini`: leave `Mode=log`.
+2. Start the game; expected lines:
+   - `<mod>: N throw rule(s)` (Runic Magic: 62),
+   - `throws: game code located (RVAs): Throw::update 0x8D7B0 (hooked), player id 0xB11D6C, Actor = registry 3, Position2D = registry 53, throw action type 0x28, world map 0x7C4930, remove from tile 0x6BB3D0, destroy entity 0x7CBD50; queued-ability consumer 0x744050 hooked (tile aim); thrown items used up 2000 ms after landing`,
+   - the `active:` line ends with `throws: 62 rule(s), hooked`;
+   - on the first throw the `state source ...` line also lists `Actor=ok Position2D=ok`.
+3. Throw anything (Throw command): `throw event: entity P threw '<id>' (entity E) to x,y,z; no throw rule`.
+   Throw a rune: `throw event: ... rule arendeth_runic_magic/Powered_Rune_of_Fire: 1 cast(s) at the landing tile, then the item is used up`,
+   `rule ...: would queue 'arendeth_runic_magic_Throw_Fire' on entity P at tile x,y,z (Mode=log ...)` and
+   `would use up '...' (entity E) at x,y,z 2000 ms after it landed (Mode=log)`. The rune stays where it landed.
+4. `Triggers.ini` `Mode=active` and `Variants.ini` `Mode=active`, restart. The
+   runes have no "Use" any more (their description says "Throw it: ...").
+   Throw one: `queued 'arendeth_runic_magic_Throw_Fire' on entity P at tile x,y,z`,
+   then `'arendeth_runic_magic_Throw_Fire' of entity P aimed at tile x,y,z` and the
+   burst centred there; 2 s later `... used up at x,y,z` (or `used up one ... of
+   the stack of N`) and the rune is gone. Throw a stack and a single rune; throw
+   beyond 7 tiles (the Throw_* `range`) once.
+5. What a failure looks like: no `aimed at` line after `queued` (the consumer
+   hook did not see it; the spell then goes off at the player's target),
+   `could NOT be aimed`, `is no longer at ... (picked up?)`, `not used up: ...`,
+   or the rune never disappears and no `used up` line appears
+   (`Throw::update` is not called every frame; send the log).
+6. Rollback: `Throws=0` (throws only) or `Mode=log`.

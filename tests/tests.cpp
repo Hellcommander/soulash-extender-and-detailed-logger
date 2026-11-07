@@ -14,6 +14,8 @@
 #include "../plugins/common/game_state.hpp"
 #include "../plugins/common/trigger_rules.hpp"
 #include "../plugins/common/variant_index.hpp"
+#include "../plugins/common/throw_layout.hpp"
+#include "../plugins/common/throw_rules.hpp"
 
 #include <windows.h>
 
@@ -786,6 +788,7 @@ namespace
 #include "pe_original_tests.inc"
 #include "trigger_tests.inc"
 #include "variant_tests.inc"
+#include "throw_tests.inc"
 
     // Child side of the debugger fallback test. Loads the proxy but never
     // calls any BugSplat export, so only the DllMain fallback can start it.
@@ -1817,6 +1820,9 @@ int wmain(int argc, wchar_t* argv[])
         TestTriggerRules();
         TestVariantPaths();
         TestVariantIndex();
+        TestThrowLayout();
+        TestThrowMemory();
+        TestThrowRules();
         TestTestBotScript();
         TestTestBotCapture();
         TestTestBotStatus();

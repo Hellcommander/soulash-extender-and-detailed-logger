@@ -20,6 +20,10 @@
 //     resolution (crit);
 //   * Deflect(system, attacker, queue) -> bool  - EntityAttack::update's
 //     deflection check (block).
+//   * Throw::update(system) -> 1 when it threw  - the player's real item throw
+//     (throws.json, docs/triggers.md section 8): the spell is cast by the
+//     thrower AT THE LANDING TILE and the item is used up. The queued-ability
+//     consumer is hooked too, to aim those casts at the tile.
 //
 // Rules live in <mod>\extender\conditions.json (`triggers`: on <event>, cast
 // B, chance, when) and <mod>\extender\effects.json. For each event the plugin
@@ -44,6 +48,8 @@
 #include "../common/plugin_status.hpp"
 #include "../common/trigger_layout.hpp"
 #include "../common/trigger_rules.hpp"
+#include "../common/throw_layout.hpp"
+#include "../common/throw_rules.hpp"
 
 #include <windows.h>
 
@@ -68,6 +74,7 @@ namespace
     constexpr std::size_t MaximumEffectsFile = 256 * 1024;
     constexpr std::size_t MaximumMods = 512;
     constexpr std::size_t MaximumPendingCasts = 256;
+    constexpr std::size_t MaximumThrowsFile = 256 * 1024;
     constexpr int KillEffectAny = 101;   // on_kill_any_create_item: the first of the two kill passes
     // Attack struct of the attack resolution (docs/triggers.md 3.1).
     constexpr std::size_t AttackAttackerOffset = 0x00;
@@ -95,6 +102,11 @@ namespace
     using DeleteFn = void (*)(void*, std::size_t);
     using GrowMapFn = void (*)(void* deque);
     using DestructorFn = void (*)(void* ability);
+    using ThrowUpdateFn = std::uint64_t (*)(void* system, void* second, void* third, void* fourth);
+    using ConsumerFn = std::uint64_t (*)(void* system, unsigned int entity, void* abilityUser, void* fourth);
+    using WorldMapFn = void* (*)();
+    using RemoveFromTileFn = void (*)(void* layer, unsigned int entity, const std::int32_t* xy);
+    using DestroyEntityFn = void (*)(void* context, unsigned int entity);
 
     const SoulashExtenderInterface* g_extender = nullptr;
     soulash_plugins::StartupReason g_startupReason;
@@ -113,6 +125,11 @@ namespace
     // unhandled one into a deliberate null write that says nothing about it.
     bool g_logExceptions = true;
     unsigned int g_maxExceptionLines = 40;
+    // throws.json: hook the player's real throw (1) or not (0); the thrown
+    // item is used up this long after it landed (its flight animation still
+    // shows the item until then).
+    bool g_throwsEnabled = true;
+    unsigned int g_throwConsumeDelayMs = 2000;
     unsigned int g_exceptionLines = 0;
     void* g_exceptionHandler = nullptr;
     thread_local int g_hookDepth = 0;   // > 0 while a Triggers detour is on this thread's stack
@@ -152,6 +169,9 @@ namespace
         bool ok = false;
     };
     gs::Access g_access;
+    // The throw code's own components (indices confirmed by throw_layout).
+    gs::StorageRef g_actorRef;
+    gs::StorageRef g_positionRef;
     StorageSpec g_storages[] = {
         {"AbilityUser", gs::TypeAbilityUser, gs::AbilityUserSize, ".?AV?$ECStorage@UAbilityUser@@@ASEngine@@", ".?AUAbilityUser@@", &g_access.abilityUser},
         {"Effects", gs::TypeEffects, gs::EffectsSize, ".?AV?$ECStorage@UEffects@@@ASEngine@@", ".?AUEffects@@", &g_access.effects},
@@ -166,6 +186,9 @@ namespace
         {"Stamina", gs::TypeStamina, gs::StaminaSize, ".?AV?$ECStorage@UStamina@@@ASEngine@@", ".?AUStamina@@", &g_access.stamina},
         {"Tags", gs::TypeTags, gs::TagsSize, ".?AV?$ECStorage@UTags@@@ASEngine@@", ".?AUTags@@", &g_access.tags},
         {"Weapon", gs::TypeWeapon, gs::WeaponSize, ".?AV?$ECStorage@UWeapon@@@ASEngine@@", ".?AUWeapon@@", &g_access.weapon},
+        {"Actor", 3, soulash_plugins::ActorStride, ".?AV?$ECStorage@UActor@@@ASEngine@@", ".?AUActor@@", &g_actorRef},
+        {"Position2D", 53, soulash_plugins::Position2DStride, ".?AV?$ECStorage@UPosition2D@@@ASEngine@@",
+            ".?AUPosition2D@@", &g_positionRef},
     };
     bool g_storagesResolved = false;
     bool g_queueUsable = false;
@@ -174,6 +197,15 @@ namespace
     std::vector<rules::ModRules>* g_mods = nullptr;   // heap: never destroyed at process exit
     unsigned int g_ruleCount = 0;
     unsigned int g_modCount = 0;
+
+    // <mod>\extender\throws.json (docs/triggers.md section 8), in mod folder order.
+    struct ThrowMod
+    {
+        std::string mod;
+        soulash_plugins::throw_rules::RuleSet rules;
+    };
+    std::vector<ThrowMod>* g_throwMods = nullptr;
+    unsigned int g_throwRuleCount = 0;
 
     // A cast waiting for turn ticks of its holder (effects.json `delay`).
     struct PendingCast
@@ -246,6 +278,9 @@ namespace
         g_maxCastsPerEvent = GetPrivateProfileIntW(L"Triggers", L"MaxCastsPerEvent", 8, iniPath);
         g_logExceptions = GetPrivateProfileIntW(L"Triggers", L"LogExceptions", 1, iniPath) != 0;
         g_maxExceptionLines = GetPrivateProfileIntW(L"Triggers", L"MaxExceptionLines", 40, iniPath);
+        g_throwsEnabled = GetPrivateProfileIntW(L"Triggers", L"Throws", 1, iniPath) != 0;
+        g_throwConsumeDelayMs = GetPrivateProfileIntW(L"Triggers", L"ThrowConsumeDelayMs", 2000, iniPath);
+        if (g_throwConsumeDelayMs > 60000) g_throwConsumeDelayMs = 60000;
         if (g_maxCastsPerEvent == 0) g_maxCastsPerEvent = 1;
         if (g_maxCastsPerEvent > 64) g_maxCastsPerEvent = 64;
     }
@@ -284,6 +319,7 @@ namespace
     {
         g_mods = new std::vector<rules::ModRules>();
         g_pending = new std::vector<PendingCast>();
+        g_throwMods = new std::vector<ThrowMod>();
         // The same folder the extender core reads its rule files from:
         // SOULASH2_MODS_DIRECTORY, else [Conditions] Directory in the extender's
         // INI beside the game, else <game>\data\mods.
@@ -366,6 +402,26 @@ namespace
                     g_ruleCount += static_cast<unsigned int>(data.effects.Triggers().size());
                 }
             }
+            const std::wstring throwsPath = root + mod + L"\\extender\\throws.json";
+            if (GetFileAttributesW(throwsPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                ThrowMod throws;
+                throws.mod = name;
+                if (!ReadFileText(throwsPath, MaximumThrowsFile, text))
+                {
+                    Log("%s: throws.json unreadable or over 256 KiB; skipped", name.c_str());
+                }
+                else if (!throws.rules.Load(text, error))
+                {
+                    Log("%s: throws.json rejected: %s", name.c_str(), error.c_str());
+                }
+                else
+                {
+                    Log("%s: %zu throw rule(s)", name.c_str(), throws.rules.Rules().size());
+                    g_throwRuleCount += static_cast<unsigned int>(throws.rules.Rules().size());
+                    g_throwMods->push_back(std::move(throws));
+                }
+            }
             if (data.hasConditions || data.hasEffects)
             {
                 Log("%s: %zu conditional trigger(s), %zu effects trigger(s)", name.c_str(),
@@ -430,9 +486,11 @@ namespace
     // ---- the cast primitive ---------------------------------------------------
     // Returns false (and logs) when the ability id is unknown or anything about
     // the queue does not look as expected. Memory stays in the game's heap.
-    bool QueueAbility(const void* context, std::uint32_t holder, const std::string& abilityId, const char* rule)
+    bool QueueAbility(const void* context, std::uint32_t holder, const std::string& abilityId, const char* rule,
+        void** pushedOut = nullptr)
     {
         (void)context;
+        if (pushedOut != nullptr) *pushedOut = nullptr;
         const unsigned char* abilityUser = gs::FindComponent(g_access.abilityUser, holder);
         if (abilityUser == nullptr)
         {
@@ -485,6 +543,7 @@ namespace
             return false;
         }
         ++g_queued;
+        if (pushedOut != nullptr) *pushedOut = ability;
         return true;
     }
 
@@ -981,6 +1040,432 @@ namespace
         return result;
     }
 
+    // ---- throws (docs/triggers.md section 8) -----------------------------------
+    // The player's real throw: Throw::update moves the item to the last tile of
+    // the throw path and pops the action. Before it runs, the hook reads that
+    // action (item, landing tile); after it returns 1 with the item at the
+    // landing tile, the item's throws.json rule casts its abilities from the
+    // thrower at that tile and, a little later, uses the item up.
+    soulash_plugins::ThrowLayout g_throwLayout;
+    ThrowUpdateFn g_throwOriginal = nullptr;
+    ConsumerFn g_consumerOriginal = nullptr;
+    WorldMapFn g_worldMap = nullptr;
+    RemoveFromTileFn g_removeFromTile = nullptr;
+    DestroyEntityFn g_destroyEntity = nullptr;
+    bool g_throwHooked = false;
+    bool g_aimHooked = false;
+    unsigned long long g_throwEvents = 0;
+    unsigned int g_throwMismatchLogs = 0;
+    char g_throwSummary[160] = "throws: not hooked";
+
+    // A queued cast to aim at a tile when the queued-ability consumer pops it.
+    struct Aim
+    {
+        void* ability;            // the Ability we pushed (compared, never dereferenced)
+        std::uint32_t holder;
+        soulash_plugins::TilePoint at;
+        ULONGLONG expires;        // GetTickCount64
+        char abilityId[96];
+    };
+    constexpr std::size_t MaximumAims = 32;
+    constexpr ULONGLONG AimLifetimeMs = 10000;
+    Aim g_aims[MaximumAims] = {};
+
+    // A thrown item to use up once its flight animation is over.
+    struct PendingConsume
+    {
+        std::uint32_t item;       // 0 = free slot
+        soulash_plugins::TilePoint at;
+        ULONGLONG due;
+        char itemId[128];
+        char rule[128];
+    };
+    constexpr std::size_t MaximumConsumes = 32;
+    PendingConsume g_consumes[MaximumConsumes] = {};
+    unsigned int g_consumesWaiting = 0;
+
+    struct ThrowCapture
+    {
+        std::uint32_t thrower;
+        soulash_plugins::ThrowAction action;
+    };
+
+    // Plain bodies for __try.
+    bool GuardedCaptureThrow(void* system, ThrowCapture* out)
+    {
+        __try
+        {
+            const void* context = gs::Read<const void*>(system, SystemContextOffset);
+            const std::int32_t player = *g_throwLayout.playerEntityId;
+            if (context == nullptr || player <= 0) return false;
+            if (!g_storagesResolved) ResolveStorages(context);
+            if (g_actorRef.storage == nullptr || g_positionRef.storage == nullptr) return false;
+            const unsigned char* actor = gs::FindComponent(g_actorRef, static_cast<std::uint32_t>(player));
+            const unsigned char* action = soulash_plugins::ActorFrontAction(actor);
+            if (!soulash_plugins::ReadThrowAction(action, g_throwLayout.throwActionType, out->action)) return false;
+            out->thrower = static_cast<std::uint32_t>(player);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool GuardedLanded(const ThrowCapture* capture, soulash_plugins::TilePoint* where)
+    {
+        __try
+        {
+            const unsigned char* position = gs::FindComponent(g_positionRef, capture->action.item);
+            if (position == nullptr) return false;
+            *where = soulash_plugins::ReadPosition(position);
+            return *where == capture->action.landing;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool GuardedItemDataId(std::uint32_t item, char* out, std::size_t size)
+    {
+        out[0] = '\0';
+        __try
+        {
+            const unsigned char* name = gs::FindComponent(g_access.name, item);
+            return name != nullptr && soulash_plugins::ReadMsvcString(name + gs::NameDataIdOffset, out, size)
+                && out[0] != '\0';
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            out[0] = '\0';
+            return false;
+        }
+    }
+
+    void FireCastAt(const void* context, std::uint32_t holder, const std::string& abilityId, const std::string& rule,
+        const soulash_plugins::TilePoint& at)
+    {
+        char where[64];
+        _snprintf_s(where, _TRUNCATE, " at tile %d,%d,%d", at.x, at.y, at.z);
+        if (!g_active)
+        {
+            FireCast(context, holder, 0, abilityId, rule, where);
+            return;
+        }
+        if (!g_queueUsable || !g_aimHooked)
+        {
+            Log("rule %s: '%s' not cast: %s", rule.c_str(), abilityId.c_str(),
+                g_queueUsable ? "the queued-ability consumer is not hooked, so the cast could not be aimed at the tile"
+                              : "queue not usable on this build");
+            return;
+        }
+        const ULONGLONG now = GetTickCount64();
+        Aim* slot = nullptr;
+        for (Aim& aim : g_aims)
+        {
+            if (aim.ability == nullptr || aim.expires <= now)
+            {
+                slot = &aim;
+                break;
+            }
+        }
+        if (slot == nullptr)
+        {
+            Log("rule %s: '%s' not cast: %zu tile casts are already waiting to be aimed", rule.c_str(), abilityId.c_str(),
+                MaximumAims);
+            return;
+        }
+        void* pushed = nullptr;
+        if (!QueueAbility(context, holder, abilityId, rule.c_str(), &pushed) || pushed == nullptr)
+        {
+            return;
+        }
+        slot->ability = pushed;
+        slot->holder = holder;
+        slot->at = at;
+        slot->expires = now + AimLifetimeMs;
+        strncpy_s(slot->abilityId, abilityId.c_str(), _TRUNCATE);
+        Log("rule %s: queued '%s' on entity %u%s", rule.c_str(), abilityId.c_str(), holder, where);
+    }
+
+    void ScheduleConsume(std::uint32_t item, const char* itemId, const soulash_plugins::TilePoint& at,
+        const std::string& rule)
+    {
+        if (!g_active)
+        {
+            Log("rule %s: would use up '%s' (entity %u) at %d,%d,%d %u ms after it landed (Mode=log)%s", rule.c_str(),
+                itemId, item, at.x, at.y, at.z, g_throwConsumeDelayMs,
+                g_destroyEntity == nullptr ? "; NOTE: only stacks could be used up on this build (DestroyEntity not located)" : "");
+            return;
+        }
+        PendingConsume* slot = nullptr;
+        for (PendingConsume& pending : g_consumes)
+        {
+            if (pending.item == 0)
+            {
+                slot = &pending;
+                break;
+            }
+        }
+        if (slot == nullptr)
+        {
+            Log("rule %s: '%s' (entity %u) will not be used up: %zu items are already waiting", rule.c_str(), itemId, item,
+                MaximumConsumes);
+            return;
+        }
+        slot->item = item;
+        slot->at = at;
+        slot->due = GetTickCount64() + g_throwConsumeDelayMs;
+        strncpy_s(slot->itemId, itemId, _TRUNCATE);
+        strncpy_s(slot->rule, rule.c_str(), _TRUNCATE);
+        ++g_consumesWaiting;
+    }
+
+    void HandleThrow(const void* context, const ThrowCapture& capture)
+    {
+        ++g_throwEvents;
+        const soulash_plugins::TilePoint& at = capture.action.landing;
+        char itemId[128];
+        if (!GuardedItemDataId(capture.action.item, itemId, sizeof(itemId)))
+        {
+            if (g_logEvents && EventLogBudget())
+            {
+                Log("throw event: entity %u threw entity %u to %d,%d,%d; its data id is unreadable", capture.thrower,
+                    capture.action.item, at.x, at.y, at.z);
+            }
+            return;
+        }
+        const soulash_plugins::throw_rules::Rule* rule = nullptr;
+        const ThrowMod* owner = nullptr;
+        for (const ThrowMod& mod : *g_throwMods)
+        {
+            rule = mod.rules.Find(itemId);
+            if (rule != nullptr)
+            {
+                owner = &mod;
+                break;
+            }
+        }
+        if (rule == nullptr)
+        {
+            if (g_logEvents && EventLogBudget())
+            {
+                Log("throw event: entity %u threw '%s' (entity %u) to %d,%d,%d; no throw rule", capture.thrower, itemId,
+                    capture.action.item, at.x, at.y, at.z);
+            }
+            return;
+        }
+        const std::string name = owner->mod + "/" + rule->id;
+        if (rule->chance < 1.0 && std::uniform_real_distribution<double>(0.0, 1.0)(*g_rng) >= rule->chance)
+        {
+            Log("throw event: entity %u threw '%s' (entity %u) to %d,%d,%d; rule %s blocked by chance %.2f",
+                capture.thrower, itemId, capture.action.item, at.x, at.y, at.z, name.c_str(), rule->chance);
+            return;
+        }
+        const std::size_t casts = rule->casts.size() < g_maxCastsPerEvent ? rule->casts.size() : g_maxCastsPerEvent;
+        Log("throw event: entity %u threw '%s' (entity %u) to %d,%d,%d; rule %s: %zu cast(s) at the landing tile%s",
+            capture.thrower, itemId, capture.action.item, at.x, at.y, at.z, name.c_str(), casts,
+            rule->consume ? ", then the item is used up" : "");
+        for (std::size_t index = 0; index < casts; ++index)
+        {
+            FireCastAt(context, capture.thrower, rule->casts[index], name, at);
+        }
+        if (rule->consume)
+        {
+            ScheduleConsume(capture.action.item, itemId, at, name);
+        }
+    }
+
+    void GuardedHandleThrow(void* system, const ThrowCapture* capture)
+    {
+        __try
+        {
+            const void* context = gs::Read<const void*>(system, SystemContextOffset);
+            if (context != nullptr)
+            {
+                HandleThrow(context, *capture);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_disabled = true;
+            Log("fault 0x%08lX while handling a throw; plugin disabled for this session, game unaffected", GetExceptionCode());
+            soulash_plugins::ReportStatus(g_extender, SOULASH_PLUGIN_STATUS_DEGRADED,
+                "memory fault while handling a throw; triggers stopped (game unaffected)");
+        }
+    }
+
+    // Uses one item up: the last of a stack is taken off its tile (the game's
+    // own RemoveFromTile, as Throw::update does for the old tile) and destroyed
+    // (the game's own DestroyEntity, as BaseAttack does for spent ammo).
+    void ConsumeItem(void* context, const PendingConsume& pending)
+    {
+        const std::uint32_t item = pending.item;
+        const unsigned char* position = gs::FindComponent(g_positionRef, item);
+        if (position == nullptr || soulash_plugins::ReadPosition(position) != pending.at)
+        {
+            Log("rule %s: '%s' (entity %u) is no longer at %d,%d,%d (picked up?); not used up", pending.rule,
+                pending.itemId, item, pending.at.x, pending.at.y, pending.at.z);
+            return;
+        }
+        char current[128] = "";
+        const unsigned char* name = gs::FindComponent(g_access.name, item);
+        if (name == nullptr || !soulash_plugins::ReadMsvcString(name + gs::NameDataIdOffset, current, sizeof(current))
+            || std::strcmp(current, pending.itemId) != 0)
+        {
+            Log("rule %s: entity %u is no longer '%s'; not used up", pending.rule, item, pending.itemId);
+            return;
+        }
+        const unsigned char* stack = gs::FindComponent(g_access.stackable, item);
+        if (stack != nullptr)
+        {
+            const auto count = gs::Read<std::int32_t>(stack, gs::StackableCountOffset);
+            if (count > 1 && count < 1000000)
+            {
+                const std::int32_t left = count - 1;
+                std::memcpy(const_cast<unsigned char*>(stack) + gs::StackableCountOffset, &left, sizeof(left));
+                Log("rule %s: used up one '%s' of the stack of %d at %d,%d,%d (%d left there)", pending.rule,
+                    pending.itemId, count, pending.at.x, pending.at.y, pending.at.z, left);
+                return;
+            }
+        }
+        if (g_destroyEntity == nullptr || g_removeFromTile == nullptr || g_worldMap == nullptr)
+        {
+            Log("rule %s: '%s' (entity %u) not used up: %s", pending.rule, pending.itemId, item,
+                g_throwLayout.consumeFailure);
+            return;
+        }
+        bool inBounds = false;
+        const unsigned char* layer = soulash_plugins::FindLayer(static_cast<const unsigned char*>(g_worldMap()),
+            pending.at, &inBounds);
+        if (layer == nullptr || !inBounds)
+        {
+            Log("rule %s: '%s' (entity %u) not used up: no tile layer for %d,%d,%d", pending.rule, pending.itemId, item,
+                pending.at.x, pending.at.y, pending.at.z);
+            return;
+        }
+        const std::int32_t xy[2] = {pending.at.x, pending.at.y};
+        g_removeFromTile(const_cast<unsigned char*>(layer), item, xy);
+        g_destroyEntity(context, item);
+        Log("rule %s: '%s' (entity %u) used up at %d,%d,%d", pending.rule, pending.itemId, item, pending.at.x,
+            pending.at.y, pending.at.z);
+    }
+
+    // Runs at the top of Throw::update (a system update: nothing of the game
+    // holds component pointers there).
+    void GuardedRunDueConsumes(void* system)
+    {
+        __try
+        {
+            void* context = gs::Read<void*>(system, SystemContextOffset);
+            if (context == nullptr) return;
+            const ULONGLONG now = GetTickCount64();
+            for (PendingConsume& pending : g_consumes)
+            {
+                if (pending.item == 0 || pending.due > now) continue;
+                ConsumeItem(context, pending);
+                pending.item = 0;
+                if (g_consumesWaiting > 0) --g_consumesWaiting;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_disabled = true;
+            Log("fault 0x%08lX while using up a thrown item; plugin disabled for this session", GetExceptionCode());
+            soulash_plugins::ReportStatus(g_extender, SOULASH_PLUGIN_STATUS_DEGRADED,
+                "memory fault while using up a thrown item; triggers stopped");
+        }
+    }
+
+    // Before the consumer pops the front Ability: if it is one of ours, aim it
+    // at its tile (the consumer aims at the last point of AbilityUser+0x188).
+    void GuardedApplyAim(std::uint32_t entity, void* abilityUser)
+    {
+        __try
+        {
+            auto* user = static_cast<unsigned char*>(abilityUser);
+            const auto* queue = reinterpret_cast<const soulash_plugins::DequeOfPointers*>(user + gs::AbilityUserQueueOffset);
+            void* front = soulash_plugins::DequeFront(*queue);
+            if (front == nullptr) return;
+            const ULONGLONG now = GetTickCount64();
+            for (Aim& aim : g_aims)
+            {
+                if (aim.ability == nullptr) continue;
+                if (aim.expires <= now)
+                {
+                    Log("tile cast of '%s' for entity %u was never popped; aim dropped", aim.abilityId, aim.holder);
+                    aim.ability = nullptr;
+                    continue;
+                }
+                if (aim.ability != front || aim.holder != entity) continue;
+                auto* positions = reinterpret_cast<soulash_plugins::PointVector*>(user + soulash_plugins::AbilityUserPositionsOffset);
+                const bool aimed = soulash_plugins::SetSinglePoint(*positions, aim.at,
+                    [](std::size_t bytes) { return g_gameNew(bytes); },
+                    [](void* memory, std::size_t bytes) { g_gameDelete(memory, bytes); });
+                Log("'%s' of entity %u %s tile %d,%d,%d", aim.abilityId, entity, aimed ? "aimed at" : "could NOT be aimed at",
+                    aim.at.x, aim.at.y, aim.at.z);
+                aim.ability = nullptr;
+                return;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            g_disabled = true;
+            Log("fault 0x%08lX while aiming a tile cast; plugin disabled for this session", GetExceptionCode());
+            soulash_plugins::ReportStatus(g_extender, SOULASH_PLUGIN_STATUS_DEGRADED,
+                "memory fault while aiming a tile cast; triggers stopped");
+        }
+    }
+
+    bool AnyAimWaiting()
+    {
+        for (const Aim& aim : g_aims)
+        {
+            if (aim.ability != nullptr) return true;
+        }
+        return false;
+    }
+
+    std::uint64_t ConsumerDetour(void* system, unsigned int entity, void* abilityUser, void* fourth)
+    {
+        HookScope scope;
+        if (!g_disabled && abilityUser != nullptr && AnyAimWaiting())
+        {
+            GuardedApplyAim(entity, abilityUser);
+        }
+        return g_consumerOriginal(system, entity, abilityUser, fourth);
+    }
+
+    std::uint64_t ThrowDetour(void* system, void* second, void* third, void* fourth)
+    {
+        HookScope scope;
+        ThrowCapture capture{};
+        bool captured = false;
+        if (!g_disabled && system != nullptr)
+        {
+            if (g_consumesWaiting > 0) GuardedRunDueConsumes(system);
+            captured = GuardedCaptureThrow(system, &capture);
+        }
+        const std::uint64_t result = g_throwOriginal(system, second, third, fourth);
+        if (captured && !g_disabled && (result & 0xFF) != 0)
+        {
+            soulash_plugins::TilePoint where;
+            if (GuardedLanded(&capture, &where))
+            {
+                GuardedHandleThrow(system, &capture);
+            }
+            else if (g_throwMismatchLogs < 10)
+            {
+                ++g_throwMismatchLogs;
+                Log("throw of entity %u: the item is at %d,%d,%d after the throw, not at the path end %d,%d,%d; ignored",
+                    capture.action.item, where.x, where.y, where.z, capture.action.landing.x, capture.action.landing.y,
+                    capture.action.landing.z);
+            }
+        }
+        return result;
+    }
+
     // ---- install --------------------------------------------------------------
     const unsigned char* FirstFunctionReferencing(const char* text)
     {
@@ -1090,6 +1575,90 @@ namespace
             missing[0] ? "; not available: " : "", missing);
     }
 
+    soulash_plugins::ThrowLayout GuardedLocateThrow(const unsigned char* throwUpdate, const unsigned char* baseAttack)
+    {
+        soulash_plugins::ThrowLayout layout;
+        __try
+        {
+            const auto* image = static_cast<const unsigned char*>(g_extender->gameBase);
+            layout = soulash_plugins::LocateThrowLayout(image, soulash_plugins::MappedImageSize(image), throwUpdate, baseAttack);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            layout = soulash_plugins::ThrowLayout{};
+            layout.failure = "access fault while reading game code";
+        }
+        return layout;
+    }
+
+    // throws.json: Throw::update (the event) and the queued-ability consumer
+    // (aiming the casts at the landing tile). Nothing is hooked without rules.
+    void InstallThrows(const unsigned char* queuedAbility)
+    {
+        if (!g_throwsEnabled)
+        {
+            strcpy_s(g_throwSummary, "throws: off (Throws=0)");
+            Log("throws: Throws=0 in Triggers.ini; the throw hook is not installed");
+            return;
+        }
+        if (g_throwRuleCount == 0)
+        {
+            strcpy_s(g_throwSummary, "throws: no throws.json rules, not hooked");
+            return;
+        }
+        const unsigned char* throwUpdate = RttiMethod(".?AVThrow@@", 1);
+        const unsigned char* baseAttack = FirstFunctionReferencing("BaseAttack {}: Deleted entity {}");
+        g_throwLayout = GuardedLocateThrow(throwUpdate, baseAttack);
+        if (!g_throwLayout.verified)
+        {
+            strcpy_s(g_throwSummary, "throws: NOT available on this build");
+            Log("throws: unavailable on this build (%s); %u throw rule(s) will not fire", g_throwLayout.failure,
+                g_throwRuleCount);
+            return;
+        }
+        for (StorageSpec& spec : g_storages)
+        {
+            if (spec.ref == &g_actorRef) spec.index = g_throwLayout.actorIndex;
+            if (spec.ref == &g_positionRef) spec.index = g_throwLayout.positionIndex;
+        }
+        g_worldMap = reinterpret_cast<WorldMapFn>(const_cast<unsigned char*>(g_throwLayout.worldMap));
+        g_removeFromTile = reinterpret_cast<RemoveFromTileFn>(const_cast<unsigned char*>(g_throwLayout.removeFromTile));
+        g_destroyEntity = reinterpret_cast<DestroyEntityFn>(const_cast<unsigned char*>(g_throwLayout.destroyEntity));
+        void* trampoline = nullptr;
+        if (queuedAbility != nullptr && g_layout.abilityDestructor != nullptr
+            && g_extender->installDetourAuto(g_extender->pluginHandle, const_cast<unsigned char*>(queuedAbility),
+                reinterpret_cast<void*>(&ConsumerDetour), &trampoline))
+        {
+            g_consumerOriginal = reinterpret_cast<ConsumerFn>(trampoline);
+            g_aimHooked = true;
+        }
+        trampoline = nullptr;
+        if (!g_extender->installDetourAuto(g_extender->pluginHandle, const_cast<unsigned char*>(g_throwLayout.throwUpdate),
+                reinterpret_cast<void*>(&ThrowDetour), &trampoline))
+        {
+            strcpy_s(g_throwSummary, "throws: detour refused");
+            Log("throws: detour on Throw::update refused; %u throw rule(s) will not fire", g_throwRuleCount);
+            return;
+        }
+        g_throwOriginal = reinterpret_cast<ThrowUpdateFn>(trampoline);
+        g_throwHooked = true;
+        _snprintf_s(g_throwSummary, _TRUNCATE, "throws: %u rule(s), hooked%s%s", g_throwRuleCount,
+            g_aimHooked ? "" : ", tile aim NOT hooked", g_destroyEntity != nullptr ? "" : ", items cannot be used up");
+        Log("throws: game code located (RVAs): Throw::update 0x%llX (hooked), player id 0x%llX, Actor = registry %u, "
+            "Position2D = registry %u, throw action type 0x%X, world map 0x%llX, remove from tile 0x%llX, destroy entity "
+            "0x%llX%s%s; queued-ability consumer 0x%llX %s; thrown items used up %u ms after landing",
+            static_cast<unsigned long long>(Rva(g_throwLayout.throwUpdate)),
+            static_cast<unsigned long long>(Rva(g_throwLayout.playerEntityId)), g_throwLayout.actorIndex,
+            g_throwLayout.positionIndex, g_throwLayout.throwActionType,
+            static_cast<unsigned long long>(Rva(g_throwLayout.worldMap)),
+            static_cast<unsigned long long>(Rva(g_throwLayout.removeFromTile)),
+            static_cast<unsigned long long>(Rva(g_throwLayout.destroyEntity)),
+            g_throwLayout.consumeFailure[0] == '\0' ? "" : " - ", g_throwLayout.consumeFailure,
+            static_cast<unsigned long long>(Rva(queuedAbility)),
+            g_aimHooked ? "hooked (tile aim)" : "NOT hooked: casts cannot be aimed, so throw casts are skipped in Mode=active",
+            g_throwConsumeDelayMs);
+    }
+
     bool Install()
     {
         soulash_plugins::TriggerAnchors anchors;
@@ -1165,12 +1734,14 @@ namespace
             g_onAttackEndOriginal, "attack end");
         InstallOptional(rules::EventKind::Block, g_layout.onDeflect, reinterpret_cast<void*>(&OnDeflectDetour),
             g_onDeflectOriginal, "deflection");
+        InstallThrows(anchors.queuedAbility);
         char hooks[400];
         HookSummary(hooks, sizeof(hooks));
-        Log("active: game build %.8s, mode=%s, %u rule(s) from %u mod(s); %s; delayed casts %s",
+        Log("active: game build %.8s, mode=%s, %u rule(s) from %u mod(s); %s; delayed casts %s; %s",
             g_extender->gameExecutableSha256[0] == '\0' ? "unknown " : g_extender->gameExecutableSha256,
             g_active ? "active" : "log", g_ruleCount, g_modCount, hooks,
-            g_onTurnOriginal != nullptr ? "wait for the holder's turns" : "are dropped (no turn tick on this build)");
+            g_onTurnOriginal != nullptr ? "wait for the holder's turns" : "are dropped (no turn tick on this build)",
+            g_throwSummary);
         return true;
     }
 }
@@ -1208,9 +1779,9 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(const Sou
     g_startupReason.End();
     char hooks[400];
     HookSummary(hooks, sizeof(hooks));
-    char detail[480];
-    _snprintf_s(detail, _TRUNCATE, "mode=%s; %u rule(s) from %u mod(s); %s",
-        g_active ? "active" : "log", g_ruleCount, g_modCount, hooks);
+    char detail[640];
+    _snprintf_s(detail, _TRUNCATE, "mode=%s; %u rule(s) from %u mod(s); %s; %s",
+        g_active ? "active" : "log", g_ruleCount, g_modCount, hooks, g_throwSummary);
     soulash_plugins::ReportStatus(extender,
         active ? (g_layout.failure[0] == '\0' ? SOULASH_PLUGIN_STATUS_ACTIVE : SOULASH_PLUGIN_STATUS_DEGRADED)
                : SOULASH_PLUGIN_STATUS_INACTIVE,

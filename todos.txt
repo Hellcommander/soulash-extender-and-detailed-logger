@@ -188,6 +188,27 @@ another version of a skill with the extender (deeper skill options)")
   yet (the run that built it skipped the game deploy because another session had uncommitted Triggers changes).
 - Open: whole-file only (no JSON merge patch); editor_saves never cleaned; images/fonts go through SDL (no variants).
 
+SESSION 2026-11-07: REAL ITEM THROWS + RUNIC MAGIC VARIANTS (owner: "when you use the extender they trigger on real
+throws not item abilities that just try to copy the effect"; "I can test it, bot just wastes credits" -> NO TestBot)
+- Triggers.dll: new rule file <mod>\extender\throws.json {throws: [{id, item, cast (1-8), chance, consume}]}
+  (plugins/common/throw_rules.hpp). Hooks Throw::update (RTTI Throw slot 1, player-only, returns 1 when it threw):
+  pre-call reads the player's front action (Actor = registry 3, type 0x28, item +0x4C, landing = last path point
+  +0x88/+0x90), post-call confirms the item's Position2D (registry 53) is the landing tile. Casts = queued casts
+  aimed at the tile by also hooking the queued-ability consumer ("Queued Ability", 0x744050): before it pops one of
+  ours, AbilityUser+0x188 (vector<{x,y,z}>, the consumer aims at its last point) is set to the tile. Use-up 2 s later
+  at the top of Throw::update: stack -1, else RemoveFromTile 0x6BB3D0 + DestroyEntity 0x7CBD50 (BaseAttack's ammo
+  delete). Located by 15 byte checks (plugins/common/throw_layout.hpp), tests/throw_tests.inc; the C++ locator was
+  also run against the real exe image offline (all addresses match). INI: Throws=1, ThrowConsumeDelayMs=2000.
+  Docs: docs/triggers.md section 8. Queued casts are "no triggers" (+0x258): multi-part spells list every part.
+- Runic Magic (game folder, extender\ only): make_throw_variants.py generates variants\entities\ for the 62 runes
+  whose Throw_* ability is aoe_tile (usable removed, description "Throw it: ...") + throws.json; README.md there.
+  Re-run it after editing rune items (whole-file variants go stale).
+- NOT RUN IN THE GAME. Owner tests: docs/triggers.md 8.3 (log mode first; then Triggers AND Variants Mode=active).
+  Open: is Throw::update called every frame (use-up runs there)? does the queued Throw_* honour range 7 from the
+  thrower? one item or the whole stack thrown? Is there a Throw command for every item (assumed: "Throw" string)?
+- Possible follow-up: deeper rune spells for the extender (multi-part `cast` lists, Entropy/Prophecy/Death/Blossom
+  from the side session's runic-magic-proposal-effects.json) once the basic throw is confirmed in game.
+
 STANDING RULES FROM THE OWNER (keep following them)
 - Read-only against the game files. Do NOT install or modify anything in the game folder without an
   explicit instruction. Do not launch the game unprompted.
