@@ -147,7 +147,11 @@ namespace soulash_plugins::game_state
     constexpr std::uintptr_t ClockTurnsPerDayOffset = 0x14;
     constexpr std::uintptr_t ClockTimeOffset = 0x18;
     constexpr std::uintptr_t ClockDayPartOffset = 0x20;
-    constexpr std::uintptr_t ClockYearPartOffset = 0x28;
+    // +0x00 year, +0x04 day of the year (1-based), +0x10 days per year (100).
+    // The exe has no year-part translator (only `day_part` is looked up), so
+    // the season is derived: four equal parts of the year.
+    constexpr std::uintptr_t ClockDayOffset = 0x04;
+    constexpr std::uintptr_t ClockDaysPerYearOffset = 0x10;
 
     // ---- core_2 lists (messages.json, 0.10.6.1) -------------------------------
     constexpr const char* WeaponTypeNames[] = {
@@ -188,7 +192,9 @@ namespace soulash_plugins::game_state
         bool has = false;
         float time = 0.0f;   // turns since the start of the game
         int dayPart = -1;    // index into DayPartNames, -1 = out of range
-        int yearPart = -1;   // index into YearPartNames
+        int yearPart = -1;   // index into YearPartNames, derived from day / daysPerYear
+        int day = 0;         // day of the year, 1-based
+        int daysPerYear = 0;
     };
 
     // One storage the plugin has verified (vtable of the storage and of its
@@ -370,9 +376,13 @@ namespace soulash_plugins::game_state
         out.has = true;
         out.time = time;
         const auto dayPart = Read<std::int32_t>(clock, ClockDayPartOffset);
-        const auto yearPart = Read<std::int32_t>(clock, ClockYearPartOffset);
         out.dayPart = dayPart >= 0 && static_cast<unsigned int>(dayPart) < DayPartCount ? dayPart : -1;
-        out.yearPart = yearPart >= 0 && static_cast<unsigned int>(yearPart) < YearPartCount ? yearPart : -1;
+        out.day = Read<std::int32_t>(clock, ClockDayOffset);
+        out.daysPerYear = Read<std::int32_t>(clock, ClockDaysPerYearOffset);
+        if (out.daysPerYear > 0 && out.day >= 1 && out.day <= out.daysPerYear)
+        {
+            out.yearPart = static_cast<int>((static_cast<long long>(out.day - 1) * YearPartCount) / out.daysPerYear);
+        }
         return out;
     }
 

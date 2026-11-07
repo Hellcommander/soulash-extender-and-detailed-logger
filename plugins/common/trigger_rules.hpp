@@ -176,6 +176,11 @@ namespace soulash_plugins::trigger_rules
                     ++out.matched;
                     const soulash::effects::Resolution resolution =
                         soulash::effects::ResolveEvent(mod.effects, trigger, state, rng, capabilities);
+                    if (resolution.chanceFailed)
+                    {
+                        ++out.blockedByChance;
+                        continue;
+                    }
                     bool conditionBlocked = false;
                     for (const auto& unresolved : resolution.unresolved)
                     {

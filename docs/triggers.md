@@ -1,7 +1,12 @@
 # Triggers: conditional triggers executed by the extender
 
 Status: **implemented as the `Triggers` plugin (`plugins/triggers`), unit-tested
-against synthetic memory and byte patterns, NOT YET RUN IN THE GAME.** Events:
+against synthetic memory and byte patterns; first runs in the game on
+2026-11-07 (TestBot-driven, `Mode=log`, build 526b6ab4): all eight hooks
+located and installed, cast / attack / kill / turn / damaged / dodge events and
+delayed casts seen with live state, crit and block not yet observed (no
+critical hit and no deflection passive in the test fight); `Mode=active` not
+yet tried.** Events:
 cast, attack, kill, turn, damaged, dodge, block, crit; delayed casts wait for
 the holder's turns. Every game fact below is static analysis of build
 `526b6ab4` (0.10.6.1, 2026-11-06/07) unless marked otherwise. The plugin ships with `Mode=log`, which installs the
@@ -85,7 +90,7 @@ file that `requires` an unbacked predicate is unavailable as a whole):
 | `skill_level` | Skills component: `std::map<string,int>` at `+0x08` (skill id → level) |
 | `stacker` | Effects component: `std::map<string,int>` stacks at `+0x38`, `std::map<string,float>` expiry time at `+0x48`; a stack whose expiry lies before the clock counts as 0 (the engine's own on_max_stacks code resets it then). Without a clock the entity's last tick time (`+0x6C`) stands in. |
 | `party`, `companions` | Party component (type 50, 0x10 bytes) is carried by the player's companions, not by the player (the owner's `player.sav` has no `Party;` line; `DrawParty` lists the Party storage's entity ids). Player: `in_party` while any companion exists, `companions` = their number. Companion: `in_party`, `companions` = the other members plus the player. Anyone else: `alone`, 0. |
-| `time_of_day`, `season` | the game clock struct (`0x205F0()` in 526b6ab4, located from `ProgressEffects::update`): `+0x20` day-part index (what the UI hands to the day-part translator `0x4CFEF0`), `+0x28` year-part index; `+0x14` = 1440 turns per day, `+0x18` time in turns. Names from core_2 `day_part` / `year_part`. The year-part field is inferred from its initial value and users; the first run's `game clock:` log line confirms it. |
+| `time_of_day`, `season` | the game clock struct (`0x205F0()` in 526b6ab4, located from `ProgressEffects::update`): `+0x20` day-part index (what the UI hands to the day-part translator `0x4CFEF0`; verified in game: 5 = Midday with the sun orb), `+0x14` = 1440 turns per day, `+0x18` time in turns, `+0x00` year, `+0x04` day of the year (1-based), `+0x10` days per year (100). Names from core_2 `day_part` / `year_part`. The exe has no year-part translator (only `day_part` is looked up and `+0x28` is a byte flag), so the season is derived: four equal parts of the year, day 1-25 Spring, 26-50 Summer, 51-75 Autumn, 76-100 Winter (day 50 of the test save logged `Summer`). |
 
 Not backed yet (unknown, fail closed): `biome`, `in_combat`, `in_settlement`.
 
@@ -209,8 +214,10 @@ Nothing is keyed by exe hash:
 | `Enabled` | 1 | 0 = load nothing, hook nothing |
 | `Mode` | `log` | `log`: hooks installed, events and would-be casts logged, nothing queued. `active`: queue. |
 | `LogEvents` | 1 | one line per cast / attack / kill / damaged / dodge / block / crit event the hooks see (capped by `MaxLogLines` per session); firings and problems always log |
-| `LogTurnEvents` | 0 | turn ticks happen for every creature every turn; with 1 they are logged too, but only when a turn rule matched the creature |
+| `LogTurnEvents` | 0 | turn ticks happen for every creature every turn. 1: logged for the creatures a turn rule was allowed for (a rule with `holder_tag: Player` logs exactly the player's turns); 2: every creature a turn rule matched, allowed or not (hundreds of lines per turn) |
 | `MaxLogLines` | 400 | |
+| `LogExceptions` | 1 | log every first-chance C++ exception in the process: type, `what()`, a short stack (`game+0xRVA`), whether a Triggers detour was on the stack. The game's own crash path turns an unhandled one into a deliberate null write (`0x6F3A10`: `xor eax,eax; mov [rax],0Dh`) that says nothing about the throw; this line does |
+| `MaxExceptionLines` | 40 | cap for those lines per session |
 | `MaxCastsPerEvent` | 8 | upper bound on queued abilities per event, all rules together |
 
 The build deploys `Triggers.dll` and the INI template (existing INI kept) and
@@ -229,9 +236,11 @@ pins the hash like the other plugins.
    - `event code located (RVAs, 0 = not on this build): kill trigger 0x6D5E70, turn tick 0x5AFAD0, parry 0x4BA1E0, damage dealt 0x4B9FB0, attack end 0x6CED40, deflect 0x64B110, game clock 0x205F0`,
    - `active: game build 526b6ab4, mode=log, N rule(s) …; events hooked: cast attack kill turn damaged dodge block crit; delayed casts wait for the holder's turns`,
    - on the first event: `state source … AbilityUser=ok Effects=ok Equipment=ok Health=ok Item=ok Name=ok Party=ok Player=ok Skills=ok Stackable=ok Stamina=ok Tags=ok Weapon=ok; queueing possible`,
-   - `game clock: time T turns, day part D (<name>), year part Y (<name>)`: the names must match the in-game clock,
+   - `rules folder: <path> (default | [Conditions] Directory | SOULASH2_MODS_DIRECTORY)` and `c++ exception logging on …`,
+   - `game clock: time T turns, day part D (<name>), year part Y (<name>)`: the day part must match the sun orb; the season is derived from the day of the year,
    - `cast event: entity P cast 'arendeth_hydromancy_water_splash' (target T): 1 rule(s) matched, 1 allowed, …; health=100 stamina=.. weapon=Unarmed shield=no tags=3 skills=11 stacks=0 party=alone companions=0 time=Morning/Spring inventory=N` (N = distinct item ids in the backpack),
-   - `rule <mod>/wounded_splash: would queue 'arendeth_hydromancy_spray' on entity P (Mode=log …)`,
+   - `rule <mod>/wounded_splash: would queue 'arendeth_hydromancy_spray' on entity P (Mode=log …)`, or `would NOT queue … not in the game's ability registry` for an id the game does not know (checked in log mode too),
+   - `c++ exception on thread T: type <mangled>, what "…"; inside a Triggers hook: yes|no; stack: …` whenever anything in the process throws; `inside a Triggers hook: no` with a `game+…` stack is the game's own,
    - `attack event: entity P attacked E (weapon entity W): …`, and after the fight `damaged event: entity E took N damage from P`, `dodge event: …`, `crit event: …`, `kill event: entity P killed E`.
    Check the state values against the character sheet (health %, stamina %,
    weapon class, tag count 3 for the player, skill count, stacks on the status
@@ -260,9 +269,27 @@ loaded), `fault 0x… while handling a cast event; plugin disabled` (send the lo
   post-damage call; damage over time (`0x5AE760`) and movement damage do not go
   through it. `block` is the deflection passive (there is no shield block in
   Soulash 2's attack code); `dodge` is the engine's miss / parry outcome.
-- The year-part field of the clock (`+0x28`) is inferred, not traced to a
-  translator call like the day part; the `game clock:` line of the first run
-  confirms or refutes it (Spring = 0).
+- The season is derived from the day of the year (no year-part translator in
+  the exe); if the game ever shows seasons, compare.
+- `crit` and `block` have not fired in a run yet (no critical hit happened in
+  the test fights; the deflection passive was not on anyone). Their hooks
+  install and are logged as hooked.
+- A `kill` whose killer is already dead (a poison kill credited to a corpse)
+  has an all-unknown snapshot and fails closed: `kill event: entity K killed V:
+  … 1 blocked by condition … health=?0 …`. Expected.
+- The engine itself throws `fmt::format_error` "invalid format specifier" from
+  its heal message builder (`0x33B670`, " (reverse heal)"): ability effect
+  message 4 (`'{} regains {:.0f} health.'` in core_2 `messages.json`) is
+  formatted with an **int** amount on that path, and fmt rejects `.0f` for an
+  int. Seen twice in the Enchanted Book fight of the test save; the game caught
+  it both times on the second run, and the first run ended in the game's
+  terminate path (unhandled C++ exception → null write at `0x6F3A10`) in the
+  same fight. Not caused by the extender (`inside a Triggers hook: no`, stack
+  entirely `game+…`). No mod overrides that message.
+- Non-creature casters show up: `cast event: entity 2 cast '122' (target 2)`
+  (an entity with a numeric ability id; `entity 2` also kills with a Sword:
+  the world or a caravan actor, not the player). Rules on `cast` match by
+  ability id, so this is noise only.
 - Predicates still not backed: `biome` and `in_settlement` need the current
   region's world tile (`region.sav` is `x|y|z|regionId`, the biome lives in
   `world.sav`'s tile records and in the world object, not in the region map);

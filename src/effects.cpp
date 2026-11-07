@@ -978,7 +978,11 @@ namespace soulash::effects
             for (const Node& child : node->children) stack.push_back(&child);
         }
         if (!anyEvaluator) return out;
-        if (trigger.chance < 1.0 && !(rng() < trigger.chance)) return out;
+        if (trigger.chance < 1.0 && !(rng() < trigger.chance))
+        {
+            out.chanceFailed = true;
+            return out;
+        }
         if (trigger.hasWhen)
         {
             const Tri result = conditions::Evaluate(trigger.when, state);

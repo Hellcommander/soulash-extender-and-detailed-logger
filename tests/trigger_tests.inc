@@ -535,14 +535,25 @@ void TestGameState()
     player.Finish();
 
     std::vector<std::uint8_t> clockBytes(0x30, 0);
-    const std::int32_t turnsPerDay = 1440, dayPart = 10, yearPart = 3;
+    const std::int32_t turnsPerDay = 1440, dayPart = 10, day = 60, daysPerYear = 100;
     const float now = 20.0f;
     std::memcpy(clockBytes.data() + gs::ClockTurnsPerDayOffset, &turnsPerDay, 4);
     std::memcpy(clockBytes.data() + gs::ClockTimeOffset, &now, 4);
     std::memcpy(clockBytes.data() + gs::ClockDayPartOffset, &dayPart, 4);
-    std::memcpy(clockBytes.data() + gs::ClockYearPartOffset, &yearPart, 4);
+    std::memcpy(clockBytes.data() + gs::ClockDayOffset, &day, 4);
+    std::memcpy(clockBytes.data() + gs::ClockDaysPerYearOffset, &daysPerYear, 4);
     const gs::GameClock clock = gs::ReadClock(clockBytes.data());
-    Check(clock.has && clock.time == 20.0f && clock.dayPart == 10 && clock.yearPart == 3, "state: clock struct read");
+    Check(clock.has && clock.time == 20.0f && clock.dayPart == 10 && clock.yearPart == 2, "state: clock struct read (day 60 of 100 = Autumn)");
+    {
+        std::vector<std::uint8_t> edge = clockBytes;
+        const std::int32_t first = 1, last = 100, over = 101;
+        std::memcpy(edge.data() + gs::ClockDayOffset, &first, 4);
+        Check(gs::ReadClock(edge.data()).yearPart == 0, "state: day 1 is Spring");
+        std::memcpy(edge.data() + gs::ClockDayOffset, &last, 4);
+        Check(gs::ReadClock(edge.data()).yearPart == 3, "state: day 100 is Winter");
+        std::memcpy(edge.data() + gs::ClockDayOffset, &over, 4);
+        Check(gs::ReadClock(edge.data()).yearPart == -1, "state: a day past the year gives no season");
+    }
 
     gs::Access access;
     access.health = health.Ref();
@@ -573,8 +584,8 @@ void TestGameState()
         "state: live stacks, expired and zero stacks left out");
     Check(state.party.has && state.party.value == "in_party" && state.companions.has && state.companions.value == 2,
         "state: the player with two Party-component companions is in a party of two");
-    Check(state.dayPart.has && state.dayPart.value == "Night" && state.season.has && state.season.value == "Winter",
-        "state: day part and season names from the clock indices");
+    Check(state.dayPart.has && state.dayPart.value == "Night" && state.season.has && state.season.value == "Autumn",
+        "state: day part and season names from the clock (day 60 of 100 = Autumn)");
     {
         soulash::conditions::Snapshot companion;
         gs::BuildSnapshot(access, companionA, 0, companion, clock);
@@ -620,7 +631,7 @@ void TestGameState()
         "{\"holder_tag\":\"player\"},{\"target_tag\":[\"undead\"]},{\"skill_level\":{\"skill\":\"arendeth_runic_magic\",\"min\":5}},"
         "{\"equipped\":{\"slot\":\"left_hand\",\"item_type\":\"Shield\"}},{\"stamina_percent\":{\"min\":70}},"
         "{\"stacker\":{\"id\":\"flag\",\"min\":3}},{\"stacker\":{\"id\":\"old\",\"max\":0}},{\"party\":\"in_party\"},"
-        "{\"companions\":{\"min\":2,\"max\":2}},{\"time_of_day\":\"night\"},{\"season\":[\"winter\"]},"
+        "{\"companions\":{\"min\":2,\"max\":2}},{\"time_of_day\":\"night\"},{\"season\":[\"autumn\"]},"
         "{\"equipped\":{\"slot\":\"right_hand\",\"item\":\"core_2_Ice_Rod\"}},{\"equipped\":{\"slot\":\"right_hand\",\"item_tag\":\"artifact\"}},"
         "{\"inventory_count\":{\"item\":\"803\",\"min\":4,\"max\":4}},{\"inventory_count\":{\"item\":\"999\",\"max\":0}}]}}]}";
     soulash::conditions::ConditionSet set;
@@ -736,6 +747,23 @@ void TestTriggerRules()
     Check(out.casts.size() == 1 && out.delayed.size() == 1 && out.delayed[0].delayTurns == 2
             && out.delayed[0].abilityId.find("X") != std::string::npos && out.delayed[0].rule == "later" && out.notes.empty(),
         "rules: with a turn source the delayed cast is returned with its delay");
+
+    // Effects triggers: the trigger's own chance roll counts as blocked by chance.
+    rules::ModRules chancy;
+    chancy.mod = "c";
+    Check(chancy.effects.Load("{\"spec\":1,\"mod\":\"c\",\"requires\":[\"on_kill\"],\"triggers\":["
+                              "{\"id\":\"maybe\",\"on\":{\"kill\":true},\"chance\":0.5,\"do\":{\"cast\":{\"spell\":\"Z\"}}}]}", error),
+        "rules: chancy effects document loads");
+    chancy.hasEffects = true;
+    std::vector<rules::ModRules> chancyMods;
+    chancyMods.push_back(std::move(chancy));
+    // `high` (0.9) is defined above.
+    out = rules::Evaluate(chancyMods, kill, state, high, 8);
+    Check(out.matched == 1 && out.allowed == 0 && out.blockedByChance == 1 && out.casts.empty() && out.notes.empty(),
+        "rules: a failed effects chance roll is counted as blocked by chance");
+    out = rules::Evaluate(chancyMods, kill, state, low, 8);
+    Check(out.matched == 1 && out.allowed == 1 && out.blockedByChance == 0 && out.casts.size() == 1,
+        "rules: a passed effects chance roll casts");
 
     // A file requiring an unbacked predicate is unavailable as a whole.
     rules::ModRules strict;

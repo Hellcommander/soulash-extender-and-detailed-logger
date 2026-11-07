@@ -51,6 +51,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
+#include <map>
 #include <memory>
 #include <random>
 #include <string>
@@ -101,9 +103,21 @@ namespace
     bool g_enabled = true;
     bool g_active = false;          // Mode=active
     bool g_logEvents = true;
-    bool g_logTurnEvents = false;
+    // 0 off; 1 = turn events where a turn rule was allowed for the creature;
+    // 2 = every creature a turn rule matched (hundreds of lines per turn).
+    int g_logTurnEvents = 0;
     unsigned int g_maxLogLines = 400;
     unsigned int g_maxCastsPerEvent = 8;
+    // First-chance C++ exceptions on any thread are logged with their type,
+    // what() and a short stack: the game's terminate handler turns an
+    // unhandled one into a deliberate null write that says nothing about it.
+    bool g_logExceptions = true;
+    unsigned int g_maxExceptionLines = 40;
+    unsigned int g_exceptionLines = 0;
+    void* g_exceptionHandler = nullptr;
+    thread_local int g_hookDepth = 0;   // > 0 while a Triggers detour is on this thread's stack
+    constexpr DWORD CppExceptionCode = 0xE06D7363;
+    constexpr ULONG_PTR CppExceptionMagic = 0x19930520;
 
     // ---- game functions (from trigger_layout) --------------------------------
     soulash_plugins::TriggerLayout g_layout;
@@ -227,9 +241,11 @@ namespace
         GetPrivateProfileStringW(L"Triggers", L"Mode", L"log", mode, 32, iniPath);
         g_active = _wcsicmp(mode, L"active") == 0;
         g_logEvents = GetPrivateProfileIntW(L"Triggers", L"LogEvents", 1, iniPath) != 0;
-        g_logTurnEvents = GetPrivateProfileIntW(L"Triggers", L"LogTurnEvents", 0, iniPath) != 0;
+        g_logTurnEvents = GetPrivateProfileIntW(L"Triggers", L"LogTurnEvents", 0, iniPath);
         g_maxLogLines = GetPrivateProfileIntW(L"Triggers", L"MaxLogLines", 400, iniPath);
         g_maxCastsPerEvent = GetPrivateProfileIntW(L"Triggers", L"MaxCastsPerEvent", 8, iniPath);
+        g_logExceptions = GetPrivateProfileIntW(L"Triggers", L"LogExceptions", 1, iniPath) != 0;
+        g_maxExceptionLines = GetPrivateProfileIntW(L"Triggers", L"MaxExceptionLines", 40, iniPath);
         if (g_maxCastsPerEvent == 0) g_maxCastsPerEvent = 1;
         if (g_maxCastsPerEvent > 64) g_maxCastsPerEvent = 64;
     }
@@ -268,7 +284,34 @@ namespace
     {
         g_mods = new std::vector<rules::ModRules>();
         g_pending = new std::vector<PendingCast>();
-        std::wstring root = std::wstring(g_extender->gameDirectory) + L"data\\mods\\";
+        // The same folder the extender core reads its rule files from:
+        // SOULASH2_MODS_DIRECTORY, else [Conditions] Directory in the extender's
+        // INI beside the game, else <game>\data\mods.
+        std::wstring root;
+        const char* source = "default";
+        wchar_t configured[MAX_PATH]{};
+        DWORD length = GetEnvironmentVariableW(L"SOULASH2_MODS_DIRECTORY", configured, MAX_PATH);
+        if (length != 0 && length < MAX_PATH)
+        {
+            root = configured;
+            source = "SOULASH2_MODS_DIRECTORY";
+        }
+        else
+        {
+            const std::wstring ini = std::wstring(g_extender->gameDirectory) + L"SoulashExtender.ini";
+            length = GetPrivateProfileStringW(L"Conditions", L"Directory", L"", configured, MAX_PATH, ini.c_str());
+            if (length != 0 && length < MAX_PATH)
+            {
+                root = configured;
+                source = "[Conditions] Directory";
+            }
+            else
+            {
+                root = std::wstring(g_extender->gameDirectory) + L"data\\mods";
+            }
+        }
+        if (root.empty() || root.back() != L'\\') root.push_back(L'\\');
+        Log("rules folder: %S (%s)", root.c_str(), source);
         WIN32_FIND_DATAW entry{};
         HANDLE find = FindFirstFileW((root + L"*").c_str(), &entry);
         if (find == INVALID_HANDLE_VALUE)
@@ -445,6 +488,29 @@ namespace
         return true;
     }
 
+    // Log mode: is the ability in the game's registry? The same lookup the
+    // queue path makes (a temporary Ability object filled by the registry's
+    // map::at, then destroyed), cached per id so each id costs one lookup.
+    std::map<std::string, bool>* g_registryCache = nullptr;
+
+    bool AbilityInRegistry(const std::string& abilityId)
+    {
+        if (!g_queueUsable || g_abilityDestructor == nullptr || g_gameDelete == nullptr) return true;   // cannot tell
+        if (g_registryCache == nullptr) g_registryCache = new std::map<std::string, bool>();
+        const auto cached = g_registryCache->find(abilityId);
+        if (cached != g_registryCache->end()) return cached->second;
+        void* ability = g_gameNew(AbilitySize);
+        if (ability == nullptr) return true;
+        std::memset(ability, 0, AbilitySize);
+        g_abilityMapAt(g_abilityRegistry(), ability, &abilityId);
+        char copiedId[160];
+        const bool known = soulash_plugins::ReadMsvcString(ability, copiedId, sizeof(copiedId)) && abilityId == copiedId;
+        g_abilityDestructor(ability);
+        g_gameDelete(ability, AbilitySize);
+        if (g_registryCache->size() < 1024) (*g_registryCache)[abilityId] = known;
+        return known;
+    }
+
     // Queue (or, in log mode, report) one cast for a holder.
     void FireCast(const void* context, std::uint32_t holder, std::uint32_t target, const std::string& abilityId,
         const std::string& rule, const char* why)
@@ -452,8 +518,16 @@ namespace
         if (!g_active)
         {
             ++g_wouldQueue;
-            Log("rule %s: would queue '%s' on entity %u%s (Mode=log; set Mode=active to queue)", rule.c_str(),
-                abilityId.c_str(), holder, why);
+            if (AbilityInRegistry(abilityId))
+            {
+                Log("rule %s: would queue '%s' on entity %u%s (Mode=log; set Mode=active to queue)", rule.c_str(),
+                    abilityId.c_str(), holder, why);
+            }
+            else
+            {
+                Log("rule %s: would NOT queue '%s' on entity %u%s: not in the game's ability registry (check the id and "
+                    "that its mod is loaded)", rule.c_str(), abilityId.c_str(), holder, why);
+            }
             return;
         }
         if (!g_queueUsable)
@@ -557,7 +631,7 @@ namespace
         {
             TickPending(context, holder, target);
         }
-        const bool logThis = g_logEvents && (!turn || g_logTurnEvents);
+        const bool logThis = g_logEvents && (!turn || g_logTurnEvents > 0);
 
         char description[240];
         DescribeEvent(kind, holder, target, extra, abilityId, description, sizeof(description));
@@ -576,7 +650,9 @@ namespace
             [] { return std::uniform_real_distribution<double>(0.0, 1.0)(*g_rng); }, g_maxCastsPerEvent,
             g_onTurnOriginal != nullptr);
 
-        if (logThis && EventLogBudget())
+        // Turn events: with LogTurnEvents=1 only the creatures a rule was allowed
+        // for (blocked-only ticks are the many); 2 logs every matched creature.
+        if (logThis && (!turn || g_logTurnEvents >= 2 || outcome.allowed > 0) && EventLogBudget())
         {
             char stateText[300];
             _snprintf_s(stateText, _TRUNCATE,
@@ -680,8 +756,137 @@ namespace
         }
     }
 
+    // ---- first-chance C++ exception logging ------------------------------------
+    struct HookScope
+    {
+        HookScope() { ++g_hookDepth; }
+        ~HookScope() { --g_hookDepth; }
+    };
+
+    void CopyPrintable(const char* text, char* out, std::size_t size)
+    {
+        std::size_t n = 0;
+        while (text[n] != '\0' && n + 1 < size)
+        {
+            const char c = text[n];
+            out[n] = c >= 0x20 && c <= 0x7e ? c : '?';
+            ++n;
+        }
+        out[n] = '\0';
+    }
+
+    // Plain body for __try. MSVC x64 throw record: [0] magic, [1] object,
+    // [2] ThrowInfo*, [3] image base; ThrowInfo+0xC -> CatchableTypeArray
+    // {count, rva[]}; CatchableType+4 -> TypeDescriptor whose name is at +0x10.
+    // what() of a std::exception is the char* at object+8 (__std_exception_data).
+    void DescribeCppException(const EXCEPTION_RECORD* record, char* type, std::size_t typeSize, char* what,
+        std::size_t whatSize)
+    {
+        type[0] = '\0';
+        what[0] = '\0';
+        __try
+        {
+            if (record->NumberParameters < 4 || record->ExceptionInformation[0] != CppExceptionMagic) return;
+            const auto* object = reinterpret_cast<const unsigned char*>(record->ExceptionInformation[1]);
+            const auto* throwInfo = reinterpret_cast<const unsigned char*>(record->ExceptionInformation[2]);
+            const auto* base = reinterpret_cast<const unsigned char*>(record->ExceptionInformation[3]);
+            if (throwInfo == nullptr || base == nullptr) return;
+            const unsigned char* array = base + *reinterpret_cast<const std::uint32_t*>(throwInfo + 12);
+            const auto count = *reinterpret_cast<const std::int32_t*>(array);
+            if (count <= 0 || count > 64) return;
+            bool isStdException = false;
+            for (std::int32_t index = 0; index < count; ++index)
+            {
+                const unsigned char* catchable = base + *reinterpret_cast<const std::uint32_t*>(array + 4 + index * 4);
+                const unsigned char* descriptor = base + *reinterpret_cast<const std::uint32_t*>(catchable + 4);
+                const char* name = reinterpret_cast<const char*>(descriptor + 16);
+                if (index == 0) CopyPrintable(name, type, typeSize);
+                if (std::strcmp(name, ".?AVexception@std@@") == 0) isStdException = true;
+            }
+            if (isStdException && object != nullptr)
+            {
+                const char* text = *reinterpret_cast<const char* const*>(object + 8);
+                if (text != nullptr) CopyPrintable(text, what, whatSize);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    // "module+0xRVA" for a code address (the game is named "game").
+    void DescribeAddress(const void* address, char* out, std::size_t size)
+    {
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                static_cast<LPCWSTR>(address), &module) || module == nullptr)
+        {
+            _snprintf_s(out, size, _TRUNCATE, "%p", address);
+            return;
+        }
+        char name[64] = "?";
+        if (module == static_cast<HMODULE>(g_extender->gameBase))
+        {
+            strcpy_s(name, "game");
+        }
+        else
+        {
+            wchar_t path[MAX_PATH]{};
+            const DWORD length = GetModuleFileNameW(module, path, MAX_PATH);
+            if (length != 0 && length < MAX_PATH)
+            {
+                const wchar_t* stem = std::wcsrchr(path, L'\\');
+                stem = stem != nullptr ? stem + 1 : path;
+                std::size_t n = 0;
+                while (stem[n] != L'\0' && stem[n] != L'.' && n + 1 < sizeof(name))
+                {
+                    name[n] = stem[n] < 0x80 ? static_cast<char>(stem[n]) : '?';
+                    ++n;
+                }
+                name[n] = '\0';
+            }
+        }
+        _snprintf_s(out, size, _TRUNCATE, "%s+0x%llX", name,
+            static_cast<unsigned long long>(reinterpret_cast<const unsigned char*>(address)
+                - reinterpret_cast<const unsigned char*>(module)));
+    }
+
+    LONG WINAPI ExceptionLogger(EXCEPTION_POINTERS* info)
+    {
+        if (info == nullptr || info->ExceptionRecord == nullptr
+            || info->ExceptionRecord->ExceptionCode != CppExceptionCode || g_exceptionLines >= g_maxExceptionLines)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        ++g_exceptionLines;
+        char type[160];
+        char what[200];
+        DescribeCppException(info->ExceptionRecord, type, sizeof(type), what, sizeof(what));
+        // Frames above the raise: the throw site and its callers.
+        void* frames[14]{};
+        const USHORT captured = RtlCaptureStackBackTrace(0, 14, frames, nullptr);
+        char chain[700] = "";
+        std::size_t used = 0;
+        for (USHORT index = 0; index < captured && used + 48 < sizeof(chain); ++index)
+        {
+            char one[96];
+            DescribeAddress(frames[index], one, sizeof(one));
+            const int written = _snprintf_s(chain + used, sizeof(chain) - used, _TRUNCATE, "%s%s",
+                index == 0 ? "" : " < ", one);
+            if (written < 0) break;
+            used += static_cast<std::size_t>(written);
+        }
+        Log("c++ exception on thread %lu: type %s%s%s%s; inside a Triggers hook: %s; stack: %s%s",
+            GetCurrentThreadId(), type[0] != '\0' ? type : "(not a C++ throw record)",
+            what[0] != '\0' ? ", what \"" : "", what, what[0] != '\0' ? "\"" : "",
+            g_hookDepth > 0 ? "yes" : "no", chain,
+            g_exceptionLines >= g_maxExceptionLines ? " (MaxExceptionLines reached; no more)" : "");
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     void* OnCastDetour(void* context, unsigned int caster, const void* abilityId)
     {
+        HookScope scope;
         void* result = g_onCastOriginal(context, caster, abilityId);
         if (!g_disabled && context != nullptr)
         {
@@ -692,6 +897,7 @@ namespace
 
     void* OnAttackDetour(void* context, unsigned int attacker, unsigned int target, unsigned int weapon)
     {
+        HookScope scope;
         void* result = g_onAttackOriginal(context, attacker, target, weapon);
         if (!g_disabled && context != nullptr)
         {
@@ -702,6 +908,7 @@ namespace
 
     std::uint64_t OnKillDetour(void* system, unsigned int killer, unsigned int victim, void* position, int effectId)
     {
+        HookScope scope;
         const std::uint64_t result = g_onKillOriginal(system, killer, victim, position, effectId);
         // The engine runs this twice per death (effects 101 and 102); fire once.
         if (!g_disabled && system != nullptr && effectId == KillEffectAny && killer != 0)
@@ -713,6 +920,7 @@ namespace
 
     std::uint64_t OnTurnDetour(void* system, unsigned int entity)
     {
+        HookScope scope;
         const std::uint64_t result = g_onTurnOriginal(system, entity);
         if (!g_disabled && system != nullptr && entity != 0)
         {
@@ -723,6 +931,7 @@ namespace
 
     std::uint64_t OnParryDetour(void* context, unsigned int attacker, unsigned int defender, float value)
     {
+        HookScope scope;
         const std::uint64_t result = g_onParryOriginal(context, attacker, defender, value);
         if (!g_disabled && context != nullptr && defender != 0)
         {
@@ -733,6 +942,7 @@ namespace
 
     std::uint64_t OnDamageDetour(void* context, unsigned int attacker, unsigned int target, int damage)
     {
+        HookScope scope;
         const std::uint64_t result = g_onDamageOriginal(context, attacker, target, damage);
         if (!g_disabled && context != nullptr && target != 0 && damage > 0)
         {
@@ -744,6 +954,7 @@ namespace
 
     std::uint64_t OnAttackEndDetour(void* system, void* attack, unsigned int weaponType, unsigned char critical)
     {
+        HookScope scope;
         const std::uint64_t result = g_onAttackEndOriginal(system, attack, weaponType, critical);
         if (!g_disabled && system != nullptr && critical != 0)
         {
@@ -759,6 +970,7 @@ namespace
 
     unsigned char OnDeflectDetour(void* system, unsigned int attacker, void* queue, void* fourth)
     {
+        HookScope scope;
         std::uint32_t target = 0;
         const bool haveTarget = !g_disabled && GuardedDeflectTarget(queue, &target);
         const unsigned char result = g_onDeflectOriginal(system, attacker, queue, fourth);
@@ -985,6 +1197,12 @@ extern "C" __declspec(dllexport) BOOL WINAPI SoulashExtenderPluginLoad(const Sou
     }
     g_rng = new std::mt19937_64(static_cast<unsigned long long>(GetTickCount64()) ^ 0x9E3779B97F4A7C15ull
         ^ (static_cast<unsigned long long>(GetCurrentProcessId()) << 32));
+    if (g_logExceptions)
+    {
+        g_exceptionHandler = AddVectoredExceptionHandler(1, &ExceptionLogger);
+        Log("c++ exception logging %s (first-chance throws on any thread, at most %u lines)",
+            g_exceptionHandler != nullptr ? "on" : "could not be installed", g_maxExceptionLines);
+    }
     LoadModRules();
     const bool active = Install();
     g_startupReason.End();

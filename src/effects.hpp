@@ -101,6 +101,7 @@ namespace soulash::effects
     {
         std::vector<Cast> casts;
         std::vector<Unresolved> unresolved;
+        bool chanceFailed = false;   // the trigger's own `chance` roll failed: nothing to do, not an error
     };
 
     // Uniform random number in [0, 1).
