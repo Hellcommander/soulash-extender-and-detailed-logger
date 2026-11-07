@@ -259,6 +259,20 @@ runewords removed; builder honours `hotbar` and deletes
 `audit-mods`, `check-assets` all clean, no orphan ability, no dangling id.
 The README still describes the hotbar spells, tablets, Etches and rune logic.
 
+**B7. Re-added as craftable thrown Etched Runes (owner, same day).** The
+eight former hotbar spells came back as `Throw_Etched_*` item abilities on
+`Etched Rune: <name>` items with the old tablet recipes and levels; the four
+payload novas and Recall Echoes became five more etched runes with new
+two-rune recipes (Cascade Discharge = Energy+Fire 18, Collapse Implosion =
+Matter+Spirit 33, Collapse Aftershock = Matter+Heavens 33, Ward Mend =
+Rigidity+Life 20, Recall Echoes = Self+Spirit 21); the Cascade, Collapse and
+Bastion runewords returned as plain throws without node summons. 19 animations
+and 16 sounds restored from the backup. Five of the new items reuse the icons
+of related ones (the items sheet is full). Registry: `etched_runes` section
+lists them; the builder does not generate them yet. Throwable recipes carry
+optional custom-component slots (`magic_slots`: 1 powered runes, 2 runewords
+and etched runes, 3 runewords from level 44). All checks clean.
+
 ### 2.2 Found, not changed (needs the owner or the game)
 
 - **Rune Roller fires an unknown number of Conjures** (1.3). Not fixable in
@@ -499,7 +513,36 @@ harmless no-ops before that. It should be installed as
 `<mod>\extender\effects.json` only after the plugin's first active run looks
 right in the log, per `docs/triggers.md` section 6.
 
-### 3.8 Untested: amplifier slots on the item-cast throw abilities
+### 3.8 Confirmed: amplifier slots on the item-cast throw abilities
+
+**Result (owner, in game with a fresh character, 2026-11-07): the slots
+appear for item-cast abilities and Etches socket into them.** Applied to the
+mod: every `Throw_*` ability now carries `slots`, graded (owner, same day):
+powered runes by circle 2 / 2 / 3 / 3 / 4 total, runewords by level 2 below
+10, 3 to 19, 4 to 43, 5 from 44; hostile throws take the larger half as
+offensive, buffs and heals take two thirds as utility. The 12 Etch amplifiers and their milestones are restored from the
+pre-removal backup, and the builder's `throw()` writes the same slots. Also
+per the owner, every rune recipe (runes, charges, powered runes, fusions,
+runewords, tablets: 97) now needs no tool; the book keeps its tool.
+
+**Issue found by the owner:** the assignment is forgotten when the character
+drops the last item that grants the ability; the next copy comes with empty
+sockets, because the ability only exists while an item grants it.
+**Extender request:** persist the last amplifier assignment per item-cast
+ability in the character's save (or a sidecar keyed by world and character
+under `SoulashExtender\`) and reapply it when that ability reappears. New
+plugin work in the extender repo, not mod data; it needs the save hook and
+the amplifier-assignment structure located first.
+
+**Rune Roller, observed in the message log:** one roller logs "successfully
+summoned 1x Rune of ..." several times in a row (Strength, Strength, Movement,
+Self, Self, ...). The four `Conjure_*` abilities have cooldown 0 and cast time
+0, so the roller casts repeatedly within its single turn. Fix applied on the
+owner's go-ahead: `cast_time 1.0` and `cooldown 2.0` on all 20 Conjures
+(builder mirrored), so one cast ends the roller's turn. To confirm: cast
+`Draw First Circle` several times and count runes per cast; expected one.
+
+Original note, kept for the reasoning:
 
 Owner's suggestion (2026-11-07): the `Throw_*` abilities could carry `slots`
 (`offensive` / `utility`) so Etch amplifiers socket into the thrown runes
